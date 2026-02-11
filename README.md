@@ -136,6 +136,37 @@ This will remove:
 
 You'll be prompted whether to keep or remove your config (OAuth token).
 
+## Development
+
+### Pre-Release Validation
+
+Before creating a release or pushing to the repository, run the validation script to check for common issues:
+
+```bash
+chmod +x validate.sh
+./validate.sh
+```
+
+The script performs these checks:
+- **Python syntax** — validates `claude_usage_widget.py` compiles
+- **Shell scripts** — validates `install.sh` and `uninstall.sh` syntax
+- **Token leaks** — scans for real OAuth tokens in repository (placeholders OK)
+- **File permissions** — verifies secure file modes
+- **Required files** — checks all distribution files exist
+- **TODO/FIXME** — finds unresolved comments
+- **README placeholders** — ensures no template placeholders remain
+- **Version tags** — validates git tag matches code version
+
+**Exit codes:**
+- `0` — All checks passed, ready for release
+- `1` — Errors found, fix before releasing
+
+This is especially useful for:
+- Pre-commit validation
+- CI/CD integration
+- Ensuring quality before releases
+- Catching common mistakes (token leaks, missing files, etc.)
+
 ## Troubleshooting
 
 | Problem | Fix |
