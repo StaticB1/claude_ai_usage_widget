@@ -206,6 +206,14 @@ Common issues in logs:
 - **HTTP 401/403 errors**: Token expired or invalid (refresh token)
 - **Network errors**: Check internet connectivity or API availability
 
+## Contributing & Contact
+
+Contributions are welcome!
+
+- **Bug reports / feature requests** — [Open an issue](https://github.com/StaticB1/claude_ai_usage_widget/issues)
+- **Discussions / collaboration** — [GitHub Discussions](https://github.com/StaticB1/claude_ai_usage_widget/discussions)
+- **Email** — contact@statotec.com
+
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for the full release history.
