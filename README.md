@@ -23,6 +23,7 @@ claude-widget-start
 
 - **Taskbar percentage** — shows your 5h usage % at a glance with color-coded icon
 - **Click for details** — popup with 5h + 7d utilization, progress bars, reset timers, and subscription plan
+- **Extra usage tracking** — displays pay-as-you-go monthly credit usage if enabled on your account
 - **Threshold notifications** — desktop alerts at startup, 75%, 90%, and 100% usage
 - **Auto-refresh** — polls every 2 minutes (configurable)
 - **Auto-detect credentials** — reads Claude Code's `~/.claude/.credentials.json` on Linux
@@ -103,10 +104,18 @@ anthropic-beta: oauth-2025-04-20
 Returns:
 ```json
 {
-  "five_hour": { "utilization": 0.42, "resets_at": "2025-02-11T15:00:00Z" },
-  "seven_day": { "utilization": 0.18, "resets_at": "2025-02-14T00:00:00Z" }
+  "five_hour":  { "utilization": 10.0, "resets_at": "2026-02-19T05:00:00Z" },
+  "seven_day":  { "utilization": 2.0,  "resets_at": "2026-02-24T08:00:00Z" },
+  "extra_usage": {
+    "is_enabled": true,
+    "monthly_limit": 2000,
+    "used_credits": 500.0,
+    "utilization": 25.0
+  }
 }
 ```
+
+The widget handles all three sections. `extra_usage` is shown only when `is_enabled` is true.
 
 ## Configuration
 
@@ -196,6 +205,10 @@ Common issues in logs:
 - **Module import errors**: Python environment issues (use `claude-widget-start`)
 - **HTTP 401/403 errors**: Token expired or invalid (refresh token)
 - **Network errors**: Check internet connectivity or API availability
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## License
 
