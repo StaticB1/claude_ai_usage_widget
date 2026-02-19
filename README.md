@@ -129,6 +129,24 @@ Edit `~/.config/claude-usage-widget/config.json`:
 
 To change refresh interval, edit `REFRESH_INTERVAL_SEC` in the Python script (default: 120s).
 
+## Upgrade
+
+```bash
+cd claude_ai_usage_widget
+chmod +x upgrade.sh && ./upgrade.sh
+```
+
+This will pull the latest version, reinstall, and restart the widget automatically. Your OAuth token and config are preserved.
+
+**Manual upgrade** (if you prefer step by step):
+```bash
+cd claude_ai_usage_widget
+git pull
+claude-widget-stop
+./install.sh
+claude-widget-start
+```
+
 ## Uninstall
 
 ```bash
