@@ -13,7 +13,7 @@ Version: 1.0.0
 License: MIT
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __author__ = "Statotech Systems"
 
 import gi
@@ -216,8 +216,11 @@ def format_reset_time(iso_str: str | None) -> str:
         total_sec = int(delta.total_seconds())
         if total_sec <= 0:
             return "any moment"
-        hours, remainder = divmod(total_sec, 3600)
+        days, remainder = divmod(total_sec, 86400)
+        hours, remainder = divmod(remainder, 3600)
         minutes, _ = divmod(remainder, 60)
+        if days > 0:
+            return f"{days}d {hours}h"
         if hours > 0:
             return f"{hours}h {minutes}m"
         return f"{minutes}m"
@@ -290,6 +293,36 @@ class UsageDetailWindow(Gtk.Window):
                 vbox.pack_start(sub_label, False, False, 0)
 
         if usage_data:
+            # Extra usage section (pay-as-you-go credits)
+            extra = usage_data.get("extra_usage") or {}
+            if extra and extra.get("is_enabled"):
+                sep = Gtk.Separator()
+                sep.get_style_context().add_class("separator")
+                vbox.pack_start(sep, False, False, 4)
+
+                extra_section = Gtk.Label(label="EXTRA USAGE (MONTHLY)")
+                extra_section.get_style_context().add_class("section-label")
+                extra_section.set_halign(Gtk.Align.START)
+                vbox.pack_start(extra_section, False, False, 0)
+
+                used = extra.get("used_credits", 0)
+                limit = extra.get("monthly_limit", 0)
+                extra_pct = min(int(extra.get("utilization", 0)), 100)
+                extra_decimal = extra_pct / 100
+                extra_color = get_color_for_pct(extra_decimal)
+
+                extra_val = Gtk.Label()
+                extra_val.set_markup(
+                    f'<span foreground="{extra_color}" font_weight="bold" font="28">{extra_pct}%</span>'
+                )
+                extra_val.set_halign(Gtk.Align.START)
+                vbox.pack_start(extra_val, False, False, 0)
+
+                credits_lbl = Gtk.Label(label=f"{used:.0f} / {limit:.0f} credits used")
+                credits_lbl.get_style_context().add_class("metric-sub")
+                credits_lbl.set_halign(Gtk.Align.START)
+                vbox.pack_start(credits_lbl, False, False, 0)
+
             for key, label_text in [("five_hour", "5-HOUR WINDOW"), ("seven_day", "7-DAY WINDOW")]:
                 bucket = usage_data.get(key)
                 if not bucket:
@@ -471,6 +504,11 @@ class ClaudeUsageApp:
         self.item_7d.set_sensitive(False)
         self.menu.append(self.item_7d)
 
+        self.item_extra = Gtk.MenuItem(label="")
+        self.item_extra.set_sensitive(False)
+        self.item_extra.set_no_show_all(True)
+        self.menu.append(self.item_extra)
+
         self.menu.append(Gtk.SeparatorMenuItem())
 
         item_details = Gtk.MenuItem(label="Show Details…")
@@ -513,9 +551,12 @@ class ClaudeUsageApp:
     def _poll_loop(self):
         """Background thread: fetch usage periodically."""
         while self.running:
-            if self.token:
-                data = fetch_usage(self.token)
-                GLib.idle_add(self._update_ui, data)
+            try:
+                if self.token:
+                    data = fetch_usage(self.token)
+                    GLib.idle_add(self._update_ui, data)
+            except Exception as e:
+                print(f"[claude-usage] Poll error: {e}", file=sys.stderr)
             time.sleep(REFRESH_INTERVAL_SEC)
 
     def force_refresh(self):
@@ -560,6 +601,16 @@ class ClaudeUsageApp:
 
             self.item_5h.set_label(f"5h: {pct5}%  (resets {format_reset_time(five.get('resets_at'))})")
             self.item_7d.set_label(f"7d: {pct7}%  (resets {format_reset_time(seven.get('resets_at'))})")
+
+            # Extra usage (pay-as-you-go credits)
+            extra = data.get("extra_usage") or {}
+            if extra and extra.get("is_enabled"):
+                used = extra.get("used_credits", 0)
+                limit = extra.get("monthly_limit", 0)
+                self.item_extra.set_label(f"Extra: {used:.0f}/{limit:.0f} credits")
+                self.item_extra.show()
+            else:
+                self.item_extra.hide()
 
             # Send notifications at specific thresholds only
             self._check_and_notify_threshold(pct5, pct7, dominant)
