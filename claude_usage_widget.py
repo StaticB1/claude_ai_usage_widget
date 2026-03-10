@@ -565,12 +565,11 @@ class ClaudeUsageApp:
                     self.token = fresh
                 if self.token:
                     data = fetch_usage(self.token)
-                    # Only update UI with None if we have no cached data yet
-                    if data is not None or self.usage_data is None:
-                        GLib.idle_add(self._update_ui, data)
+                    GLib.idle_add(self._update_ui, data)
             except RateLimitError:
-                # Back off 10 minutes — don't wipe the display
+                # Show ERR and back off 10 minutes before retrying
                 print("[claude-usage] Rate limited, backing off 10 min", file=sys.stderr)
+                GLib.idle_add(self._update_ui, None)
                 time.sleep(600)
                 continue
             except Exception as e:
