@@ -13,7 +13,7 @@ Version: 1.0.0
 License: MIT
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 __author__ = "Statotech Systems"
 
 import gi
@@ -552,6 +552,11 @@ class ClaudeUsageApp:
         """Background thread: fetch usage periodically."""
         while self.running:
             try:
+                # Re-read credentials on every cycle so a token refreshed
+                # by Claude Code overnight is picked up automatically.
+                fresh = load_token()
+                if fresh:
+                    self.token = fresh
                 if self.token:
                     data = fetch_usage(self.token)
                     GLib.idle_add(self._update_ui, data)

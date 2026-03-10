@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.2] - 2026-02-19
+
+### Fixed
+- **ERR on startup / after idle** — widget now re-reads `~/.claude/.credentials.json` on every poll cycle so a token refreshed by Claude Code overnight is picked up automatically, instead of staying stuck on the expired token loaded at startup
+
+---
+
 ## [1.0.1] - 2026-02-19
 
 ### Fixed
