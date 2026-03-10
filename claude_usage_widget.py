@@ -13,7 +13,7 @@ Version: 1.0.0
 License: MIT
 """
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 __author__ = "Statotech Systems"
 
 import gi
@@ -180,6 +180,10 @@ def save_token(token: str):
 
 # ── API call ────────────────────────────────────────────────────────────────
 
+class RateLimitError(Exception):
+    pass
+
+
 def fetch_usage(token: str) -> dict | None:
     """Fetch usage data from the Claude API."""
     headers = {
@@ -197,6 +201,8 @@ def fetch_usage(token: str) -> dict | None:
         with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
+        if e.code == 429:
+            raise RateLimitError()
         print(f"[claude-usage] HTTP {e.code}: {e.reason}", file=sys.stderr)
         return None
     except Exception as e:
@@ -559,7 +565,14 @@ class ClaudeUsageApp:
                     self.token = fresh
                 if self.token:
                     data = fetch_usage(self.token)
-                    GLib.idle_add(self._update_ui, data)
+                    # Only update UI with None if we have no cached data yet
+                    if data is not None or self.usage_data is None:
+                        GLib.idle_add(self._update_ui, data)
+            except RateLimitError:
+                # Back off 10 minutes — don't wipe the display
+                print("[claude-usage] Rate limited, backing off 10 min", file=sys.stderr)
+                time.sleep(600)
+                continue
             except Exception as e:
                 print(f"[claude-usage] Poll error: {e}", file=sys.stderr)
             time.sleep(REFRESH_INTERVAL_SEC)

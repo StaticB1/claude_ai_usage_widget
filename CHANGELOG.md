@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.3] - 2026-02-19
+
+### Fixed
+- **ERR on rate limit (429)** — widget now keeps the last good data when the API returns 429 and backs off for 10 minutes before retrying, instead of wiping the display to ERR
+- **ERR on transient failures** — any failed poll that returns no data is silently skipped if previous good data exists; ERR only shows when there has never been a successful fetch
+
+---
+
 ## [1.0.2] - 2026-02-19
 
 ### Fixed
