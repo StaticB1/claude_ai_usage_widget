@@ -13,7 +13,7 @@ Version: 1.0.0
 License: MIT
 """
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 __author__ = "Statotech Systems"
 
 import gi
@@ -283,7 +283,7 @@ class UsageDetailWindow(Gtk.Window):
         header.pack_start(title, False, False, 0)
 
         status_label = Gtk.Label(label=f"● {token_status}")
-        sc = "status-ok" if token_status == "Connected" else "status-err"
+        sc = "status-ok" if token_status == "Connected" else ("status-warn" if token_status == "Rate limited" else "status-err")
         status_label.get_style_context().add_class(sc)
         status_label.set_halign(Gtk.Align.END)
         header.pack_end(status_label, False, False, 0)
@@ -567,9 +567,9 @@ class ClaudeUsageApp:
                     data = fetch_usage(self.token)
                     GLib.idle_add(self._update_ui, data)
             except RateLimitError:
-                # Show ERR and back off 10 minutes before retrying
+                # Show ERR but keep last good data so details window still works
                 print("[claude-usage] Rate limited, backing off 10 min", file=sys.stderr)
-                GLib.idle_add(self._update_ui, None)
+                GLib.idle_add(self._set_rate_limit_ui)
                 time.sleep(600)
                 continue
             except Exception as e:
@@ -583,6 +583,16 @@ class ClaudeUsageApp:
                 data = fetch_usage(self.token)
                 GLib.idle_add(self._update_ui, data)
         threading.Thread(target=_do, daemon=True).start()
+
+    def _set_rate_limit_ui(self):
+        """Show ERR state without clearing cached usage_data (preserves details window)."""
+        self.last_updated = datetime.now().strftime("%H:%M:%S")
+        self.indicator.set_label("ERR", "")
+        icon_path = write_icon(0, error=True)
+        self.indicator.set_icon_full(icon_path, "Error")
+        self.item_5h.set_label("5h: rate limited")
+        self.item_7d.set_label("7d: rate limited")
+        return False
 
     def _update_ui(self, data: dict | None):
         """Update indicator label + icon from fetched data (runs on GTK thread)."""
@@ -694,7 +704,14 @@ class ClaudeUsageApp:
             self.last_notification_threshold = current_threshold
 
     def on_show_details(self, _widget):
-        token_status = "Connected" if self.usage_data else ("No token" if not self.token else "Error")
+        if self.usage_data:
+            token_status = "Connected"
+        elif not self.token:
+            token_status = "No token"
+        elif self.item_5h.get_label().endswith("rate limited"):
+            token_status = "Rate limited"
+        else:
+            token_status = "Error"
         UsageDetailWindow(self.usage_data, self.last_updated, token_status, self.subscription_info)
 
     def on_set_token(self, _widget):
