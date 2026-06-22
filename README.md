@@ -1,249 +1,199 @@
-# ⚡ Claude AI Usage Widget — Linux Taskbar
+<p align="center">
+  <img src="assets/cover.png" alt="Claude Token Tracker" width="400">
+</p>
 
-A lightweight system tray widget that shows your Claude AI subscription usage percentage (5-hour and 7-day rate limit windows) directly in your Linux taskbar.
+# Claude Token Tracker
 
-![Claude Usage Widget Screenshot](screenshot.png)
-<!-- Add a screenshot.png to the repository showing the widget in action -->
+> The upgraded successor to **claude_ai_usage_widget**. The original was a
+> lightweight GTK widget for watching your Claude.ai 5-hour usage; this is a
+> full local analytics tool built on the same idea.
 
-## Quick Start
+Persistent local analytics for Claude Code: per-project / per-model / per-tool
+spend, 5-hour block forecasts with ETA-to-limit, budgets, and a Linux GTK
+dashboard. The CLI works on Linux, macOS, and Windows; the GUI is Linux-only.
 
-```bash
-# Install dependencies
-sudo apt install python3 python3-gi gir1.2-appindicator3-0.1 gir1.2-notify-0.7
+Where it differs from `ccusage` and other CLIs: it keeps a SQLite history
+that survives `~/.claude/projects` cleanup, attributes spend to **tools** and
+**models**, and lets you set USD/token budgets that fire desktop notifications.
 
-# Install widget
-git clone https://github.com/StaticB1/claude_ai_usage_widget.git && cd claude_ai_usage_widget
-chmod +x install.sh && ./install.sh
+## What's new vs. the original widget
 
-# Start widget
-claude-widget-start
-```
+- **SQLite history** that outlives `~/.claude/projects` cleanup (the widget
+  only read live state).
+- **Per-project / per-model / per-tool** attribution instead of a single
+  global gauge.
+- **Budgets** with desktop notifications, **5-hour block forecasts** with
+  ETA-to-limit, **multi-account** support, and a **cross-platform CLI** (`ctt`).
+- The familiar tray + 5h/7d plan-utilization view is still here, now inside a
+  full Catppuccin-themed dashboard.
 
 ## Features
 
-- **Taskbar percentage** — shows your 5h usage % at a glance with color-coded icon
-- **Click for details** — popup with 5h + 7d utilization, progress bars, reset timers, and subscription plan
-- **Extra usage tracking** — displays pay-as-you-go monthly credit usage if enabled on your account
-- **Threshold notifications** — desktop alerts at startup, 75%, 90%, and 100% usage
-- **Auto-refresh** — polls every 2 minutes (configurable)
-- **Auto-detect credentials** — reads Claude Code's `~/.claude/.credentials.json` on Linux
-- **Manual token entry** — dialog for manual OAuth token if you don't use Claude Code
-- **Autostart** — installs a `.desktop` entry for autostart on login
-
-## Requirements
-
-- Linux with GTK3 (GNOME, KDE, XFCE, etc.)
-- Python 3.10+
-- System packages:
-  ```
-  sudo apt install python3 python3-gi gir1.2-appindicator3-0.1 gir1.2-notify-0.7
-  ```
+- **SQLite history** — `~/.config/claude-token-tracker/history.db`. Stays
+  intact even if you wipe `~/.claude/projects`.
+- **Per-project / per-model / per-tool breakdown** — see which projects,
+  which model, and which tool calls (`Bash`, `Read`, `Edit`, `Agent`, …)
+  drive your spend.
+- **5-hour rolling block + forecast** — mirrors Anthropic's `claude /usage`
+  semantics. Shows ETA to your 5h cap when cloud usage is available.
+- **Budgets** — daily/weekly/monthly USD or token caps, scoped globally,
+  per-project, or per-model. Desktop notifications when crossed.
+- **Cross-platform CLI (`ctt`)** — JSON output for piping into shell prompts,
+  status bars, CI checks.
+- **Editable rate card** — drop a JSON file at
+  `~/.config/claude-token-tracker/rate_card.json` to override pricing without
+  editing code.
+- **Tray + dashboard (Linux)** — Catppuccin-themed GTK UI, auto-backs-off
+  cloud polling when the window is hidden.
 
 ## Install
 
-```bash
-git clone https://github.com/StaticB1/claude_ai_usage_widget.git && cd claude_ai_usage_widget
-chmod +x install.sh
-./install.sh
-```
-
-Then run:
-```bash
-claude-widget-start
-```
-
-It will autostart on next login.
-
-## Usage
+### One-line install (any Linux distro)
 
 ```bash
-claude-widget-start   # Start the widget
-claude-widget-stop    # Stop the widget
+curl -fsSL https://github.com/StaticB1/claude_ai_usage_widget/raw/main/install.sh | bash
 ```
 
-The widget runs in the background and displays in your system tray.
-
-**Check if running:**
-```bash
-ps aux | grep '[c]laude_usage_widget'
-```
-
-## Getting Your OAuth Token
-
-### Option A: Claude Code (automatic)
-
-If you have [Claude Code](https://code.claude.com) installed and logged in:
+The script downloads the source, installs GTK3 bindings via your distro's
+package manager (apt / dnf / pacman / zypper), drops the app into
+`~/.local/share/claude-token-tracker`, registers `claude-token-tracker` (GUI)
+and `ctt` (CLI) in `~/.local/bin`, installs hicolor icons, and adds an
+autostart entry. Pass `--no-autostart` to skip the autostart step:
 
 ```bash
-claude login   # if not already
+curl -fsSL https://github.com/StaticB1/claude_ai_usage_widget/raw/main/install.sh | bash -s -- --no-autostart
 ```
 
-The widget auto-reads `~/.claude/.credentials.json` — no extra config needed.
-
-### Option B: Browser DevTools (manual)
-
-1. Open https://claude.ai and log in
-2. Open DevTools → **Network** tab
-3. Send a message, then filter requests for `api.anthropic.com`
-4. Find the `Authorization: Bearer sk-ant-oat01-...` header
-5. Copy the full token starting with `sk-ant-oat01-`
-6. Enter it via the widget's **Set Token…** menu item
-
-The token is saved to `~/.config/claude-usage-widget/config.json` (mode 600).
-
-## How It Works
-
-Uses the same internal API endpoint Claude Code uses:
-
-```
-GET https://api.anthropic.com/api/oauth/usage
-Authorization: Bearer <oauth-token>
-anthropic-beta: oauth-2025-04-20
-```
-
-Returns:
-```json
-{
-  "five_hour":  { "utilization": 10.0, "resets_at": "2026-02-19T05:00:00Z" },
-  "seven_day":  { "utilization": 2.0,  "resets_at": "2026-02-24T08:00:00Z" },
-  "extra_usage": {
-    "is_enabled": true,
-    "monthly_limit": 2000,
-    "used_credits": 500.0,
-    "utilization": 25.0
-  }
-}
-```
-
-The widget handles all three sections. `extra_usage` is shown only when `is_enabled` is true.
-
-## Configuration
-
-Edit `~/.config/claude-usage-widget/config.json`:
-
-```json
-{
-  "oauth_token": "sk-ant-oat01-..."
-}
-```
-
-To change refresh interval, edit `REFRESH_INTERVAL_SEC` in the Python script (default: 120s).
-
-## Upgrade
+### From a clone
 
 ```bash
+git clone https://github.com/StaticB1/claude_ai_usage_widget.git
 cd claude_ai_usage_widget
-chmod +x upgrade.sh && ./upgrade.sh
+bash install.sh                    # add --no-autostart to skip login startup
 ```
 
-This will pull the latest version, reinstall, and restart the widget automatically. Your OAuth token and config are preserved.
+### macOS / Windows / headless servers (CLI only)
 
-**Manual upgrade** (if you prefer step by step):
+The CLI (`ctt`) is pure-Python stdlib and works without GTK:
+
 ```bash
-cd claude_ai_usage_widget
-git pull
-claude-widget-stop
-./install.sh
-claude-widget-start
+pip install --user git+https://github.com/StaticB1/claude_ai_usage_widget.git
+ctt --help
 ```
 
 ## Uninstall
 
 ```bash
-chmod +x uninstall.sh
-./uninstall.sh
+# If installed via curl / git clone:
+bash <(curl -fsSL https://github.com/StaticB1/claude_ai_usage_widget/raw/main/install.sh) --uninstall
+
+# Or, if you still have the clone:
+bash install.sh --uninstall
+
+# CLI-only install:
+pip uninstall claude-token-tracker
+
+# Remove your stored history (optional):
+rm -rf ~/.config/claude-token-tracker
 ```
 
-This will remove:
-- Installation directory (`~/.local/share/claude-usage-widget/`)
-- Wrapper scripts (`claude-widget-start`, `claude-widget-stop`)
-- Symlink (`~/.local/bin/claude-usage-widget`)
-- Autostart entry (`~/.config/autostart/claude-usage-widget.desktop`)
-- Application entry (`~/.local/share/applications/claude-usage-widget.desktop`)
+The uninstaller removes the app dir, both binaries, the `.desktop` entries,
+the autostart entry, and the hicolor icons. It deliberately keeps
+`~/.config/claude-token-tracker/` (history.db, budgets, rate-card override)
+so you don't lose months of data on a reinstall — delete that directory
+manually if you want a true clean wipe.
 
-You'll be prompted whether to keep or remove your config (OAuth token).
+## CLI
 
-## Development
+```
+ctt scan                       # import new logs from ~/.claude into the store
+ctt summary --period 30d       # per-project totals (table or --json)
+ctt models  --period 7d        # per-model breakdown (table or --json)
+ctt tools   --period 7d        # tool-call attribution (Bash, Edit, …)
+ctt block                      # active 5h block + burn rate + ETA
+ctt cloud                      # raw cloud usage JSON from claude.ai
+ctt prompt                     # one-line status: shell prompts / status bars
+ctt export --format csv > x.csv
+ctt budget add --name "month cap" --usd 100 --period month
+ctt budget list
+ctt budget remove 1
+ctt reprice                    # reprice stored history after rate-card edit
+ctt gui                        # launch GTK dashboard (Linux)
+```
 
-### Pre-Release Validation
+### Examples
 
-Before creating a release or pushing to the repository, run the validation script to check for common issues:
-
+Show in your shell prompt:
 ```bash
-chmod +x validate.sh
-./validate.sh
+PS1='$(ctt prompt --no-cloud) \$ '
+# Renders e.g. '4h 17m $1.24 \$' while Claude Code is active.
 ```
 
-The script performs these checks:
-- **Python syntax** — validates `claude_usage_widget.py` compiles
-- **Shell scripts** — validates `install.sh` and `uninstall.sh` syntax
-- **Token leaks** — scans for real OAuth tokens in repository (placeholders OK)
-- **File permissions** — verifies secure file modes
-- **Required files** — checks all distribution files exist
-- **TODO/FIXME** — finds unresolved comments
-- **README placeholders** — ensures no template placeholders remain
-- **Version tags** — validates git tag matches code version
+CI guardrail — fail a build if today's Opus spend > $20:
+```bash
+COST=$(ctt summary --period today --json | jq '.totals.cost_usd')
+[ "$(echo "$COST > 20" | bc)" -eq 1 ] && { echo "Daily Claude budget blown: $$COST"; exit 1; }
+```
 
-**Exit codes:**
-- `0` — All checks passed, ready for release
-- `1` — Errors found, fix before releasing
+## Configuration
 
-This is especially useful for:
-- Pre-commit validation
-- CI/CD integration
-- Ensuring quality before releases
-- Catching common mistakes (token leaks, missing files, etc.)
-
-## Troubleshooting
-
-| Problem | Fix |
+| Path | What it is |
 |---|---|
-| No tray icon on GNOME 43+ | Install `gnome-shell-extension-appindicator` and enable it |
-| `AppIndicator3` import fails | `sudo apt install gir1.2-appindicator3-0.1` |
-| `ModuleNotFoundError: No module named 'gi'` | You're using pyenv/conda Python. Use `claude-widget-start` which uses system Python |
-| `symbol lookup error: libpthread.so.0` | Snap library conflict. Use `claude-widget-start` which sets clean environment |
-| `command not found` after install/uninstall | Run `hash -r` to clear bash's command cache, or close/reopen terminal |
-| Token expired / 401 | Re-run `claude login` (Claude Code) or re-extract from browser |
-| Icon shows "ERR" | Check token validity and network connectivity |
+| `~/.claude/projects/` | Read — Claude Code's session JSONL (source of truth). |
+| `~/.claude/.credentials.json` | Read — OAuth token managed by `claude` CLI. |
+| `~/.config/claude-token-tracker/history.db` | SQLite — long-term token/cost history. |
+| `~/.config/claude-token-tracker/config.json` | Optional fallback OAuth token (when `claude` CLI isn't installed). |
+| `~/.config/claude-token-tracker/rate_card.json` | Optional pricing override. |
 
-### Python Environment Issues
+### Rate-card override
 
-If you use **pyenv**, **conda**, or other Python version managers, the `python3-gi` system package may not be accessible. The installer creates wrapper scripts (`claude-widget-start`/`claude-widget-stop`) that automatically use the system Python (`/usr/bin/python3`) with a clean environment to avoid conflicts.
-
-### Checking Logs
-
-If the widget fails to start or behaves unexpectedly, check the log file:
-
-```bash
-cat /tmp/claude-widget.log
+```json
+{
+  "models": {
+    "claude-opus-4-7":    [15.0, 18.75, 30.0, 1.50, 75.0],
+    "claude-sonnet-4-7":  [3.0,  3.75,   6.0, 0.30, 15.0]
+  }
+}
 ```
 
-Common issues in logs:
-- **Symbol lookup errors**: Snap library conflicts (use `claude-widget-start`)
-- **Module import errors**: Python environment issues (use `claude-widget-start`)
-- **HTTP 401/403 errors**: Token expired or invalid (refresh token)
-- **Network errors**: Check internet connectivity or API availability
+Tuple is `[input, cache_write_5m, cache_write_1h, cache_read, output]` in
+USD per million tokens. Run `ctt reprice` after editing.
 
-## Contributing & Contact
+## Architecture
 
-Contributions are welcome!
+```
+cct/
+├── parser.py    JSONL → Turn (with tool_use extraction, sidechain flag)
+├── pricing.py   Rate card + override loader
+├── store.py     SQLite store with budgets + summaries
+├── blocks.py    Anthropic-style 5h rolling blocks + burn-rate forecast
+├── budgets.py   Period evaluation (day/week/month, scoped)
+├── cloud.py     OAuth + claude.ai usage API
+├── cli.py       `ctt` argparse commands
+└── gui.py       GTK3 dashboard (Linux)
+```
 
-- **Bug reports / feature requests** — [Open an issue](https://github.com/StaticB1/claude_ai_usage_widget/issues)
-- **Discussions / collaboration** — [GitHub Discussions](https://github.com/StaticB1/claude_ai_usage_widget/discussions)
-- **Email** — contact@statotec.com
+## Tests
 
-## Changelog
+```bash
+pip install pytest
+pytest
+```
 
-See [CHANGELOG.md](CHANGELOG.md) for the full release history.
+## Acknowledgments
+
+Claude Token Tracker grew out of
+[**claude_ai_usage_widget**](https://github.com/StaticB1/claude_ai_usage_widget)
+by **StaticB1** — the original GTK widget for live Claude.ai 5-hour / 7-day
+usage. Its tray gauge, escalation notifications, and plan-utilization view are
+the foundation this project builds on. Thanks to StaticB1 for the original
+work and for taking this upgrade upstream.
 
 ## License
 
-MIT
+MIT.
 
-## Author
+## Authors
 
-Created by **Statotech Systems**
-
----
-
-Made with ⚡ by [Statotech Systems](https://github.com/StaticB1)
+- Original `claude_ai_usage_widget` — **StaticB1**
+- Token-tracker upgrade — **Statotech Systems**, in partnership with **Ebenworks**

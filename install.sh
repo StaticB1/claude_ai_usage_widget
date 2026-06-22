@@ -1,163 +1,389 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_ID="claude-usage-widget"
-INSTALL_DIR="$HOME/.local/share/$APP_ID"
-BIN_LINK="$HOME/.local/bin/claude-usage-widget"
+# Repo info — used when the script is piped from curl and needs to fetch
+# the source tarball itself.
+REPO_OWNER="StaticB1"
+REPO_NAME="claude_ai_usage_widget"
+REPO_BRANCH="main"
+REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}"
+TARBALL_URL="${REPO_URL}/archive/refs/heads/${REPO_BRANCH}.tar.gz"
 
-echo "╔══════════════════════════════════════════╗"
-echo "║   Claude AI Usage Widget — Installer     ║"
-echo "╚══════════════════════════════════════════╝"
-
-# ── Dependencies ────────────────────────────────────────────────────────────
-
-echo ""
-echo "▸ Checking dependencies…"
-
-MISSING=()
-
-# Python 3
-if ! command -v python3 &>/dev/null; then
-    MISSING+=("python3")
+# Resolve the script's directory, but be tolerant when piped (no real path).
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+else
+    SCRIPT_DIR=""
 fi
 
-# GIR packages
-python3 -c "import gi; gi.require_version('Gtk','3.0'); gi.require_version('AppIndicator3','0.1'); gi.require_version('Notify','0.7')" 2>/dev/null || {
-    MISSING+=("gir1.2-appindicator3-0.1" "gir1.2-notify-0.7")
+INSTALL_DIR="$HOME/.local/share/claude-token-tracker"
+BIN_DIR="$HOME/.local/bin"
+GUI_BIN="$BIN_DIR/claude-token-tracker"
+CLI_BIN="$BIN_DIR/ctt"
+AUTOSTART_DIR="$HOME/.config/autostart"
+APPS_DIR="$HOME/.local/share/applications"
+ICON_BASE="$HOME/.local/share/icons/hicolor"
+DESKTOP_ID="claude-token-tracker"
+
+AUTOSTART=true
+UNINSTALL=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --no-autostart) AUTOSTART=false ;;
+        --uninstall)    UNINSTALL=true  ;;
+        --help|-h)
+            echo "Usage: bash install.sh [--no-autostart] [--uninstall]"
+            echo "  --no-autostart   Skip adding to login startup"
+            echo "  --uninstall      Remove all installed files"
+            echo
+            echo "Curl install (no clone needed):"
+            echo "  curl -fsSL ${REPO_URL}/raw/${REPO_BRANCH}/install.sh | bash"
+            exit 0 ;;
+    esac
+done
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+    GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
+    BOLD='\033[1m';     RESET='\033[0m'
+else
+    GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
+fi
+
+ok()      { echo -e "${GREEN}✓${RESET} $*"; }
+warn()    { echo -e "${YELLOW}! $*${RESET}"; }
+err()     { echo -e "${RED}✗ $*${RESET}" >&2; exit 1; }
+section() { echo -e "\n${BOLD}── $* ──${RESET}"; }
+
+CONFIG_DIR="$HOME/.config/claude-token-tracker"
+
+if $UNINSTALL; then
+    section "Uninstalling Claude Token Tracker"
+    rm -rf  "$INSTALL_DIR"
+    rm -f   "$GUI_BIN" "$CLI_BIN"
+    rm -f   "$AUTOSTART_DIR/$DESKTOP_ID.desktop"
+    rm -f   "$APPS_DIR/$DESKTOP_ID.desktop"
+    for size in 16 24 32 48 64 128 256 512; do
+        rm -f "$ICON_BASE/${size}x${size}/apps/$DESKTOP_ID.png"
+    done
+    command -v gtk-update-icon-cache &>/dev/null \
+        && gtk-update-icon-cache -q "$ICON_BASE" 2>/dev/null || true
+    if [ -d "$CONFIG_DIR" ]; then
+        if [ -t 0 ]; then
+            read -r -p "Also delete $CONFIG_DIR (history, budgets, accounts)? [y/N]: " ans
+            case "$ans" in
+                y|Y|yes|YES)
+                    rm -rf "$CONFIG_DIR"
+                    ok "Removed $CONFIG_DIR"
+                    ;;
+                *)
+                    ok "Kept $CONFIG_DIR (delete manually if desired)"
+                    ;;
+            esac
+        else
+            ok "Kept $CONFIG_DIR (run interactively, or 'rm -rf $CONFIG_DIR' to wipe)"
+        fi
+    fi
+    ok "Uninstalled."
+    exit 0
+fi
+
+echo -e "${BOLD}Claude Token Tracker — installer${RESET}"
+
+# When piped from curl, or run from a directory missing the source tree,
+# fetch the tarball and re-anchor SCRIPT_DIR onto the extracted copy.
+needs_bootstrap=false
+if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR/cct" ]; then
+    needs_bootstrap=true
+fi
+
+if $needs_bootstrap; then
+    section "Fetching source from $REPO_URL"
+    command -v tar &>/dev/null || err "tar not found. Install tar."
+    if command -v curl &>/dev/null; then
+        FETCH=(curl -fsSL --retry 3 -o)
+    elif command -v wget &>/dev/null; then
+        FETCH=(wget -q -O)
+    else
+        err "Neither curl nor wget found. Install one to bootstrap from GitHub."
+    fi
+    TMPDIR_BOOT="$(mktemp -d)"
+    trap 'rm -rf "$TMPDIR_BOOT"' EXIT
+    "${FETCH[@]}" "$TMPDIR_BOOT/src.tar.gz" "$TARBALL_URL" \
+        || err "Download failed: $TARBALL_URL"
+    tar -xzf "$TMPDIR_BOOT/src.tar.gz" -C "$TMPDIR_BOOT"
+    extracted="$(find "$TMPDIR_BOOT" -maxdepth 2 -type d -name 'cct' \
+                 -printf '%h\n' | head -1)"
+    [ -n "$extracted" ] || err "Source tarball did not contain a cct/ package."
+    SCRIPT_DIR="$extracted"
+    ok "Source extracted to $SCRIPT_DIR"
+fi
+
+section "Checking Python"
+command -v python3 &>/dev/null || err "python3 not found. Install Python 3.8+."
+PY_OK=$(python3 -c "import sys; print(sys.version_info >= (3,8))")
+PY_VER=$(python3 -c "import sys; v=sys.version_info; print(f'{v.major}.{v.minor}.{v.micro}')")
+[[ "$PY_OK" == "True" ]] || err "Python 3.8+ required (found $PY_VER)."
+ok "Python $PY_VER"
+
+# pyenv-aware install: when pyenv is detected, drop a dedicated venv next to
+# the install. The launcher invokes that venv's python directly so a later
+# `pyenv global` flip won't break the widget. --system-site-packages keeps
+# PyGObject available (it's installed system-wide via apt/dnf, not pip).
+USE_VENV=false
+VENV_DIR="$INSTALL_DIR/.venv"
+PYTHON_FOR_LAUNCHER="python3"
+if command -v pyenv &>/dev/null; then
+    ok "pyenv detected — creating isolated venv (survives pyenv version switches)"
+    USE_VENV=true
+fi
+
+section "Installing system dependencies (GTK3 + AppIndicator)"
+
+need_gi=false; need_gtk=false
+python3 -c "import gi" 2>/dev/null || need_gi=true
+python3 -c "
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk
+" 2>/dev/null || need_gtk=true
+
+has_indicator() {
+    python3 -c "
+import gi
+try:
+    gi.require_version('AyatanaAppIndicator3', '0.1')
+    from gi.repository import AyatanaAppIndicator3
+except Exception:
+    gi.require_version('AppIndicator3', '0.1')
+    from gi.repository import AppIndicator3
+" 2>/dev/null
 }
 
-if [ ${#MISSING[@]} -gt 0 ]; then
-    echo "  ✗ Missing packages: ${MISSING[*]}"
-    echo ""
-    echo "  Install them with:"
-    echo "    sudo apt install python3 gir1.2-appindicator3-0.1 gir1.2-notify-0.7 python3-gi"
-    echo ""
-    read -rp "  Install now? [Y/n] " yn
-    case "${yn,,}" in
-        n|no) echo "  Aborted."; exit 1 ;;
-        *)
-            sudo apt update
-            sudo apt install -y python3 python3-gi gir1.2-appindicator3-0.1 gir1.2-notify-0.7
-            ;;
-    esac
-fi
-
-echo "  ✓ All dependencies satisfied"
-
-# ── Install files ───────────────────────────────────────────────────────────
-
-echo ""
-echo "▸ Installing to $INSTALL_DIR …"
-
-mkdir -p "$INSTALL_DIR"
-cp claude_usage_widget.py "$INSTALL_DIR/claude_usage_widget.py"
-chmod +x "$INSTALL_DIR/claude_usage_widget.py"
-
-mkdir -p "$(dirname "$BIN_LINK")"
-ln -sf "$INSTALL_DIR/claude_usage_widget.py" "$BIN_LINK"
-
-# Create wrapper scripts for easy start/stop
-cat > "$HOME/.local/bin/claude-widget-start" <<'EOFSTART'
-#!/bin/bash
-# Start Claude Usage Widget with clean environment
-env -i \
-  HOME="$HOME" \
-  DISPLAY="$DISPLAY" \
-  DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
-  XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-  PATH="/usr/local/bin:/usr/bin:/bin" \
-  /usr/bin/python3 ~/.local/share/claude-usage-widget/claude_usage_widget.py > /tmp/claude-widget.log 2>&1 &
-
-sleep 1
-if ps aux | grep -q '[c]laude_usage_widget'; then
-    echo "✓ Claude widget started"
+if ! $need_gi && ! $need_gtk; then
+    ok "GTK3 Python bindings already present"
 else
-    echo "✗ Failed to start. Check /tmp/claude-widget.log"
-    exit 1
+    if command -v apt-get &>/dev/null; then
+        pkgs=()
+        $need_gi  && pkgs+=("python3-gi")
+        $need_gtk && pkgs+=("gir1.2-gtk-3.0")
+        echo "apt: installing ${pkgs[*]}"
+        sudo apt-get install -y "${pkgs[@]}"
+    elif command -v dnf &>/dev/null; then
+        pkgs=()
+        $need_gi  && pkgs+=("python3-gobject")
+        $need_gtk && pkgs+=("gtk3")
+        sudo dnf install -y "${pkgs[@]}"
+    elif command -v pacman &>/dev/null; then
+        pkgs=()
+        $need_gi  && pkgs+=("python-gobject")
+        $need_gtk && pkgs+=("gtk3")
+        sudo pacman -S --noconfirm "${pkgs[@]}"
+    elif command -v zypper &>/dev/null; then
+        pkgs=()
+        $need_gi  && pkgs+=("python3-gobject")
+        $need_gtk && pkgs+=("gtk3")
+        sudo zypper install -y "${pkgs[@]}"
+    else
+        warn "Unknown package manager. Install python3-gi + GTK3 bindings manually."
+    fi
 fi
-EOFSTART
 
-cat > "$HOME/.local/bin/claude-widget-stop" <<'EOFSTOP'
-#!/bin/bash
-# Stop Claude Usage Widget
-if pkill -f claude_usage_widget.py 2>/dev/null; then
-    echo "✓ Claude widget stopped"
-else
-    echo "✗ Widget not running"
-    exit 1
+python3 -c "
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk
+" 2>/dev/null || err "GTK3 bindings still not available."
+ok "GTK3 bindings OK"
+
+if ! has_indicator; then
+    echo "  Installing AppIndicator (system tray)..."
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get install -y gir1.2-ayatanaappindicator3-0.1 2>/dev/null \
+            || sudo apt-get install -y gir1.2-appindicator3-0.1 2>/dev/null \
+            || warn "AppIndicator unavailable — tray icon won't appear (app still works)"
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y libayatana-appindicator-gtk3 2>/dev/null \
+            || sudo dnf install -y libappindicator-gtk3 2>/dev/null \
+            || warn "AppIndicator unavailable — tray icon won't appear"
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -S --noconfirm libayatana-appindicator 2>/dev/null \
+            || warn "AppIndicator unavailable — tray icon won't appear"
+    elif command -v zypper &>/dev/null; then
+        sudo zypper install -y libayatana-appindicator3-1 2>/dev/null \
+            || warn "AppIndicator unavailable — tray icon won't appear"
+    fi
 fi
-EOFSTOP
+has_indicator && ok "AppIndicator OK" || true
 
-chmod +x "$HOME/.local/bin/claude-widget-start"
-chmod +x "$HOME/.local/bin/claude-widget-stop"
+section "Installing app"
+mkdir -p "$INSTALL_DIR" "$BIN_DIR" "$AUTOSTART_DIR" "$APPS_DIR"
 
-echo "  ✓ Installed"
+if $USE_VENV; then
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+        python3 -m venv --system-site-packages "$VENV_DIR"
+    fi
+    PYTHON_FOR_LAUNCHER="$VENV_DIR/bin/python"
+    ok "Venv ready: $VENV_DIR"
+fi
 
-# ── Desktop autostart entry ─────────────────────────────────────────────────
+# Copy package + entry shim. We don't pip-install because GTK is system-only.
+rm -rf "$INSTALL_DIR/cct" "$INSTALL_DIR/assets" "$INSTALL_DIR/claude_token_tracker.py"
+cp -r  "$SCRIPT_DIR/cct" "$INSTALL_DIR/cct"
+[ -d "$SCRIPT_DIR/assets" ] && cp -r "$SCRIPT_DIR/assets" "$INSTALL_DIR/assets"
+cp     "$SCRIPT_DIR/claude_token_tracker.py" "$INSTALL_DIR/claude_token_tracker.py"
+chmod +x "$INSTALL_DIR/claude_token_tracker.py"
+ok "Copied to $INSTALL_DIR"
 
-echo ""
-echo "▸ Creating autostart entry…"
+# Install hicolor icons so the desktop file's Icon= name resolves system-wide
+section "Installing app icon"
+mkdir -p "$ICON_BASE"
+# gtk-update-icon-cache is a no-op without an index.theme. Most user-level
+# hicolor dirs don't ship one — copy it from the system theme so launchers
+# (Unity, GNOME, KDE) actually resolve our Icon= name.
+if [ ! -f "$ICON_BASE/index.theme" ] && [ -f /usr/share/icons/hicolor/index.theme ]; then
+    cp /usr/share/icons/hicolor/index.theme "$ICON_BASE/index.theme"
+fi
+for size in 16 24 32 48 64 128 256 512; do
+    src="$SCRIPT_DIR/assets/icon-${size}.png"
+    if [ -f "$src" ]; then
+        dest_dir="$ICON_BASE/${size}x${size}/apps"
+        mkdir -p "$dest_dir"
+        cp "$src" "$dest_dir/$DESKTOP_ID.png"
+    fi
+done
+if command -v gtk-update-icon-cache &>/dev/null; then
+    gtk-update-icon-cache -f -q "$ICON_BASE" 2>/dev/null || true
+fi
+if command -v update-desktop-database &>/dev/null; then
+    update-desktop-database "$APPS_DIR" 2>/dev/null || true
+fi
+ok "Icons installed to $ICON_BASE"
 
-AUTOSTART_DIR="$HOME/.config/autostart"
-mkdir -p "$AUTOSTART_DIR"
+# GUI launcher (note: $PYTHON_FOR_LAUNCHER is interpolated at install time —
+# either "python3" (system Python) or the venv's python (pyenv-isolated)).
+cat > "$GUI_BIN" << EOF
+#!/usr/bin/env bash
+exec "$PYTHON_FOR_LAUNCHER" "$INSTALL_DIR/claude_token_tracker.py" "\$@"
+EOF
+chmod +x "$GUI_BIN"
+ok "GUI launcher: $GUI_BIN"
 
-cat > "$AUTOSTART_DIR/$APP_ID.desktop" <<EOF
+cat > "$CLI_BIN" << EOF
+#!/usr/bin/env bash
+PYTHONPATH="$INSTALL_DIR:\${PYTHONPATH-}" \\
+    exec "$PYTHON_FOR_LAUNCHER" -m cct "\$@"
+EOF
+chmod +x "$CLI_BIN"
+ok "CLI launcher:  $CLI_BIN  (try: ctt summary)"
+
+if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+        if [[ -f "$rc" ]]; then
+            echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> "$rc"
+            warn "Added ~/.local/bin to PATH in $rc — restart shell or run: export PATH=\"\$HOME/.local/bin:\$PATH\""
+            break
+        fi
+    done
+fi
+
+cat > "$APPS_DIR/$DESKTOP_ID.desktop" << EOF
 [Desktop Entry]
 Type=Application
-Name=Claude Usage Widget
-Comment=Shows Claude AI usage in system tray
-Exec=env -u LD_LIBRARY_PATH PATH="/usr/local/bin:/usr/bin:/bin" /usr/bin/python3 $INSTALL_DIR/claude_usage_widget.py
-Icon=network-transmit-receive
+Name=Claude Token Tracker
+Exec=$GUI_BIN
+Icon=claude-token-tracker
+Comment=Track Claude Code token usage per project
+Categories=Utility;Development;
 Terminal=false
-Categories=Utility;
 StartupNotify=false
+EOF
+ok "App menu entry created"
+
+if [ -t 0 ]; then
+    section "Setting up accounts"
+    mkdir -p "$CONFIG_DIR"
+    CFG="$CONFIG_DIR/config.json"
+    read -r -p "  How many Claude accounts do you want to monitor? [1]: " NACC
+    NACC="${NACC:-1}"
+    if ! [[ "$NACC" =~ ^[0-9]+$ ]] || [ "$NACC" -lt 1 ]; then
+        warn "Invalid count — defaulting to 1"
+        NACC=1
+    fi
+
+    ACC_JSON=""
+    for i in $(seq 1 "$NACC"); do
+        echo
+        echo "  — Account $i of $NACC —"
+        DEFAULT_LABEL="Account$i"
+        [ "$i" = "1" ] && [ "$NACC" = "1" ] && DEFAULT_LABEL="default"
+        read -r -p "    Label [$DEFAULT_LABEL]: " LABEL
+        LABEL="${LABEL:-$DEFAULT_LABEL}"
+        read -r -p "    Claude config dir [$HOME/.claude]: " CDIR
+        CDIR="${CDIR:-$HOME/.claude}"
+        # Expand ~/ in case the user typed it literally.
+        CDIR="${CDIR/#\~/$HOME}"
+        if [ -f "$CDIR/.credentials.json" ]; then
+            ok "    Found credentials at $CDIR/.credentials.json"
+        else
+            warn "    No .credentials.json in $CDIR — run 'claude login' there later."
+        fi
+        # Build the JSON line by line — escape backslashes/quotes in label.
+        ESC_LABEL="${LABEL//\\/\\\\}"; ESC_LABEL="${ESC_LABEL//\"/\\\"}"
+        ESC_CDIR="${CDIR//\\/\\\\}"; ESC_CDIR="${ESC_CDIR//\"/\\\"}"
+        SEP=","
+        [ -z "$ACC_JSON" ] && SEP=""
+        ACC_JSON+="${SEP}{\"label\":\"$ESC_LABEL\",\"claude_dir\":\"$ESC_CDIR\",\"disable_polling\":false,\"hide_from_tray\":false}"
+    done
+
+    # Preserve any existing config keys (e.g. legacy oauth_token, settings)
+    # by merging in Python rather than blasting the file.
+    python3 - "$CFG" "$ACC_JSON" << 'PYEOF'
+import json, os, sys
+path, accounts_json = sys.argv[1], sys.argv[2]
+existing = {}
+if os.path.exists(path):
+    try:
+        existing = json.loads(open(path).read())
+    except Exception:
+        existing = {}
+existing['accounts'] = json.loads('[' + accounts_json + ']')
+with open(path, 'w') as f:
+    json.dump(existing, f, indent=2)
+os.chmod(path, 0o600)
+PYEOF
+    ok "Account config written to $CFG"
+else
+    # Non-interactive (curl | bash): leave config alone — the app falls back
+    # to a single 'default' account at ~/.claude on first run.
+    :
+fi
+
+if $AUTOSTART; then
+    cat > "$AUTOSTART_DIR/$DESKTOP_ID.desktop" << EOF
+[Desktop Entry]
+Type=Application
+Name=Claude Token Tracker
+Exec=$GUI_BIN
+Icon=claude-token-tracker
+Comment=Track Claude Code token usage per project
+Hidden=false
+NoDisplay=false
 X-GNOME-Autostart-enabled=true
 EOF
-
-echo "  ✓ Autostart enabled"
-
-# ── Desktop application entry ───────────────────────────────────────────────
-
-APPS_DIR="$HOME/.local/share/applications"
-mkdir -p "$APPS_DIR"
-
-cat > "$APPS_DIR/$APP_ID.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=Claude Usage Widget
-Comment=Shows Claude AI usage in system tray
-Exec=$BIN_LINK
-Icon=network-transmit-receive
-Terminal=false
-Categories=Utility;
-StartupNotify=false
-EOF
-
-echo "  ✓ Application entry created"
-
-# ── Check for existing token ────────────────────────────────────────────────
-
-echo ""
-CRED_FILE="$HOME/.claude/.credentials.json"
-if [ -f "$CRED_FILE" ]; then
-    echo "  ✓ Found Claude Code credentials — token will be auto-detected"
+    ok "Autostart on login enabled"
 else
-    echo "  ⚠ No Claude Code credentials found at $CRED_FILE"
-    echo "    You'll be prompted to enter your OAuth token on first run."
-    echo ""
-    echo "    To get your token:"
-    echo "    Option A: Install Claude Code → 'claude login' → token saved automatically"
-    echo "    Option B: Browser DevTools → Network tab → filter 'api.anthropic.com'"
-    echo "              → copy the Authorization: Bearer sk-ant-oat01-... header value"
+    rm -f "$AUTOSTART_DIR/$DESKTOP_ID.desktop"
+    ok "Skipped autostart (--no-autostart)"
 fi
 
-# ── Done ────────────────────────────────────────────────────────────────────
-
 echo ""
-echo "╔══════════════════════════════════════════╗"
-echo "║   ✓ Installation complete!               ║"
-echo "║                                          ║"
-echo "║   Start:  claude-widget-start            ║"
-echo "║   Stop:   claude-widget-stop             ║"
-echo "║   (or reboot — it autostarts)            ║"
-echo "╚══════════════════════════════════════════╝"
+echo -e "${BOLD}${GREEN}Installation complete!${RESET}"
+echo ""
+echo "  GUI:        claude-token-tracker"
+echo "  CLI:        ctt summary  |  ctt block  |  ctt --help"
+echo "  App menu:   search 'Claude Token Tracker'"
+$AUTOSTART && echo "  Startup:    auto-starts on next login"
+echo ""
+echo "  Uninstall:  bash $SCRIPT_DIR/install.sh --uninstall"
