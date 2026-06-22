@@ -122,8 +122,9 @@ def _utilization_pct(usage_data: Optional[dict],
         v = float(raw)
     except (TypeError, ValueError):
         return None
-    if v <= 1:
-        v *= 100.0
+    # Utilization from the usage API is already a percentage (0-100); use it
+    # directly. The old `if v <= 1: v *= 100` heuristic turned genuine sub-1%
+    # usage into 100% (issue #4).
     return max(0.0, min(v, 999.0))
 
 

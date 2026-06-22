@@ -153,11 +153,15 @@ def test_separate_accounts_isolated(tmp_path):
     assert [n.account for n in b] == ['personal']
 
 
-def test_snapshot_from_cloud_data_handles_fraction_or_percent():
+def test_snapshot_from_cloud_data_reads_percentages():
+    # The usage API reports utilization as a percentage (0-100).
     s1 = WindowSnapshot.from_cloud_data({
-        'five_hour': {'utilization': 0.42, 'resets_at': 'x'},
+        'five_hour': {'utilization': 42, 'resets_at': 'x'},
         'seven_day': {'utilization': 73, 'resets_at': 'y'},
     })
     assert s1.five_hour_pct == 42
     assert s1.seven_day_pct == 73
+    # Regression for issue #4: a sub-1% value stays sub-1%, not 100%.
+    s2 = WindowSnapshot.from_cloud_data({'seven_day': {'utilization': 1.0}})
+    assert s2.seven_day_pct == 1.0
     assert WindowSnapshot.from_cloud_data(None).five_hour_pct is None

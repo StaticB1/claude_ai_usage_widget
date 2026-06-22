@@ -108,15 +108,18 @@ def subscription_summary(info: Optional[dict]) -> Tuple[str, bool]:
 
 
 def normalize_utilization(raw) -> float:
-    """API returns either a 0..1 fraction or an integer percent — coerce
-    to 0..1 float clamped to that range."""
+    """The claude.ai usage API reports utilization as a percentage
+    (0-100; e.g. 62.0 means 62%). Convert to a 0..1 fraction for progress
+    bars, clamped to [0, 1].
+
+    NOTE: do NOT reintroduce a 'fraction vs percent' heuristic here. The old
+    `if v > 1: v /= 100` guess mis-scaled genuine sub-1% usage (a value of
+    1.0 == 1%) into a full 100% — the false 100% alert in issue #4."""
     try:
         v = float(raw or 0)
     except (TypeError, ValueError):
         return 0.0
-    if v > 1:
-        v = v / 100.0
-    return max(0.0, min(v, 1.0))
+    return max(0.0, min(v / 100.0, 1.0))
 
 
 def fetch_cloud_usage(token: str) -> dict:

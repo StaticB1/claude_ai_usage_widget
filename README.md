@@ -84,24 +84,26 @@ ctt --help
 ## Uninstall
 
 ```bash
-# If installed via curl / git clone:
+# From a clone — one command (also clears the legacy widget):
+bash uninstall.sh
+
+# No clone? The installer doubles as its own uninstaller:
 bash <(curl -fsSL https://github.com/StaticB1/claude_ai_usage_widget/raw/main/install.sh) --uninstall
 
-# Or, if you still have the clone:
-bash install.sh --uninstall
-
-# CLI-only install:
+# CLI-only (pip) install:
 pip uninstall claude-token-tracker
 
 # Remove your stored history (optional):
 rm -rf ~/.config/claude-token-tracker
 ```
 
-The uninstaller removes the app dir, both binaries, the `.desktop` entries,
-the autostart entry, and the hicolor icons. It deliberately keeps
-`~/.config/claude-token-tracker/` (history.db, budgets, rate-card override)
-so you don't lose months of data on a reinstall — delete that directory
-manually if you want a true clean wipe.
+`uninstall.sh` delegates to `install.sh --uninstall` (the canonical path) and
+then sweeps any leftovers from the original `claude-usage-widget`, so upgrading
+from the old widget leaves nothing behind. The uninstaller removes the app
+dir, both binaries, the `.desktop` entries, the autostart entry, and the
+hicolor icons. It deliberately keeps `~/.config/claude-token-tracker/`
+(history.db, budgets, rate-card override) so you don't lose months of data on
+a reinstall — delete that directory manually if you want a true clean wipe.
 
 ## CLI
 
@@ -179,6 +181,18 @@ cct/
 pip install pytest
 pytest
 ```
+
+## Contributing & Contact
+
+Contributions are welcome!
+
+- **Bug reports / feature requests** — [Open an issue](https://github.com/StaticB1/claude_ai_usage_widget/issues)
+- **Discussions / collaboration** — [GitHub Discussions](https://github.com/StaticB1/claude_ai_usage_widget/discussions)
+- **Email** — contact@statotec.com
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## Acknowledgments
 

@@ -127,9 +127,9 @@ def test_pct_budget_rejects_out_of_range(store):
 def test_pct_budget_evaluates_from_cloud_data(store):
     bid = store.add_budget('5h-cap', 'global', '5h',
                            limit_usd=None, limit_tokens=None, limit_pct=80.0)
-    usage = {'five_hour': {'utilization': 0.6,  # 60%
+    usage = {'five_hour': {'utilization': 60,  # 60%
                            'resets_at': '2026-04-28T18:00:00Z'},
-             'seven_day': {'utilization': 0.2}}
+             'seven_day': {'utilization': 20}}
     s = next(x for x in evaluate_budgets(store, usage_data=usage)
              if x.id == bid)
     assert s.is_pct_based
@@ -138,14 +138,16 @@ def test_pct_budget_evaluates_from_cloud_data(store):
     assert s.pct == pytest.approx(0.75)  # 60 / 80
 
 
-def test_pct_budget_handles_integer_percent_form(store):
+def test_pct_budget_low_percent_not_misscaled(store):
+    # Regression for issue #4: the usage API reports utilization as a
+    # percentage, so 1.0 means 1% — it must NOT be rescaled to 100%.
     bid = store.add_budget('5h-cap', 'global', '5h',
                            limit_usd=None, limit_tokens=None, limit_pct=80.0)
-    # Some API responses give integer % rather than 0..1 fraction
-    usage = {'five_hour': {'utilization': 60}}
+    usage = {'five_hour': {'utilization': 1.0}}
     s = next(x for x in evaluate_budgets(store, usage_data=usage)
              if x.id == bid)
-    assert s.spent_pct == pytest.approx(60.0)
+    assert s.spent_pct == pytest.approx(1.0)   # 1%, not 100%
+    assert s.pct == pytest.approx(0.0125)      # 1 / 80
 
 
 def test_pct_budget_without_cloud_data_is_dormant(store):
@@ -163,7 +165,7 @@ def test_pct_budget_should_notify_when_threshold_crossed(store):
                            limit_usd=None, limit_tokens=None,
                            limit_pct=80.0, notify_at_pct=70)
     # 60/80 = 75% of budget → above 70% notify threshold
-    usage = {'five_hour': {'utilization': 0.6}}
+    usage = {'five_hour': {'utilization': 60}}
     s = next(x for x in evaluate_budgets(store, usage_data=usage)
              if x.id == bid)
     assert s.should_notify()
@@ -172,9 +174,9 @@ def test_pct_budget_should_notify_when_threshold_crossed(store):
 def test_pct_period_key_changes_when_resets_at_advances(store):
     bid = store.add_budget('5h-cap', 'global', '5h',
                            limit_usd=None, limit_tokens=None, limit_pct=80.0)
-    u1 = {'five_hour': {'utilization': 0.5,
+    u1 = {'five_hour': {'utilization': 50,
                         'resets_at': '2026-04-28T18:00:00Z'}}
-    u2 = {'five_hour': {'utilization': 0.5,
+    u2 = {'five_hour': {'utilization': 50,
                         'resets_at': '2026-04-28T23:00:00Z'}}
     k1 = next(x for x in evaluate_budgets(store, usage_data=u1)
               if x.id == bid).period_key

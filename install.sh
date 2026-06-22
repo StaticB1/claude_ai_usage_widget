@@ -197,9 +197,39 @@ from gi.repository import Gtk
 " 2>/dev/null || err "GTK3 bindings still not available."
 ok "GTK3 bindings OK"
 
+# libnotify GI bindings — desktop alerts. Optional: the app runs without them
+# (notifications just go quiet). The typelib package is separate from python3-gi.
+if ! python3 -c "
+import gi
+gi.require_version('Notify', '0.7')
+from gi.repository import Notify
+" 2>/dev/null; then
+    echo "  Installing libnotify bindings (desktop notifications)..."
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get install -y gir1.2-notify-0.7 2>/dev/null \
+            || warn "libnotify bindings unavailable — desktop alerts off (app still works)"
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y libnotify 2>/dev/null \
+            || warn "libnotify bindings unavailable — desktop alerts off"
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -S --noconfirm libnotify 2>/dev/null \
+            || warn "libnotify bindings unavailable — desktop alerts off"
+    elif command -v zypper &>/dev/null; then
+        sudo zypper install -y typelib-1_0-Notify-0_7 2>/dev/null \
+            || warn "libnotify bindings unavailable — desktop alerts off"
+    fi
+fi
+python3 -c "
+import gi
+gi.require_version('Notify', '0.7')
+from gi.repository import Notify
+" 2>/dev/null && ok "libnotify bindings OK" || true
+
 if ! has_indicator; then
     echo "  Installing AppIndicator (system tray)..."
     if command -v apt-get &>/dev/null; then
+        # Debian 13 / recent Ubuntu renamed the old gir1.2-appindicator3-0.1
+        # to the Ayatana package; try it first, fall back for older distros.
         sudo apt-get install -y gir1.2-ayatanaappindicator3-0.1 2>/dev/null \
             || sudo apt-get install -y gir1.2-appindicator3-0.1 2>/dev/null \
             || warn "AppIndicator unavailable — tray icon won't appear (app still works)"
