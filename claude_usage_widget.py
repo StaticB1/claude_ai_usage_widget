@@ -344,13 +344,11 @@ class UsageDetailWindow(Gtk.Window):
                 vbox.pack_start(section_label, False, False, 0)
 
                 utilization = bucket.get("utilization", 0)
-                # Handle both decimal (0-1) and percentage (0-100) formats
-                if utilization > 1:  # Already a percentage
-                    pct = int(utilization)
-                    utilization_decimal = utilization / 100
-                else:  # Decimal format
-                    pct = int(utilization * 100)
-                    utilization_decimal = utilization
+                # The usage API reports utilization as a percentage (0-100).
+                # Don't guess 'decimal vs percentage' — that mis-scaled real
+                # sub-1% usage (e.g. 1.0 == 1%) into 100% (issue #4).
+                pct = int(round(utilization))
+                utilization_decimal = min(utilization / 100, 1.0)
 
                 # Big number
                 val = Gtk.Label(label=f"{pct}%")
@@ -605,20 +603,13 @@ class ClaudeUsageApp:
             u5 = five.get("utilization", 0)
             u7 = seven.get("utilization", 0)
 
-            # Handle both decimal (0-1) and percentage (0-100) formats
-            if u5 > 1:  # Already a percentage
-                pct5 = int(u5)
-                u5_decimal = u5 / 100
-            else:  # Decimal format, convert to percentage
-                pct5 = int(u5 * 100)
-                u5_decimal = u5
-
-            if u7 > 1:  # Already a percentage
-                pct7 = int(u7)
-                u7_decimal = u7 / 100
-            else:  # Decimal format, convert to percentage
-                pct7 = int(u7 * 100)
-                u7_decimal = u7
+            # Utilization from the usage API is a percentage (0-100). Don't
+            # guess 'decimal vs percentage' — that turned genuine sub-1% usage
+            # (1.0 == 1%) into a false 100% alert (issue #4).
+            pct5 = int(round(u5))
+            u5_decimal = min(u5 / 100, 1.0)
+            pct7 = int(round(u7))
+            u7_decimal = min(u7 / 100, 1.0)
 
             dominant = max(u5_decimal, u7_decimal)
 

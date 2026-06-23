@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-token-tracker"
+version = "3.0.0"
+description = "Persistent analytics over your local Claude Code logs: per-project / per-model / per-tool spend, 5-hour block forecasts, budgets, and a Linux GTK dashboard."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Statotech Systems" }, { name = "Ebenworks" }]
+keywords = ["claude", "anthropic", "claude-code", "tokens", "usage", "tracker"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: X11 Applications :: GTK",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development",
+    "Topic :: Utilities",
+]
+# Pure-stdlib for the lib + CLI. The GUI needs PyGObject + GTK3 system
+# packages — install them via your distro (see README) since they don't
+# ship as wheels.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+ctt = "cct.cli:main"
+claude-token-tracker = "cct.gui:run"
+
+[project.urls]
+Homepage = "https://github.com/StaticB1/claude_ai_usage_widget"
+Repository = "https://github.com/StaticB1/claude_ai_usage_widget"
+Issues = "https://github.com/StaticB1/claude_ai_usage_widget/issues"
+
+[tool.setuptools.packages.find]
+include = ["cct*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
