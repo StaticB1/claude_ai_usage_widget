@@ -7,7 +7,7 @@ from typing import List, Optional
 
 APP_ID = 'claude-token-tracker'
 APP_NAME = 'Claude Usage Widget & Token Tracker'
-APP_VERSION = '3.0.0'
+APP_VERSION = '2.0.0'
 
 CLAUDE_DIR = Path.home() / '.claude' / 'projects'
 CREDENTIALS_FILE = Path.home() / '.claude' / '.credentials.json'
