@@ -104,6 +104,38 @@ cd claude_ai_usage_widget
 bash install.sh                    # add --no-autostart to skip login startup
 ```
 
+### Upgrading from the old widget
+
+> **v2 is a rebrand, not a drop-in update.** The original single-file
+> **claude_ai_usage_widget** installed as `claude-usage-widget` (binaries
+> `claude-widget-start`/`-stop`, config in `~/.config/claude-usage-widget`).
+> v2 is **Claude Usage Widget & Token Tracker**, installed as
+> `claude-token-tracker` (+ the `ctt` CLI) under all-new paths. Because the
+> paths differ, **installing v2 doesn't remove v1** — the old widget would
+> keep auto-starting on login alongside the new one until you clear it.
+
+From an existing clone, one command handles the whole migration — pull, stop
+the old widget, sweep its leftover files, install v2, and relaunch:
+
+```bash
+cd claude_ai_usage_widget
+bash upgrade.sh
+```
+
+No clone? Sweep the legacy widget first, then run the one-line installer:
+
+```bash
+# 1. Remove the old widget (keeps ~/.config/claude-usage-widget in case it holds a token)
+bash <(curl -fsSL https://github.com/StaticB1/claude_ai_usage_widget/raw/main/uninstall.sh)
+# 2. Install v2
+curl -fsSL https://github.com/StaticB1/claude_ai_usage_widget/raw/main/install.sh | bash
+```
+
+Your data carries over automatically: the live widget re-reads the OAuth token
+from `~/.claude/.credentials.json`, and the new local history DB backfills from
+`~/.claude/projects` on the first `ctt scan`. Once v2 is confirmed working you
+can delete the old config with `rm -rf ~/.config/claude-usage-widget`.
+
 ### macOS / Windows / headless servers (CLI only)
 
 The CLI (`ctt`) is pure-Python stdlib and works without GTK:
