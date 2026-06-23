@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- App tile -->
+  <rect x="16" y="16" width="480" height="480" rx="104" fill="#FAFAF8" stroke="#ECEBE6" stroke-width="3"/>
+
+  <!-- Scan-frame corner brackets (slate) -->
+  <g fill="none" stroke="#1F2933" stroke-width="20" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M96 152 L96 116 Q96 96 116 96 L152 96"/>
+    <path d="M416 152 L416 116 Q416 96 396 96 L360 96"/>
+    <path d="M96 360 L96 396 Q96 416 116 416 L152 416"/>
+    <path d="M416 360 L416 396 Q416 416 396 416 L360 416"/>
+  </g>
+
+  <!-- Magnifier handle (slate) -->
+  <path d="M305 301 L372 368" fill="none" stroke="#1F2933" stroke-width="34" stroke-linecap="round"/>
+
+  <!-- Magnifier lens (teal ring, light fill) -->
+  <circle cx="240" cy="236" r="92" fill="#FAFAF8" stroke="#14B8A6" stroke-width="26"/>
+
+  <!-- Bar chart inside the lens (teal) -->
+  <g fill="#14B8A6">
+    <rect x="193" y="230" width="22" height="58" rx="7"/>
+    <rect x="229" y="192" width="22" height="96" rx="7"/>
+    <rect x="265" y="214" width="22" height="74" rx="7"/>
+  </g>
+</svg>

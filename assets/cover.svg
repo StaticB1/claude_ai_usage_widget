@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="420" viewBox="0 0 1280 420">
+  <rect width="1280" height="420" fill="#FAFAF8"/>
+
+  <!-- Mark (no tile), scaled + positioned on the left -->
+  <g transform="translate(-3.3,-3.3) scale(0.86)">
+    <g fill="none" stroke="#1F2933" stroke-width="20" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M96 152 L96 116 Q96 96 116 96 L152 96"/>
+      <path d="M416 152 L416 116 Q416 96 396 96 L360 96"/>
+      <path d="M96 360 L96 396 Q96 416 116 416 L152 416"/>
+      <path d="M416 360 L416 396 Q416 416 396 416 L360 416"/>
+    </g>
+    <path d="M305 301 L372 368" fill="none" stroke="#1F2933" stroke-width="34" stroke-linecap="round"/>
+    <circle cx="240" cy="236" r="92" fill="#FAFAF8" stroke="#14B8A6" stroke-width="26"/>
+    <g fill="#14B8A6">
+      <rect x="193" y="230" width="22" height="58" rx="7"/>
+      <rect x="229" y="192" width="22" height="96" rx="7"/>
+      <rect x="265" y="214" width="22" height="74" rx="7"/>
+    </g>
+  </g>
+
+  <!-- Wordmark (3 lines for the longer name) -->
+  <g font-family="DejaVu Sans, Verdana, sans-serif" font-weight="bold" fill="#1F2933" letter-spacing="-2">
+    <text x="410" y="148" font-size="68">claude</text>
+    <text x="410" y="240" font-size="68">usage widget</text>
+    <text x="410" y="332" font-size="68">&amp; token tracker</text>
+  </g>
+  <rect x="412" y="352" width="556" height="11" rx="5.5" fill="#14B8A6"/>
+</svg>
