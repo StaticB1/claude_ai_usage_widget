@@ -114,27 +114,28 @@ bash install.sh                    # add --no-autostart to skip login startup
 > paths differ, **installing v2 doesn't remove v1** — the old widget would
 > keep auto-starting on login alongside the new one until you clear it.
 
-From an existing clone, one command handles the whole migration — pull, stop
-the old widget, sweep its leftover files, install v2, and relaunch:
+**If you installed the old widget with the one-line installer (no repo folder),
+just run the installer again** — it now detects the old `claude-usage-widget`,
+stops it, and removes its files (dir, `claude-widget-start`/`-stop` binaries,
+and autostart entry) before installing v2:
 
 ```bash
-cd claude_ai_usage_widget
-bash upgrade.sh
-```
-
-No clone? Sweep the legacy widget first, then run the one-line installer:
-
-```bash
-# 1. Remove the old widget (keeps ~/.config/claude-usage-widget in case it holds a token)
-bash <(curl -fsSL https://github.com/StaticB1/claude_ai_usage_widget/raw/main/uninstall.sh)
-# 2. Install v2
 curl -fsSL https://github.com/StaticB1/claude_ai_usage_widget/raw/main/install.sh | bash
 ```
 
-Your data carries over automatically: the live widget re-reads the OAuth token
-from `~/.claude/.credentials.json`, and the new local history DB backfills from
-`~/.claude/projects` on the first `ctt scan`. Once v2 is confirmed working you
-can delete the old config with `rm -rf ~/.config/claude-usage-widget`.
+**If you have a clone**, one command pulls the latest and runs the same migration:
+
+```bash
+cd claude_ai_usage_widget
+git pull        # or: bash upgrade.sh, which pulls + reinstalls + relaunches for you
+bash install.sh
+```
+
+Either way your data carries over automatically: the live widget re-reads the
+OAuth token from `~/.claude/.credentials.json`, and the new local history DB
+backfills from `~/.claude/projects` on the first `ctt scan`. The old config dir
+`~/.config/claude-usage-widget` is left in place in case it holds a manually
+pasted token — once v2 is confirmed working you can `rm -rf` it.
 
 ### macOS / Windows / headless servers (CLI only)
 

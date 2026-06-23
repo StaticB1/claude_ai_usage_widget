@@ -39,38 +39,10 @@ else
     echo "  ✓ Nothing was running"
 fi
 
-# ── Sweep legacy v1 widget (the rebrand changed every path) ──────────────────
-# v1 was the single-file `claude-usage-widget`; v2 is `claude-token-tracker`
-# with new dirs/binaries. Installing v2 doesn't touch v1, so a stale autostart
-# entry would keep launching the dead widget alongside the new one.
-
-echo ""
-echo "▸ Removing legacy claude-usage-widget files (if present)…"
-LEGACY_ID="claude-usage-widget"
-legacy_found=false
-for f in \
-    "$HOME/.local/share/$LEGACY_ID" \
-    "$HOME/.local/bin/$LEGACY_ID" \
-    "$HOME/.local/bin/claude-widget-start" \
-    "$HOME/.local/bin/claude-widget-stop" \
-    "$HOME/.config/autostart/$LEGACY_ID.desktop" \
-    "$HOME/.local/share/applications/$LEGACY_ID.desktop"; do
-    if [ -e "$f" ]; then
-        rm -rf "$f"
-        legacy_found=true
-    fi
-done
-if $legacy_found; then
-    echo "  ✓ Cleared legacy widget files"
-    # Leave ~/.config/claude-usage-widget alone — it may hold a pasted token.
-    if [ -d "$HOME/.config/$LEGACY_ID" ]; then
-        echo "  · Kept ~/.config/$LEGACY_ID (old config — delete manually to wipe)"
-    fi
-else
-    echo "  ✓ No legacy files found"
-fi
-
 # ── Reinstall ────────────────────────────────────────────────────────────────
+# install.sh also sweeps any leftover legacy claude-usage-widget files (old
+# dir, binaries, and autostart entry), so the dead widget can't keep launching
+# alongside the new app.
 
 echo ""
 echo "▸ Installing updated files…"

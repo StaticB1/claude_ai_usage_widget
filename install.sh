@@ -247,6 +247,36 @@ if ! has_indicator; then
 fi
 has_indicator && ok "AppIndicator OK" || true
 
+# ── Sweep the legacy v1 widget ────────────────────────────────────────────────
+# The original single-file widget (claude_ai_usage_widget) installed under the
+# `claude-usage-widget` name — different dir, different binaries, different
+# autostart entry — so a v2 install never overwrites it, and its autostart
+# entry would keep launching the dead widget alongside the new app. Clearing it
+# here means BOTH `curl | bash` upgraders (who have no clone to run upgrade.sh
+# from) and clone users get a clean migration. The old config dir is preserved
+# in case it holds a manually-pasted OAuth token.
+section "Checking for the old widget"
+LEGACY_ID="claude-usage-widget"
+legacy_hits=()
+for f in \
+    "$HOME/.local/share/$LEGACY_ID" \
+    "$HOME/.local/bin/$LEGACY_ID" \
+    "$HOME/.local/bin/claude-widget-start" \
+    "$HOME/.local/bin/claude-widget-stop" \
+    "$HOME/.config/autostart/$LEGACY_ID.desktop" \
+    "$HOME/.local/share/applications/$LEGACY_ID.desktop"; do
+    [ -e "$f" ] && legacy_hits+=("$f")
+done
+if [ "${#legacy_hits[@]}" -gt 0 ]; then
+    pkill -f claude_usage_widget.py 2>/dev/null || true
+    for f in "${legacy_hits[@]}"; do rm -rf "$f"; done
+    ok "Removed old claude-usage-widget"
+    [ -d "$HOME/.config/$LEGACY_ID" ] \
+        && echo "  · Kept ~/.config/$LEGACY_ID (old config — delete manually to wipe)"
+else
+    ok "No old widget found"
+fi
+
 section "Installing app"
 mkdir -p "$INSTALL_DIR" "$BIN_DIR" "$AUTOSTART_DIR" "$APPS_DIR"
 
