@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Appearance setting** — Settings now has a System / Light / Dark theme
+  switch. System follows the desktop's `org.gnome.desktop.interface`
+  color-scheme live (no restart); switching updates the whole app,
+  including per-widget colors (usage bars, summary cards) that a plain
+  CSS-provider swap doesn't reach.
+- **Tray menu, redone** — the 5h/7d limits and the current 5-hour block now
+  render as small colored progress indicators instead of plain text, and a
+  new **Usage panel…** entry (also reachable via middle-click on the tray
+  icon) opens a small themed standalone window with real progress bars and
+  cloud connection status — useful since the AppIndicator dropdown itself
+  can't be restyled by the app.
+- **Scrollable dashboard views** — Dashboard/Projects/Breakdowns/Budgets/
+  Settings now scroll vertically, so the window can be resized well below
+  its previous 900×600 floor without clipping content.
+- **Pricing** — added `claude-fable-5`, `claude-mythos-5`, and
+  `claude-opus-4-8` to the built-in rate card.
+
+### Fixed
+- `claude-mythos-5` no longer silently priced as `claude-fable-5` in the
+  substring-match fallback.
+- `theme` values from a hand-edited config are now validated against
+  `{system, light, dark}` instead of accepted as-is.
+
 ## [2.0.0] - 2026-06-23
 
 Rebrand + rewrite: **claude_ai_usage_widget → Claude Usage Widget & Token Tracker.**
