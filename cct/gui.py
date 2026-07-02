@@ -32,9 +32,9 @@ try:
 except (ValueError, ImportError):
     HAS_NOTIFY = False
 
-from gi.repository import Gtk, GLib, GdkPixbuf, Pango  # noqa: E402
+from gi.repository import Gtk, GLib, Gdk, GdkPixbuf, Pango  # noqa: E402
 
-from .blocks import compute_blocks, forecast_active
+from .blocks import BLOCK_HOURS, compute_blocks, forecast_active
 from .budgets import evaluate_budgets, period_window
 from .cli import scan_into_store
 from .cloud import (AuthError, CloudApiError, RateLimitError,
@@ -57,7 +57,7 @@ from .store import Store
 
 # ─── Theme ─────────────────────────────────────────────────────────────────
 # Light theme keyed off the brand logo: warm orange + ink-black on off-white.
-COLORS = {
+COLORS_LIGHT = {
     'bg':      '#FAFAF7',  # paper / app background
     'surface': '#FFFFFF',  # cards, sidebar, header
     'overlay': '#ECECE8',  # hover, dividers, subtle fills
@@ -71,6 +71,57 @@ COLORS = {
     'red':     '#DC2626',
     'orange':  '#EA580C',
 }
+COLORS_DARK = {
+    'bg':      '#1E1E22',  # dark app background
+    'surface': '#26262B',  # cards, sidebar, header
+    'overlay': '#333339',  # hover, dividers, subtle fills
+    'text':    '#EDEDEF',  # primary text
+    'subtext': '#B8B8C0',  # secondary text
+    'muted':   '#84848E',  # tertiary / labels
+    'accent':  '#F5821F',  # brand orange
+    'blue':    '#60A5FA',
+    'green':   '#4ADE80',
+    'yellow':  '#FACC15',
+    'red':     '#F87171',
+    'orange':  '#FB923C',
+}
+def _gnome_interface_settings():
+    """Return a Gio.Settings for org.gnome.desktop.interface, or None if
+    the schema (or the color-scheme key) isn't installed — e.g. non-GNOME
+    desktops or a GNOME older than 42. Gio.Settings.new() on a missing
+    schema is a *fatal* GLib error (aborts the process), not a Python
+    exception, so we must check via SettingsSchemaSource first rather
+    than relying on try/except."""
+    try:
+        from gi.repository import Gio
+        source = Gio.SettingsSchemaSource.get_default()
+        if source is None:
+            return None
+        schema = source.lookup('org.gnome.desktop.interface', True)
+        if schema is None or not schema.has_key('color-scheme'):
+            return None
+        return Gio.Settings.new('org.gnome.desktop.interface')
+    except Exception:
+        return None
+
+
+def _resolve_palette(pref: str) -> dict:
+    """Map a theme preference ('system'|'light'|'dark') to a palette."""
+    if pref == 'dark':
+        return COLORS_DARK
+    if pref == 'light':
+        return COLORS_LIGHT
+    settings = _gnome_interface_settings()  # 'system': follow the desktop
+    if settings is None:
+        return COLORS_LIGHT
+    scheme = settings.get_string('color-scheme')
+    return COLORS_DARK if 'dark' in scheme else COLORS_LIGHT
+
+
+from .config import load_settings as _load_settings_for_theme
+# Mutable palette dict: updated in place on theme switch so inline
+# color references pick up the new values on the next redraw.
+COLORS = dict(_resolve_palette(_load_settings_for_theme().theme))
 USAGE_COLORS = {
     'low':      '#16A34A',
     'medium':   '#CA8A04',
@@ -112,7 +163,8 @@ def get_usage_color(pct: float) -> str:
     return USAGE_COLORS['critical']
 
 
-CSS_STYLES = f"""
+def _make_css() -> str:
+    return f"""
 window {{
     background-color: {COLORS['bg']}; color: {COLORS['text']};
     font-family: "Inter", "SF Pro Text", "Segoe UI", system-ui, sans-serif;
@@ -428,6 +480,28 @@ menuitem:disabled {{
     color: {COLORS['muted']};
     opacity: 0.85;
 }}
+window.usage-popup {{
+    background-color: {COLORS['surface']};
+    border: 1px solid {COLORS['overlay']};
+    border-radius: 14px;
+}}
+.usage-popup-title {{
+    font-size: 15px; font-weight: 700; color: {COLORS['text']};
+}}
+.usage-popup-label {{ font-size: 13px; font-weight: 600; color: {COLORS['text']}; }}
+.usage-popup-sub {{ font-size: 12px; color: {COLORS['muted']}; }}
+.usage-popup progressbar trough {{
+    min-height: 8px; border-radius: 4px;
+    background-color: {COLORS['overlay']}; border: none;
+}}
+.usage-popup progressbar progress {{
+    min-height: 8px; border-radius: 4px; border: none;
+}}
+.pb-low progress {{ background-color: {USAGE_COLORS['low']}; background-image: none; }}
+.pb-medium progress {{ background-color: {USAGE_COLORS['medium']}; background-image: none; }}
+.pb-high progress {{ background-color: {USAGE_COLORS['high']}; background-image: none; }}
+.pb-critical progress {{ background-color: {USAGE_COLORS['critical']}; background-image: none; }}
+.pb-unknown progress {{ background-color: {USAGE_COLORS['unknown']}; background-image: none; }}
 menuitem separator, separator {{
     background-color: {COLORS['overlay']};
     min-height: 1px; min-width: 1px;
@@ -518,11 +592,16 @@ label {{ color: {COLORS['text']}; }}
 
 class SummaryCard(Gtk.Box):
     def __init__(self, title: str, value: str = "--", subtitle: str = "",
-                 accent_color: str = COLORS['accent']):
+                 accent_color: str = COLORS['accent'],
+                 color_key: Optional[str] = None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.get_style_context().add_class('card')
         self.set_margin_top(8)
         self.set_margin_bottom(8)
+        # color_key (e.g. 'blue') lets retint() re-derive the accent from
+        # the live COLORS dict after a theme switch; accent_color alone
+        # would stay pinned to the palette active at construction time.
+        self._color_key = color_key
         self._accent_color = accent_color
 
         # 28×3px colored accent dash above the title.
@@ -570,6 +649,21 @@ class SummaryCard(Gtk.Box):
         if title is not None:
             self.title_lbl.set_text(title)
 
+    def retint(self):
+        """Re-apply the accent color from the live COLORS dict — call
+        after a theme switch so the dash and value label don't stay
+        pinned to the palette active when the card was constructed."""
+        if self._color_key is None:
+            return
+        self._accent_color = COLORS[self._color_key]
+        self._dash_provider.load_from_data(
+            f'box {{ background-color: {self._accent_color}; }}'.encode())
+        current = self.value_lbl.get_text()
+        self.value_lbl.set_markup(
+            f'<span foreground="{self._accent_color}">'
+            f'{html.escape(current)}</span>'
+        )
+
 
 class UsageBar(Gtk.Box):
     def __init__(self, label: str, percentage: float):
@@ -592,7 +686,16 @@ class UsageBar(Gtk.Box):
         self.progress.set_value(percentage)
         self.progress.set_size_request(-1, 8)
 
-        bar_color = get_usage_color(percentage)
+        self._trough_provider = Gtk.CssProvider()
+        self.progress.get_style_context().add_provider(
+            self._trough_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+        self._percentage = percentage
+        self._apply_bar_css()
+        self.pack_start(self.progress, False, False, 0)
+
+    def _apply_bar_css(self):
+        bar_color = get_usage_color(self._percentage)
         css = f"""
             levelbar trough {{
                 background-color: {COLORS['overlay']};
@@ -603,15 +706,11 @@ class UsageBar(Gtk.Box):
                 border-radius: 4px; min-height: 8px;
             }}
         """
-        provider = Gtk.CssProvider()
-        provider.load_from_data(css.encode())
-        self.progress.get_style_context().add_provider(
-            provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
-        )
-        self.pack_start(self.progress, False, False, 0)
+        self._trough_provider.load_from_data(css.encode())
 
     def update(self, percentage: float, label: Optional[str] = None,
                reset_time: Optional[str] = None):
+        self._percentage = percentage
         self.progress.set_value(percentage)
         self.pct_lbl.set_text(f"{int(percentage * 100)}%")
         if label:
@@ -619,6 +718,12 @@ class UsageBar(Gtk.Box):
             if reset_time and reset_time != 'unknown':
                 text += f"  (resets in {reset_time})"
             self.label_lbl.set_text(text)
+        self._apply_bar_css()  # keep trough color in sync with the live theme
+
+    def retint(self):
+        """Re-apply trough colors from the live COLORS dict after a
+        theme switch, without touching the current percentage/label."""
+        self._apply_bar_css()
 
 
 # ─── Main Window ───────────────────────────────────────────────────────────
@@ -629,8 +734,8 @@ class TrackerWindow(Gtk.Window):
     def __init__(self, app: 'App'):
         super().__init__(title=APP_NAME)
         self.app = app
-        self.set_default_size(1200, 800)
-        self.set_size_request(900, 600)
+        self.set_default_size(1200, 620)
+        self.set_size_request(900, 380)
 
         ip = _icon_path(128)
         if ip is not None:
@@ -640,11 +745,18 @@ class TrackerWindow(Gtk.Window):
                 pass
 
         provider = Gtk.CssProvider()
-        provider.load_from_data(CSS_STYLES.encode())
+        provider.load_from_data(_make_css().encode())
         Gtk.StyleContext.add_provider_for_screen(
             self.get_screen(), provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
+        self._css_provider = provider
+        # live-update when the desktop scheme flips (theme='system');
+        # None on desktops without the GNOME interface schema.
+        self._iface_settings = _gnome_interface_settings()
+        if self._iface_settings is not None:
+            self._iface_settings.connect(
+                'changed::color-scheme', self._on_system_scheme_changed)
 
         self._current_view = 'dashboard'
         self._dashboard_period = '7d'
@@ -677,11 +789,17 @@ class TrackerWindow(Gtk.Window):
         self._stack = Gtk.Stack()
         self._stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         self._stack.set_transition_duration(150)
-        self._stack.add_named(self._build_dashboard_view(), 'dashboard')
-        self._stack.add_named(self._build_projects_view(), 'projects')
-        self._stack.add_named(self._build_breakdowns_view(), 'breakdowns')
-        self._stack.add_named(self._build_budgets_view(), 'budgets')
-        self._stack.add_named(self._build_settings_view(), 'settings')
+        def _scrolled(widget):
+            sw = Gtk.ScrolledWindow()
+            sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            sw.add(widget)
+            return sw
+
+        self._stack.add_named(_scrolled(self._build_dashboard_view()), 'dashboard')
+        self._stack.add_named(_scrolled(self._build_projects_view()), 'projects')
+        self._stack.add_named(_scrolled(self._build_breakdowns_view()), 'breakdowns')
+        self._stack.add_named(_scrolled(self._build_budgets_view()), 'budgets')
+        self._stack.add_named(_scrolled(self._build_settings_view()), 'settings')
         content.pack_start(self._stack, True, True, 0)
 
         content.pack_start(self._build_status_bar(), False, False, 0)
@@ -854,8 +972,11 @@ class TrackerWindow(Gtk.Window):
 
         # Period selector
         scope = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        h = Gtk.Label()
-        h.set_markup(f'<span foreground="{COLORS["subtext"]}">Period</span>')
+        h = Gtk.Label(label="Period")
+        # Styled via the .subtitle CSS class (not inline markup) so it
+        # picks up the live palette automatically when the global CSS
+        # provider is swapped on a theme switch — no manual retint needed.
+        h.get_style_context().add_class('subtitle')
         scope.pack_start(h, False, False, 0)
         self._dashboard_period_combo = Gtk.ComboBoxText()
         for k in ('all', 'today', '7d', '30d'):
@@ -898,11 +1019,16 @@ class TrackerWindow(Gtk.Window):
         cards.set_margin_top(16); cards.set_homogeneous(True)
         cards.set_max_children_per_line(5); cards.set_min_children_per_line(2)
         self._summary_cards = {
-            'total':  SummaryCard("Total Tokens", "0", "", COLORS['accent']),
-            'input':  SummaryCard("Input Tokens", "0", "", COLORS['blue']),
-            'cache':  SummaryCard("Cache Tokens", "0", "", COLORS['orange']),
-            'output': SummaryCard("Output Tokens", "0", "", COLORS['green']),
-            'cost':   SummaryCard("API Equivalent", "$0.00", "", COLORS['yellow']),
+            'total':  SummaryCard("Total Tokens", "0", "", COLORS['accent'],
+                                  color_key='accent'),
+            'input':  SummaryCard("Input Tokens", "0", "", COLORS['blue'],
+                                  color_key='blue'),
+            'cache':  SummaryCard("Cache Tokens", "0", "", COLORS['orange'],
+                                  color_key='orange'),
+            'output': SummaryCard("Output Tokens", "0", "", COLORS['green'],
+                                  color_key='green'),
+            'cost':   SummaryCard("API Equivalent", "$0.00", "",
+                                  COLORS['yellow'], color_key='yellow'),
         }
         self._summary_cards['cost'].set_tooltip_text(
             "What these tokens would cost on the pay-as-you-go API.\n"
@@ -1792,6 +1918,39 @@ class TrackerWindow(Gtk.Window):
         self._cloud_status_card.pack_start(btn, False, False, 0)
 
     # ── Settings view ──────────────────────────────────────────────────────
+    def _apply_theme(self, pref: str):
+        COLORS.clear()
+        COLORS.update(_resolve_palette(pref))
+        new_provider = Gtk.CssProvider()
+        new_provider.load_from_data(_make_css().encode())
+        screen = self.get_screen()
+        Gtk.StyleContext.remove_provider_for_screen(
+            screen, self._css_provider)
+        Gtk.StyleContext.add_provider_for_screen(
+            screen, new_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self._css_provider = new_provider
+        # Retint widgets that bake colors into a per-widget CssProvider or
+        # markup at construction time — the global provider swap above
+        # doesn't reach those; without this they'd stay stale until the
+        # next full data refresh (or forever, if not on the dashboard view).
+        self._usage_5h.retint()
+        self._usage_7d.retint()
+        for card in self._summary_cards.values():
+            card.retint()
+        self.refresh_data()  # redraw everything else
+
+    def _on_system_scheme_changed(self, *_args):
+        from .config import load_settings
+        if load_settings().theme == 'system':
+            self._apply_theme('system')
+
+    def _on_theme_changed(self, combo):
+        from .config import load_settings, save_settings
+        st = load_settings()
+        st.theme = combo.get_active_id() or 'system'
+        save_settings(st)
+        self._apply_theme(st.theme)
+
     def _build_settings_view(self) -> Gtk.Widget:
         c = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         c.set_margin_top(24); c.set_margin_bottom(24)
@@ -1827,6 +1986,30 @@ class TrackerWindow(Gtk.Window):
         tb.pack_end(sb, False, False, 0)
         cloud.pack_start(tb, False, False, 0)
         c.pack_start(cloud, False, False, 0)
+
+        # Appearance section
+        ap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        ap.get_style_context().add_class('card')
+        ap.set_margin_top(16)
+        at = Gtk.Label(label="Appearance")
+        at.get_style_context().add_class('card-title')
+        at.set_halign(Gtk.Align.START)
+        ap.pack_start(at, False, False, 0)
+        arow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        arow.set_margin_top(8)
+        al = Gtk.Label(label="Theme")
+        al.get_style_context().add_class('subtitle')
+        arow.pack_start(al, False, False, 0)
+        self._theme_combo = Gtk.ComboBoxText()
+        self._theme_combo.append('system', 'System')
+        self._theme_combo.append('light', 'Light')
+        self._theme_combo.append('dark', 'Dark')
+        from .config import load_settings as _ls
+        self._theme_combo.set_active_id(_ls().theme)
+        self._theme_combo.connect('changed', self._on_theme_changed)
+        arow.pack_start(self._theme_combo, False, False, 0)
+        ap.pack_start(arow, False, False, 0)
+        c.pack_start(ap, False, False, 0)
 
         # Rate card section
         rc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -2151,6 +2334,7 @@ class TrackerWindow(Gtk.Window):
                 'enabled': bool(self._burn_switch.get_active()),
                 'multiplier': float(self._mult_spin.get_value()),
             },
+            theme=load_settings().theme,
         )
         self.app.apply_settings(new_settings)
         self._flash_saved(self._notif_saved_label,
@@ -2395,6 +2579,18 @@ class App:
         self.cloud_error = st.cloud_error
         self.cloud_retry_at = st.cloud_retry_at
 
+    def _set_tray_menu(self):
+        """(Re)build the tray menu and rewire the middle-click target —
+        set_secondary_activate_target must be reapplied after every
+        set_menu(), since it points at a specific menu-item instance that
+        a rebuild discards."""
+        self._indicator.set_menu(self._build_tray_menu())
+        try:  # middle-click on the tray icon opens the usage panel
+            self._indicator.set_secondary_activate_target(
+                self._usage_menu_item)
+        except Exception:
+            pass
+
     def _setup_tray(self):
         # Use the brand icon as the indicator base; live state goes into
         # the indicator's label string. AppIndicator's icon must be either
@@ -2412,7 +2608,7 @@ class App:
         self._indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         self._indicator.set_title(APP_NAME)
         self._indicator.set_label("--", "100%")
-        self._indicator.set_menu(self._build_tray_menu())
+        self._set_tray_menu()
 
     @staticmethod
     def _bar(pct: float, width: int = 10) -> str:
@@ -2422,23 +2618,191 @@ class App:
         filled = int(round(pct * width))
         return '▰' * filled + '▱' * (width - filled)
 
+    def _close_usage_popup(self):
+        """Tear down the popup and release its input grab, if any. Safe to
+        call multiple times or when no popup is open."""
+        win = getattr(self, '_usage_popup', None)
+        if win is None:
+            return
+        self._usage_popup = None
+        seat = Gdk.Display.get_default().get_default_seat()
+        seat.ungrab()
+        win.destroy()
+
+    def _show_usage_popup(self, *_a):
+        """Small themed panel with real progress bars (opened from the
+        tray menu or a middle-click on the indicator icon)."""
+        if getattr(self, '_usage_popup', None):
+            self._close_usage_popup()
+            return
+        st = self._primary_state()
+
+        # Gtk.WindowType.POPUP (override-redirect) + an explicit pointer
+        # grab, rather than a TOPLEVEL window relying on focus-out: WM/
+        # compositor focus-out timing is unreliable (Wayland can fire it
+        # right at map time), which previously required a grace-period
+        # hack that just moved the bug around (missed dismiss clicks,
+        # broken re-toggle from the tray menu). A grab we own ourselves
+        # dismisses deterministically on any click outside the window.
+        win = Gtk.Window(type=Gtk.WindowType.POPUP)
+        win.set_resizable(False)
+        win.set_default_size(380, -1)
+        win.get_style_context().add_class('usage-popup')
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        for side in ('top', 'bottom', 'start', 'end'):
+            getattr(outer, f'set_margin_{side}')(20)
+        win.add(outer)
+
+        title = Gtk.Label(label='Claude Usage')
+        title.get_style_context().add_class('usage-popup-title')
+        outer.pack_start(title, False, False, 0)
+
+        def _pb_class(frac: Optional[float]) -> str:
+            if frac is None:
+                return 'pb-unknown'
+            if frac < 0.5:
+                return 'pb-low'
+            if frac < 0.75:
+                return 'pb-medium'
+            if frac < 0.9:
+                return 'pb-high'
+            return 'pb-critical'
+
+        def section(name: str, pct: Optional[int], reset_iso, window: str):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+            lab = Gtk.Label(label=name)
+            lab.get_style_context().add_class('usage-popup-label')
+            lab.set_halign(Gtk.Align.START)
+            row.pack_start(lab, True, True, 0)
+            reset = Gtk.Label(label='Resets ' + fmt_reset_absolute(
+                reset_iso, with_weekday=(window == '7d')))
+            reset.get_style_context().add_class('usage-popup-sub')
+            reset.set_halign(Gtk.Align.END)
+            row.pack_end(reset, False, False, 0)
+            box.pack_start(row, False, False, 0)
+
+            frac = None if pct is None else max(0.0, min(1.0, pct / 100.0))
+            pb = Gtk.ProgressBar()
+            pb.set_fraction(frac or 0.0)
+            pb.get_style_context().add_class(_pb_class(frac))
+            box.pack_start(pb, False, False, 0)
+
+            used = Gtk.Label(
+                label='?' if pct is None else f'{pct}% used')
+            used.get_style_context().add_class('usage-popup-sub')
+            box.pack_start(used, False, False, 0)
+            return box
+
+        outer.pack_start(section('Session (5 hour)', st.last_pct5,
+                                 st.last_resets_5h, '5h'), False, False, 0)
+        outer.pack_start(section('Weekly (7 day)', st.last_pct7,
+                                 st.last_resets_7d, '7d'), False, False, 0)
+
+        outer.pack_start(Gtk.Separator(), False, False, 0)
+
+        status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        # Only the account's actual error states count as "bad" — 'idle'
+        # (no fetch yet) and 'loading' (fetch in flight) are normal,
+        # transient states, not failures, and shouldn't render as red.
+        error_states = {'auth_error', 'network_error', 'rate_limited',
+                        'no_token'}
+        state = st.cloud_state if st.token else 'no_token'
+        is_error = state in error_states
+        ok = state == 'ok'
+        dot = Gtk.Label()
+        color = USAGE_COLORS['critical' if is_error else 'low']
+        dot.set_markup(f'<span foreground="{color}">●</span>')
+        status_row.pack_start(dot, False, False, 0)
+        if ok:
+            status_txt = 'Cloud connection OK'
+        elif is_error:
+            status_txt = state.replace('_', ' ')
+        else:
+            status_txt = 'Checking…' if state == 'loading' else 'Waiting for first update'
+        stl = Gtk.Label(label=status_txt)
+        stl.get_style_context().add_class('usage-popup-label')
+        status_row.pack_start(stl, False, False, 0)
+        outer.pack_start(status_row, False, False, 0)
+
+        outer.pack_start(Gtk.Separator(), False, False, 0)
+
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        upd = Gtk.Label(
+            label='Last updated: ' + datetime.now().strftime('%H:%M'))
+        upd.get_style_context().add_class('usage-popup-sub')
+        upd.set_halign(Gtk.Align.START)
+        bottom.pack_start(upd, True, True, 0)
+        rb = Gtk.Button(label='Refresh')
+        rb.get_style_context().add_class('btn-secondary')
+
+        def _do_refresh(_b):
+            self._close_usage_popup()
+            self._refresh_cloud()
+        rb.connect('clicked', _do_refresh)
+        bottom.pack_end(rb, False, False, 0)
+        outer.pack_start(bottom, False, False, 0)
+
+        def _on_button_press(_w, event):
+            # Grabbed pointer delivers every button-press to us; a click
+            # outside the popup's own allocation means "dismiss".
+            alloc = win.get_allocation()
+            if not (0 <= event.x < alloc.width and 0 <= event.y < alloc.height):
+                self._close_usage_popup()
+            return False
+
+        win.connect('button-press-event', _on_button_press)
+        win.connect('key-press-event', lambda w, e:
+                    self._close_usage_popup() if e.keyval == 65307 else None)
+        win.show_all()
+        win.present()
+        self._usage_popup = win
+
+        seat = Gdk.Display.get_default().get_default_seat()
+        seat.grab(win.get_window(), Gdk.SeatCapabilities.ALL, True,
+                  None, None, None, None)
+
+    @staticmethod
+    def _emoji_bar(frac: Optional[float], width: int = 8) -> str:
+        """Colored emoji progress bar for menu items: colour tracks load."""
+        if frac is None:
+            return '⬜' * width
+        f = max(0.0, min(1.0, frac))
+        filled = round(f * width)
+        if filled == 0 and f > 0:
+            filled = 1
+        if f < 0.5:
+            seg = '🟩'
+        elif f < 0.75:
+            seg = '🟨'
+        elif f < 0.9:
+            seg = '🟧'
+        else:
+            seg = '🟥'
+        return seg * filled + '⬜' * (width - filled)
+
+    def _limit_menu_item(self) -> Gtk.MenuItem:
+        it = Gtk.MenuItem(label='--')
+        it.set_sensitive(False)
+        return it
+
     def _build_tray_menu(self) -> Gtk.Menu:
         menu = Gtk.Menu()
         self._tray_items.clear()
         self._tray_account_items.clear()
 
         # ── LIMITS (primary account) ──────────────────────────────────────
-        lim_hdr = Gtk.MenuItem(label='─ LIMITS ──────────────────────')
+        lim_hdr = Gtk.MenuItem(label='Limits')
         lim_hdr.set_sensitive(False); menu.append(lim_hdr)
-        for k, txt in (('5h', '   5h   ▱▱▱▱▱▱▱▱▱▱   --%'),
-                       ('7d', '   7d   ▱▱▱▱▱▱▱▱▱▱   --%')):
-            it = Gtk.MenuItem(label=txt)
-            it.set_sensitive(False); menu.append(it)
+        for k in ('5h', '7d'):
+            it = self._limit_menu_item()
+            menu.append(it)
             self._tray_items[k] = it
 
         # ── ACCOUNTS section (only when more than one configured) ─────────
         if len(self._accounts) > 1:
-            acc_hdr = Gtk.MenuItem(label='─ ACCOUNTS ────────────────────')
+            acc_hdr = Gtk.MenuItem(label='Accounts')
             acc_hdr.set_sensitive(False); menu.append(acc_hdr)
             for acc in self._accounts:
                 it = Gtk.MenuItem(label=f"   {acc.label}: —")
@@ -2446,11 +2810,11 @@ class App:
                 self._tray_account_items[acc.label] = it
 
         # ── BLOCK section ─────────────────────────────────────────────────
-        blk_hdr = Gtk.MenuItem(label='─ CURRENT 5H BLOCK ────────────')
+        blk_hdr = Gtk.MenuItem(label='Current 5h block')
         blk_hdr.set_sensitive(False); menu.append(blk_hdr)
-        for k, txt in (('block',        '   ⏱   —'),
-                       ('block_tokens', '   ◆   —'),
-                       ('block_cost',   '   $   —')):
+        for k, txt in (('block',        '⏳  —'),
+                       ('block_tokens', '🪙  —'),
+                       ('block_cost',   '💸  —')):
             it = Gtk.MenuItem(label=txt)
             it.set_sensitive(False); menu.append(it)
             self._tray_items[k] = it
@@ -2458,6 +2822,11 @@ class App:
         menu.append(Gtk.SeparatorMenuItem())
 
         # ── Quick actions ─────────────────────────────────────────────────
+        usage_item = Gtk.MenuItem(label='Usage panel…')
+        usage_item.connect('activate', self._show_usage_popup)
+        menu.append(usage_item)
+        self._usage_menu_item = usage_item
+
         open_item = Gtk.MenuItem(label='Open Dashboard')
         open_item.connect('activate',
                           lambda _: self._show_view('dashboard'))
@@ -2543,24 +2912,25 @@ class App:
     def _update_tray_limits(self, st: AccountState):
         """5h/7d lines render either from current usage_data or the
         last-known cached values (preserving info between fetches)."""
+        def _set(key: str, frac: Optional[float], text: str):
+            self._tray_items[key].set_label(text)
+
         if st.cloud_state in ('auth_error', 'network_error', 'rate_limited',
                               'no_token'):
             hint = st.cloud_state.replace('_', ' ')
-            self._tray_items['5h'].set_label(
-                f"   5h   {self._bar(0)}   {hint}")
-            self._tray_items['7d'].set_label(
-                f"   7d   {self._bar(0)}   {hint}")
+            _set('5h', None, f"5h  {self._emoji_bar(None)}  {hint}")
+            _set('7d', None, f"7d  {self._emoji_bar(None)}  {hint}")
             return
         u5 = (st.last_pct5 or 0) / 100.0
         u7 = (st.last_pct7 or 0) / 100.0
         r5 = self._fmt_reset(st.last_resets_5h, st.account, window='5h')
         r7 = self._fmt_reset(st.last_resets_7d, st.account, window='7d')
-        p5 = '?' if st.last_pct5 is None else f"{st.last_pct5:>3}%"
-        p7 = '?' if st.last_pct7 is None else f"{st.last_pct7:>3}%"
-        self._tray_items['5h'].set_label(
-            f"   5h   {self._bar(u5)}   {p5} · resets {r5}")
-        self._tray_items['7d'].set_label(
-            f"   7d   {self._bar(u7)}   {p7} · resets {r7}")
+        p5 = '?' if st.last_pct5 is None else f"{st.last_pct5}%"
+        p7 = '?' if st.last_pct7 is None else f"{st.last_pct7}%"
+        b5 = self._emoji_bar(u5 if st.last_pct5 is not None else None)
+        b7 = self._emoji_bar(u7 if st.last_pct7 is not None else None)
+        _set('5h', None, f"5h  {b5}  {p5} · ↻ {r5}")
+        _set('7d', None, f"7d  {b7}  {p7} · ↻ {r7}")
 
     def _tray_account_line(self, st: AccountState) -> str:
         if st.cloud_state in ('auth_error', 'network_error', 'rate_limited',
@@ -2599,17 +2969,21 @@ class App:
             blocks = compute_blocks(rows)
             if blocks and blocks[-1].is_active():
                 b = blocks[-1]
-                remaining = fmt_duration(b.remaining().total_seconds())
+                rem_s = b.remaining().total_seconds()
+                remaining = fmt_duration(rem_s)
+                elapsed_frac = 1.0 - rem_s / (BLOCK_HOURS * 3600.0)
+                bar = self._emoji_bar(elapsed_frac)
                 self._tray_items['block'].set_label(
-                    f"   ⏱   {remaining} remaining")
+                    f"⏳  {bar}  {remaining} left")
                 self._tray_items['block_tokens'].set_label(
-                    f"   ◆   {fmt(b.total_tokens)} tokens")
+                    f"🪙  {fmt(b.total_tokens)} tokens")
                 self._tray_items['block_cost'].set_label(
-                    f"   $   {fmt_cost(b.cost_usd)} spent")
+                    f"💸  {fmt_cost(b.cost_usd)} spent")
             else:
-                self._tray_items['block'].set_label('   ⏱   idle')
-                self._tray_items['block_tokens'].set_label('   ◆   —')
-                self._tray_items['block_cost'].set_label('   $   —')
+                self._tray_items['block'].set_label(
+                    f"⏳  {self._emoji_bar(None)}  idle")
+                self._tray_items['block_tokens'].set_label('🪙  —')
+                self._tray_items['block_cost'].set_label('💸  —')
         except Exception as e:
             print(f"[{APP_ID}] tray block update: {e}", file=sys.stderr)
         return False
@@ -2934,7 +3308,7 @@ class App:
         self._sync_primary()
         # The accounts section is structural — rebuild the whole tray menu.
         if self._indicator:
-            self._indicator.set_menu(self._build_tray_menu())
+            self._set_tray_menu()
         self._rebuild_tray()
         # Repopulate the dashboard's header account combo if the window is up.
         if self.window is not None:

@@ -154,6 +154,7 @@ class Settings:
     poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
     thresholds: dict = field(default_factory=lambda: dict(DEFAULT_THRESHOLDS))
     burn_rate: dict = field(default_factory=lambda: dict(DEFAULT_BURN_RATE))
+    theme: str = 'system'  # 'system' | 'light' | 'dark'
 
 
 def load_settings() -> Settings:
@@ -172,6 +173,8 @@ def load_settings() -> Settings:
             'multiplier': float(
                 br.get('multiplier', DEFAULT_BURN_RATE['multiplier'])),
         },
+        theme=(t if (t := str(cfg.get('theme') or 'system'))
+              in ('system', 'light', 'dark') else 'system'),
     )
 
 
@@ -180,4 +183,5 @@ def save_settings(s: Settings) -> None:
     cfg['poll_interval_seconds'] = int(s.poll_interval_seconds)
     cfg['thresholds'] = dict(s.thresholds)
     cfg['burn_rate'] = dict(s.burn_rate)
+    cfg['theme'] = s.theme
     save_config(cfg)

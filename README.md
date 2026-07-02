@@ -75,8 +75,9 @@ the tray gauge behaves like the original widget.
   ride the live 5h/7d windows. Desktop notification when crossed.
 - **Cross-platform CLI (`ctt`)** — table or `--json` output for shell prompts,
   status bars, and CI checks.
-- **GTK dashboard (Linux)** — Catppuccin-themed UI with Dashboard, Projects,
-  Breakdowns, Budgets, and Settings views; backs off live polling when hidden.
+- **GTK dashboard (Linux)** — Dashboard, Projects, Breakdowns, Budgets, and
+  Settings views, with a System / Light / Dark theme switch; backs off live
+  polling when hidden.
 
 ## Install
 
@@ -201,7 +202,7 @@ per-account **"disable polling"** switch in Settings.
 ```bash
 # USD or token caps, scoped globally / per project / per model:
 ctt budget add --name "Monthly cap"   --usd 100   --period month
-ctt budget add --name "Opus tokens"   --tokens 50000000 --period week --scope model:claude-opus-4-7
+ctt budget add --name "Opus tokens"   --tokens 50000000 --period week --scope model:claude-opus-4-8
 ctt budget add --name "Proj X daily"  --usd 10    --period day  --scope project:my-app
 
 # Plan-utilization budget (rides the live 5h/7d window — needs an OAuth token):
@@ -229,13 +230,20 @@ COST=$(ctt summary --period today --json | jq '.totals.cost_usd')
 
 ### Dashboard (Linux)
 
-`claude-token-tracker` (or `ctt gui`) opens a Catppuccin-themed window with:
+`claude-token-tracker` (or `ctt gui`) opens a window with:
 
 - **Dashboard** — live limits, current block, headline totals.
 - **Projects** — per-project spend and recent sessions.
 - **Breakdowns** — per-model and per-tool attribution.
 - **Budgets** — create/track budgets with progress bars.
-- **Settings** — accounts, polling, notification thresholds, OAuth token.
+- **Settings** — accounts, polling, notification thresholds, OAuth token,
+  **Appearance** (System / Light / Dark theme, switches live).
+
+The tray menu itself also shows the 5h/7d limits and the current block as
+inline progress bars rather than plain numbers, and a **Usage panel…** entry
+opens a small standalone card with the same bars plus cloud connection status
+— handy on desktops (or window managers) where the AppIndicator dropdown
+itself can't be restyled.
 
 ## Configuration
 
@@ -266,6 +274,8 @@ The installer can set these up interactively, or edit `config.json`:
 ```json
 {
   "models": {
+    "claude-fable-5":    [10.0, 12.50, 20.0, 1.00, 50.0],
+    "claude-opus-4-8":   [5.0,  6.25,  10.0, 0.50, 25.0],
     "claude-opus-4-7":   [15.0, 18.75, 30.0, 1.50, 75.0],
     "claude-sonnet-4-7": [3.0,  3.75,   6.0, 0.30, 15.0]
   }
