@@ -57,10 +57,16 @@ def _cutoff(period: str) -> Optional[datetime]:
         return now - timedelta(days=7)
     if period == '30d':
         return now - timedelta(days=30)
-    if period.endswith('d') and period[:-1].isdigit():
-        return now - timedelta(days=int(period[:-1]))
-    if period.endswith('h') and period[:-1].isdigit():
-        return now - timedelta(hours=int(period[:-1]))
+    # Custom "<N>d" / "<N>h". Use isascii()+isdecimal() (not isdigit(), which
+    # accepts superscripts and other Unicode digits that then crash int()), and
+    # cap N so an enormous value can't raise OverflowError out of timedelta —
+    # both bad cases fall through to the clean "Unknown period" error below.
+    if period and period[-1] in ('d', 'h'):
+        num = period[:-1]
+        if num.isascii() and num.isdecimal() and int(num) <= 100_000:
+            n = int(num)
+            unit = 'days' if period[-1] == 'd' else 'hours'
+            return now - timedelta(**{unit: n})
     raise SystemExit(f"Unknown period: {period}")
 
 

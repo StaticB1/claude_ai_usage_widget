@@ -3035,7 +3035,14 @@ class App:
             # can't be relied on within this same iteration).
             retries: List[datetime] = []
             for acc in poll:
-                state = self._account_states[acc.label]
+                # reload_accounts() can atomically swap self._account_states on
+                # the main thread while we iterate this snapshot of `poll`; a
+                # just-removed account won't be in the new dict. Use .get()+skip
+                # so a mid-poll removal can't KeyError out of this worker thread
+                # and leave cloud polling dead until restart.
+                state = self._account_states.get(acc.label)
+                if state is None:
+                    continue
                 # Honor this account's own rate-limit backoff without holding
                 # up healthy accounts (a 429 on one token used to delay the
                 # whole loop, and thus every other account, by ≥120s).
