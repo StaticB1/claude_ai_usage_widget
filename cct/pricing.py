@@ -9,6 +9,9 @@ from .config import RATE_CARD_FILE
 PricingTuple = Tuple[float, float, float, float, float]
 
 DEFAULT_RATE_CARD: Dict[str, PricingTuple] = {
+    'claude-fable-5':    (10.0, 12.50, 20.0, 1.00, 50.0),
+    'claude-mythos-5':   (10.0, 12.50, 20.0, 1.00, 50.0),
+    'claude-opus-4-8':   (5.0,  6.25,  10.0, 0.50, 25.0),
     'claude-opus-4-7':   (15.0, 18.75, 30.0, 1.50, 75.0),
     'claude-opus-4-6':   (15.0, 18.75, 30.0, 1.50, 75.0),
     'claude-opus-4-5':   (15.0, 18.75, 30.0, 1.50, 75.0),
@@ -33,6 +36,12 @@ class RateCard:
         if model in self.table:
             return self.table[model]
         low = model.lower()
+        if 'mythos' in low:
+            return self.table.get('claude-mythos-5',
+                                  (10.0, 12.50, 20.0, 1.00, 50.0))
+        if 'fable' in low:
+            return self.table.get('claude-fable-5',
+                                  (10.0, 12.50, 20.0, 1.00, 50.0))
         if 'opus' in low:
             return self.table.get('claude-opus-4-7',
                                   (15.0, 18.75, 30.0, 1.50, 75.0))
