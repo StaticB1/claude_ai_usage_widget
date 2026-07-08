@@ -165,3 +165,24 @@ def test_snapshot_from_cloud_data_reads_percentages():
     s2 = WindowSnapshot.from_cloud_data({'seven_day': {'utilization': 1.0}})
     assert s2.seven_day_pct == 1.0
     assert WindowSnapshot.from_cloud_data(None).five_hour_pct is None
+
+
+def test_corrupt_state_file_does_not_crash_construction(tmp_path):
+    """A structurally-valid-but-wrong state file (or garbage) must load as
+    empty state instead of crashing NotificationManager() — a construction
+    crash would wedge notifications for the whole tray process."""
+    bad_contents = [
+        'null', '123', '[1, 2, 3]', '"hello"', 'not json at all', '',
+        '{"accounts": [1, 2]}',                       # accounts not a dict
+        '{"accounts": {"a": 5}}',                     # entry not a dict
+        '{"accounts": {"a": {"5h": "x", "7d": 3}}}',  # inner windows wrong type
+    ]
+    sf = tmp_path / 'state.json'
+    for content in bad_contents:
+        sf.write_text(content)
+        mgr = NotificationManager(state_file=sf)      # must not raise
+        assert isinstance(mgr._state, dict)
+        # And it must still be usable afterwards.
+        reset = _iso(datetime(2026, 5, 1, 17, tzinfo=timezone.utc))
+        mgr.evaluate('default',
+                     WindowSnapshot(five_hour_pct=90, five_hour_resets_at=reset))

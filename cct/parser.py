@@ -103,24 +103,36 @@ def parse_jsonl(path: Path) -> Tuple[Optional[str], List[Turn]]:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(entry, dict):
+                    # A valid-JSON but non-object line (null, a bare number, a
+                    # list) would crash the entry.get(...) calls below with
+                    # AttributeError and abort the whole file. Skip it like any
+                    # other malformed line.
+                    continue
 
                 if project_name is None:
                     cwd = entry.get('cwd')
-                    if cwd:
+                    if isinstance(cwd, str) and cwd:
                         project_name = os.path.basename(cwd)
 
                 if entry.get('type') != 'assistant':
                     continue
 
-                msg = entry.get('message') or {}
-                usage = msg.get('usage') or {}
+                msg = entry.get('message')
+                if not isinstance(msg, dict):
+                    msg = {}
+                usage = msg.get('usage')
+                if not isinstance(usage, dict):
+                    usage = {}
                 inp = usage.get('input_tokens', 0) or 0
                 cc_total = usage.get('cache_creation_input_tokens', 0) or 0
                 cr = usage.get('cache_read_input_tokens', 0) or 0
                 out = usage.get('output_tokens', 0) or 0
                 model = msg.get('model')
 
-                cc_split = usage.get('cache_creation') or {}
+                cc_split = usage.get('cache_creation')
+                if not isinstance(cc_split, dict):
+                    cc_split = {}
                 cc_1h = cc_split.get('ephemeral_1h_input_tokens', 0) or 0
                 cc_5m = cc_split.get('ephemeral_5m_input_tokens', 0) or 0
                 # `cache_creation_input_tokens` is authoritative. If the 5m/1h
