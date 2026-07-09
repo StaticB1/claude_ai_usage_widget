@@ -162,9 +162,11 @@ class _AccountState:
 
     @classmethod
     def from_dict(cls, d: dict) -> '_AccountState':
+        fh = d.get('5h')
+        sd = d.get('7d')
         return cls(
-            five_hour=dict(d.get('5h') or {}),
-            seven_day=dict(d.get('7d') or {}),
+            five_hour=dict(fh) if isinstance(fh, dict) else {},
+            seven_day=dict(sd) if isinstance(sd, dict) else {},
         )
 
 
@@ -180,9 +182,18 @@ class NotificationManager:
             raw = json.loads(self.state_file.read_text())
         except (json.JSONDecodeError, OSError):
             return {}
-        accounts = raw.get('accounts') or {}
+        # A structurally-valid-but-wrong state file (JSON null/list/string, a
+        # non-dict 'accounts', or non-dict per-account entries) must not crash
+        # NotificationManager construction — that would wedge notifications for
+        # the whole tray process. Fall back to empty state instead.
+        if not isinstance(raw, dict):
+            return {}
+        accounts = raw.get('accounts')
+        if not isinstance(accounts, dict):
+            return {}
         return {label: _AccountState.from_dict(d)
-                for label, d in accounts.items()}
+                for label, d in accounts.items()
+                if isinstance(d, dict)}
 
     def _save(self) -> None:
         payload = {

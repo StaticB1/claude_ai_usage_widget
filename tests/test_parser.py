@@ -106,3 +106,29 @@ def test_parse_timestamp_formats():
     assert parse_timestamp(None) is None
     assert parse_timestamp('') is None
     assert parse_timestamp('not a date') is None
+
+
+def test_non_dict_and_wrong_type_lines_skipped_not_crashing(tmp_path):
+    """A valid-JSON but non-object line (null / number / list / string), or an
+    assistant entry whose message/usage fields are the wrong type, must be
+    skipped without aborting the whole file (regression: these used to raise an
+    uncaught AttributeError and drop every turn in the session)."""
+    p = tmp_path / 's.jsonl'
+    _write_jsonl(p, [
+        None,                                    # JSON null
+        123,                                     # bare number
+        [1, 2, 3],                               # array
+        "just a string",                         # string
+        {'type': 'assistant', 'message': 'not-a-dict'},
+        {'type': 'assistant',
+         'message': {'id': 'm0', 'usage': 'not-a-dict'}},
+        {'type': 'assistant', 'cwd': 12345,      # non-string cwd
+         'timestamp': '2026-04-28T10:00:00Z',
+         'message': {'id': 'm-good', 'model': 'claude-sonnet-4-7',
+                     'usage': {'input_tokens': 5, 'output_tokens': 7}}},
+    ])
+    label, turns = parse_jsonl(p)
+    # Only the last, well-formed assistant turn survives.
+    assert len(turns) == 1
+    assert turns[0].input_tokens == 5
+    assert turns[0].output_tokens == 7
