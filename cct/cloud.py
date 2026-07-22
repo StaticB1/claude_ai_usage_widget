@@ -122,6 +122,47 @@ def normalize_utilization(raw) -> float:
     return max(0.0, min(v / 100.0, 1.0))
 
 
+def extract_model_limits(data: Optional[dict]) -> list:
+    """Pull per-model weekly limits out of the usage API's ``limits`` array.
+
+    The API returns a flat ``limits`` list that mixes account-wide windows
+    (``kind`` == ``session`` / ``weekly_all``) with per-model caps
+    (``kind`` == ``weekly_scoped``, carrying ``scope.model.display_name`` —
+    e.g. a separate weekly Opus limit on Max plans). We surface only the
+    model-scoped ones here; the account-wide 5h/7d windows already come from
+    the legacy ``five_hour`` / ``seven_day`` fields.
+
+    Returns a list of dicts, highest-utilization first::
+
+        [{"model": "Fable", "pct": 52, "fraction": 0.52,
+          "resets_at": "2026-…", "is_active": True}]
+
+    Tolerant of a missing/malformed ``limits`` field (older API responses
+    predate it) — returns ``[]`` rather than raising."""
+    if not isinstance(data, dict):
+        return []
+    out = []
+    for lim in data.get('limits') or []:
+        if not isinstance(lim, dict) or lim.get('kind') != 'weekly_scoped':
+            continue
+        scope = lim.get('scope')
+        model = (scope or {}).get('model') if isinstance(scope, dict) else None
+        name = (model or {}).get('display_name') if isinstance(model, dict) \
+            else None
+        if not name:
+            continue
+        frac = normalize_utilization(lim.get('percent'))
+        out.append({
+            "model": str(name),
+            "pct": int(round(frac * 100)),
+            "fraction": frac,
+            "resets_at": lim.get('resets_at'),
+            "is_active": bool(lim.get('is_active')),
+        })
+    out.sort(key=lambda m: m['fraction'], reverse=True)
+    return out
+
+
 def fetch_cloud_usage(token: str) -> dict:
     headers = {
         "Accept": "application/json",
