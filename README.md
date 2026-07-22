@@ -55,6 +55,9 @@ the tray gauge behaves like the original widget.
   utilization at a glance, mirroring Anthropic's `claude /usage` semantics.
 - **5h + 7d rolling windows** — see both the short and weekly limit usage, with
   reset countdowns.
+- **Per-model weekly limits** — when your plan meters a model separately (e.g. a
+  dedicated **Opus** weekly cap on Max), each model's limit gets its own row/bar
+  with percentage and reset, marked `●` when it's the one currently gating you.
 - **ETA-to-limit** — projects when you'll hit your cap at the current burn rate.
 - **Escalation notifications** — desktop alerts at 75% / 90% / 100% of a window.
 - **Multi-account** — track several Claude logins at once, each with its own
@@ -164,8 +167,9 @@ Launch `claude-token-tracker` and a gauge appears in your system tray:
 - The ring/percentage is your **live 5-hour plan utilization** (0–100% of your
   Pro/Max/Team limit). Green → amber → red as you approach the cap.
 - Right-click the tray icon for the full readout: the **LIMITS** section (5h and
-  7d windows + resets), per-**ACCOUNT** utilization, and your **CURRENT 5H
-  BLOCK** burn (this part is local and works even without a token).
+  7d windows + any per-model weekly caps, each with resets), per-**ACCOUNT**
+  utilization, and your **CURRENT 5H BLOCK** burn (this part is local and works
+  even without a token).
 - **Open Dashboard** for the full tracker UI; **Refresh now** forces a poll.
 - Notifications fire as you cross **75% / 90% / 100%** of a window.
 
@@ -232,7 +236,8 @@ COST=$(ctt summary --period today --json | jq '.totals.cost_usd')
 
 `claude-token-tracker` (or `ctt gui`) opens a window with:
 
-- **Dashboard** — live limits, current block, headline totals.
+- **Dashboard** — live limits (5h / 7d + per-model weekly caps), current block,
+  headline totals.
 - **Projects** — per-project spend and recent sessions.
 - **Breakdowns** — per-model and per-tool attribution.
 - **Budgets** — create/track budgets with progress bars.

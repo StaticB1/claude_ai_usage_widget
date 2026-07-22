@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Per-model plan limits** — the tray **Limits** section and the dashboard
+  plan-limits card now show a row/bar for each model-scoped weekly cap the
+  usage API reports (e.g. a separate **Opus** weekly limit on Max plans), each
+  with its own percentage and reset countdown; a `●` marks the limit currently
+  binding your usage. Read from the API's `limits[]` array (kind
+  `weekly_scoped`); previously only the account-wide 5h / 7d windows were shown.
 - **Appearance setting** — Settings now has a System / Light / Dark theme
   switch. System follows the desktop's `org.gnome.desktop.interface`
   color-scheme live (no restart); switching updates the whole app,

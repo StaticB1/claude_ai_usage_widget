@@ -38,9 +38,9 @@ from .blocks import BLOCK_HOURS, compute_blocks, forecast_active
 from .budgets import evaluate_budgets, period_window
 from .cli import scan_into_store
 from .cloud import (AuthError, CloudApiError, RateLimitError,
-                    fetch_cloud_usage, format_reset_time, load_subscription_info,
-                    load_token, normalize_utilization, save_token,
-                    subscription_summary)
+                    extract_model_limits, fetch_cloud_usage, format_reset_time,
+                    load_subscription_info, load_token, normalize_utilization,
+                    save_token, subscription_summary)
 from .config import (APP_ID, APP_NAME, APP_VERSION, LOCAL_SCAN_INTERVAL,
                      NOTIFICATION_THRESHOLDS, PERIOD_LABELS,
                      DEFAULT_ACCOUNT_LABEL, Account,
@@ -1010,6 +1010,9 @@ class TrackerWindow(Gtk.Window):
         self._cloud_usage_box.pack_start(self._usage_5h, True, True, 0)
         self._usage_7d = UsageBar("7-Day Window", 0.0)
         self._cloud_usage_box.pack_start(self._usage_7d, True, True, 0)
+        # Per-model weekly caps get their own bars, created on demand as the
+        # API reports them (keyed by display name).
+        self._usage_model_bars: Dict[str, UsageBar] = {}
         c.pack_start(self._cloud_usage_box, False, False, 0)
 
         # Summary cards
@@ -1889,7 +1892,27 @@ class TrackerWindow(Gtk.Window):
                                   format_reset_time(five.get('resets_at')))
             self._usage_7d.update(u7, "7-Day Window",
                                   format_reset_time(seven.get('resets_at')))
-            self._cloud_usage_box.show()
+            # Per-model weekly caps: one bar each, created on first sighting
+            # and dropped when the API stops reporting the model.
+            model_limits = extract_model_limits(cv.usage_data)
+            present = set()
+            for m in model_limits:
+                name = m['model']
+                present.add(name)
+                label = f"{name} (weekly)" + (" ●" if m['is_active'] else "")
+                bar = self._usage_model_bars.get(name)
+                if bar is None:
+                    bar = UsageBar(label, m['fraction'])
+                    self._usage_model_bars[name] = bar
+                    self._cloud_usage_box.pack_start(bar, True, True, 0)
+                bar.update(m['fraction'], label,
+                           format_reset_time(m['resets_at']))
+            for name in list(self._usage_model_bars):
+                if name not in present:
+                    bar = self._usage_model_bars.pop(name)
+                    self._cloud_usage_box.remove(bar)
+                    bar.destroy()
+            self._cloud_usage_box.show_all()
         else:
             self._cloud_usage_box.hide()
 
@@ -1935,6 +1958,8 @@ class TrackerWindow(Gtk.Window):
         # next full data refresh (or forever, if not on the dashboard view).
         self._usage_5h.retint()
         self._usage_7d.retint()
+        for bar in self._usage_model_bars.values():
+            bar.retint()
         for card in self._summary_cards.values():
             card.retint()
         self.refresh_data()  # redraw everything else
@@ -2502,6 +2527,9 @@ class AccountState:
     last_resets_5h: Optional[str] = None
     last_resets_7d: Optional[str] = None
     awaiting_new_window: bool = False  # window rolled over, no fresh data yet
+    # Per-model weekly caps (kind=weekly_scoped), last-known; preserved
+    # between fetches like last_pctX so a blip doesn't blank the rows.
+    last_model_limits: List[dict] = field(default_factory=list)
 
 
 class App:
@@ -2799,6 +2827,15 @@ class App:
             it = self._limit_menu_item()
             menu.append(it)
             self._tray_items[k] = it
+        # Per-model weekly caps (e.g. a separate Opus limit on Max plans).
+        # Rows are dynamic: the menu is rebuilt when the model set changes
+        # (see _rebuild_tray), so build from the primary account's cache.
+        self._tray_model_names = [m['model'] for m
+                                  in self._primary_state().last_model_limits]
+        for name in self._tray_model_names:
+            it = self._limit_menu_item()
+            menu.append(it)
+            self._tray_items[f'model:{name}'] = it
 
         # ── ACCOUNTS section (only when more than one configured) ─────────
         if len(self._accounts) > 1:
@@ -2867,6 +2904,13 @@ class App:
         between resets so a missed fetch doesn't blank the indicator."""
         if not self._indicator:
             return
+        # The per-model rows are dynamic (models come and go per plan). When
+        # the set changes, rebuild the menu so rows are added/removed; label
+        # updates below then fill them in. Rare event — not every fetch.
+        model_names = [m['model'] for m
+                       in self._primary_state().last_model_limits]
+        if model_names != getattr(self, '_tray_model_names', []):
+            self._set_tray_menu()
         # ── Tray label: aggregated multi-account 5h % ─────────────────────
         pieces: List[str] = []
         for acc in self._visible_accounts():
@@ -2912,14 +2956,19 @@ class App:
     def _update_tray_limits(self, st: AccountState):
         """5h/7d lines render either from current usage_data or the
         last-known cached values (preserving info between fetches)."""
-        def _set(key: str, frac: Optional[float], text: str):
-            self._tray_items[key].set_label(text)
+        def _set(key: str, text: str):
+            it = self._tray_items.get(key)
+            if it is not None:
+                it.set_label(text)
 
         if st.cloud_state in ('auth_error', 'network_error', 'rate_limited',
                               'no_token'):
             hint = st.cloud_state.replace('_', ' ')
-            _set('5h', None, f"5h  {self._emoji_bar(None)}  {hint}")
-            _set('7d', None, f"7d  {self._emoji_bar(None)}  {hint}")
+            _set('5h', f"5h  {self._emoji_bar(None)}  {hint}")
+            _set('7d', f"7d  {self._emoji_bar(None)}  {hint}")
+            for m in st.last_model_limits:
+                _set(f"model:{m['model']}",
+                     f"   {m['model']}  {self._emoji_bar(None)}  {hint}")
             return
         u5 = (st.last_pct5 or 0) / 100.0
         u7 = (st.last_pct7 or 0) / 100.0
@@ -2929,8 +2978,15 @@ class App:
         p7 = '?' if st.last_pct7 is None else f"{st.last_pct7}%"
         b5 = self._emoji_bar(u5 if st.last_pct5 is not None else None)
         b7 = self._emoji_bar(u7 if st.last_pct7 is not None else None)
-        _set('5h', None, f"5h  {b5}  {p5} · ↻ {r5}")
-        _set('7d', None, f"7d  {b7}  {p7} · ↻ {r7}")
+        _set('5h', f"5h  {b5}  {p5} · ↻ {r5}")
+        _set('7d', f"7d  {b7}  {p7} · ↻ {r7}")
+        # Per-model weekly caps. ● flags the one currently binding your usage.
+        for m in st.last_model_limits:
+            bar = self._emoji_bar(m['fraction'])
+            rr = self._fmt_reset(m['resets_at'], st.account, window='7d')
+            marker = ' ●' if m['is_active'] else ''
+            _set(f"model:{m['model']}",
+                 f"   {m['model']}  {bar}  {m['pct']}%{marker} · ↻ {rr}")
 
     def _tray_account_line(self, st: AccountState) -> str:
         if st.cloud_state in ('auth_error', 'network_error', 'rate_limited',
@@ -3125,6 +3181,7 @@ class App:
             # numbers so clear any "?" awaiting flag.
             st.last_pct5, st.last_pct7 = pct5, pct7
             st.last_resets_5h, st.last_resets_7d = r5, r7
+            st.last_model_limits = extract_model_limits(data)
 
             if account_label == self._primary_account().label:
                 if HAS_NOTIFY:
