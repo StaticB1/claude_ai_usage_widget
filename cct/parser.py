@@ -36,10 +36,6 @@ class Turn:
                 + self.cache_read + self.output_tokens)
 
     @property
-    def tool_count(self) -> int:
-        return sum(self.tool_uses.values())
-
-    @property
     def dedup_key(self) -> str:
         return self.msg_id or self.request_id or self.uuid or (
             f"{self.project}|{self.session_id or ''}|"
@@ -84,15 +80,38 @@ def _extract_tool_uses(msg: dict) -> Dict[str, int]:
     return counts
 
 
+def _file_mtime(path: Path) -> datetime:
+    """Last-modified time of ``path``, or the epoch if it can't be read."""
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
 def parse_jsonl(path: Path) -> Tuple[Optional[str], List[Turn]]:
     """Parse one Claude Code session JSONL. Returns (project_label, turns).
 
-    Claude Code may emit duplicate copies of the same assistant message — we
-    dedup on `message.id`, falling back to requestId / uuid for older logs.
+    Claude Code writes one assistant API response across several log entries
+    that repeat the same `message.id` — the text block on one line, each
+    tool_use block on the next. Two things were lost by skipping the repeats
+    outright, both measured over this machine's logs:
+
+    * The tool_use blocks the repeats carried. 59% of all tool calls (53,750
+      of 91,101) never reached the store, so every tool was under-reported.
+    * The real ``output_tokens``. Input, cache-creation and cache-read counts
+      are identical on every entry of a message, but the earlier entries
+      often carry a placeholder output count (4, or 8) and only the last
+      entry has the true one (568). 5,163 messages were affected, costing
+      5.44M output tokens — 7.6% of all output on disk, and output is the
+      dearest token class there is.
+
+    So a repeat entry now merges its tool counts into the turn already
+    recorded and raises each token count to the highest seen for that id.
     """
     project_name: Optional[str] = None
     turns: List[Turn] = []
-    seen: set = set()
+    seen: Dict[str, Turn] = {}
+    last_ts: Optional[datetime] = None
     try:
         with open(path, encoding='utf-8', errors='ignore') as f:
             for line in f:
@@ -151,15 +170,38 @@ def parse_jsonl(path: Path) -> Tuple[Optional[str], List[Turn]]:
                 req_id = entry.get('requestId')
                 uuid_ = entry.get('uuid')
                 key = msg_id or req_id or uuid_
+                tool_uses = _extract_tool_uses(msg)
                 if key is not None:
-                    if key in seen:
+                    prior = seen.get(key)
+                    if prior is not None:
+                        for name, n in tool_uses.items():
+                            prior.tool_uses[name] = \
+                                prior.tool_uses.get(name, 0) + n
+                        # Never sum: the entries restate one response's usage
+                        # rather than adding to it. Take the highest, which is
+                        # the completed count.
+                        prior.input_tokens = max(prior.input_tokens, inp)
+                        prior.cache_creation_5m = max(
+                            prior.cache_creation_5m, cc_5m)
+                        prior.cache_creation_1h = max(
+                            prior.cache_creation_1h, cc_1h)
+                        prior.cache_read = max(prior.cache_read, cr)
+                        prior.output_tokens = max(prior.output_tokens, out)
+                        if prior.model is None and model:
+                            prior.model = model
                         continue
-                    seen.add(key)
 
-                ts = parse_timestamp(entry.get('timestamp')) \
-                    or datetime.now(timezone.utc)
+                # A missing timestamp used to become "now", which drops a
+                # historical turn into the current 5-hour window and inflates
+                # it. The log is append-ordered, so the previous entry's time
+                # is a sound bound; failing that, the file's own mtime.
+                ts = parse_timestamp(entry.get('timestamp'))
+                if ts is None:
+                    ts = last_ts or _file_mtime(path)
+                else:
+                    last_ts = ts
 
-                turns.append(Turn(
+                turn = Turn(
                     timestamp=ts,
                     project=project_name or 'Unknown',
                     msg_id=msg_id,
@@ -173,10 +215,19 @@ def parse_jsonl(path: Path) -> Tuple[Optional[str], List[Turn]]:
                     cache_read=cr,
                     output_tokens=out,
                     is_sidechain=bool(entry.get('isSidechain')),
-                    tool_uses=_extract_tool_uses(msg),
-                ))
+                    tool_uses=tool_uses,
+                )
+                turns.append(turn)
+                if key is not None:
+                    seen[key] = turn
     except (OSError, PermissionError):
         pass
+    if project_name:
+        # `cwd` can appear after the first assistant turn, which then kept
+        # 'Unknown' while the rest of the same session got the real name.
+        for t in turns:
+            if t.project == 'Unknown':
+                t.project = project_name
     return project_name, turns
 
 
@@ -187,10 +238,3 @@ def iter_project_dirs(root: Optional[Path] = None) -> Iterator[Path]:
     for d in sorted(base.iterdir()):
         if d.is_dir() and d.name.startswith('-'):
             yield d
-
-
-def fallback_label(proj_dir: Path) -> str:
-    name = proj_dir.name[1:] if proj_dir.name.startswith('-') else proj_dir.name
-    if '-' in name:
-        name = name.split('-', 1)[1]
-    return name or 'Unknown'

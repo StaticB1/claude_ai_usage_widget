@@ -3,19 +3,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
+from .blocks import BLOCK_DURATION, parse_resets_at
+from .cloud import utilization_pct
+from .periods import (local_day_start, local_month_end, local_month_start,
+                     local_week_start)
 from .store import Store
-
-
-def _parse_resets_at(iso: Optional[str]) -> Optional[datetime]:
-    if not iso:
-        return None
-    try:
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
 
 
 def period_window(period: str,
@@ -24,42 +16,41 @@ def period_window(period: str,
                   ) -> Tuple[datetime, datetime, str]:
     """(start, end, key) for a budget period anchored at `now` (UTC).
 
-    For rolling Anthropic plan windows ('5h', '7d'), `resets_at` (from the
-    cloud API) anchors the period so the key only changes when Anthropic
-    actually resets the quota. Without it, falls back to a rolling window
-    ending at `now`.
+    Calendar periods ('day', 'week', 'month') follow the user's **local**
+    calendar — a monthly cap should roll over at local midnight on the 1st,
+    not at whatever local hour UTC midnight happens to fall on. Boundaries are
+    computed locally and returned in UTC for querying.
+
+    Rolling Anthropic plan windows ('5h', '7d') are anchored on `resets_at`
+    from the cloud API, so the key only changes when Anthropic actually resets
+    the quota. Without it, falls back to a rolling window ending at `now`.
     """
     now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    local = now.astimezone()
+
     if period == 'day':
-        start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-        end = start + timedelta(days=1)
-        key = start.strftime('%Y-%m-%d')
+        start_l = local_day_start(local)
+        end_l = start_l + timedelta(days=1)
+        key = start_l.strftime('%Y-%m-%d')
     elif period == 'week':
-        weekday = now.weekday()
-        day = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-        start = day - timedelta(days=weekday)
-        end = start + timedelta(days=7)
-        key = start.strftime('%G-W%V')
+        start_l = local_week_start(local)
+        end_l = start_l + timedelta(days=7)
+        key = start_l.strftime('%G-W%V')
     elif period == 'month':
-        start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
-        if now.month == 12:
-            end = datetime(now.year + 1, 1, 1, tzinfo=timezone.utc)
-        else:
-            end = datetime(now.year, now.month + 1, 1, tzinfo=timezone.utc)
-        key = start.strftime('%Y-%m')
-    elif period == '5h':
-        end_dt = _parse_resets_at(resets_at) or now
-        start = end_dt - timedelta(hours=5)
-        end = end_dt
-        key = end_dt.strftime('5h@%Y-%m-%dT%H:%M')
-    elif period == '7d':
-        end_dt = _parse_resets_at(resets_at) or now
-        start = end_dt - timedelta(days=7)
-        end = end_dt
-        key = end_dt.strftime('7d@%Y-%m-%dT%H:%M')
+        start_l = local_month_start(local)
+        end_l = local_month_end(local)
+        key = start_l.strftime('%Y-%m')
+    elif period in ('5h', '7d'):
+        end_dt = parse_resets_at(resets_at) or now
+        span = BLOCK_DURATION if period == '5h' else timedelta(days=7)
+        return (end_dt - span, end_dt,
+                end_dt.strftime(f'{period}@%Y-%m-%dT%H:%M'))
     else:
         raise ValueError(f"Unknown period: {period}")
-    return start, end, key
+    return (start_l.astimezone(timezone.utc),
+            end_l.astimezone(timezone.utc), key)
 
 
 @dataclass
@@ -83,11 +74,6 @@ class BudgetState:
     @property
     def is_pct_based(self) -> bool:
         return self.limit_pct is not None
-
-    @property
-    def is_token_based(self) -> bool:
-        return bool(self.limit_tokens) and not self.limit_usd \
-            and self.limit_pct is None
 
     @property
     def pct(self) -> float:
@@ -114,25 +100,18 @@ def _utilization_pct(usage_data: Optional[dict],
     if not usage_data:
         return None
     key = 'five_hour' if window == '5h' else 'seven_day'
-    bucket = usage_data.get(key) or {}
-    raw = bucket.get('utilization')
-    if raw is None:
+    bucket = usage_data.get(key)
+    if not isinstance(bucket, dict):
         return None
-    try:
-        v = float(raw)
-    except (TypeError, ValueError):
-        return None
-    # Utilization from the usage API is already a percentage (0-100); use it
-    # directly. The old `if v <= 1: v *= 100` heuristic turned genuine sub-1%
-    # usage into 100% (issue #4).
-    return max(0.0, min(v, 999.0))
+    return utilization_pct(bucket.get('utilization'))
 
 
 def _resets_at(usage_data: Optional[dict], window: str) -> Optional[str]:
     if not usage_data:
         return None
     key = 'five_hour' if window == '5h' else 'seven_day'
-    return (usage_data.get(key) or {}).get('resets_at')
+    bucket = usage_data.get(key)
+    return (bucket or {}).get('resets_at') if isinstance(bucket, dict) else None
 
 
 def evaluate_budgets(store: Store,
@@ -174,18 +153,13 @@ def evaluate_budgets(store: Store,
         elif scope.startswith('account:'):
             account = scope.split(':', 1)[1]
         # Clamp to the period's upper bound so future-dated rows (clock skew or
-        # imported data) can't inflate the current period's spend.
-        rows = store.query(since=start, until=end, project=project,
+        # imported data) can't inflate the current period's spend. Summed in
+        # SQL — this runs on every poll tick, and pulling a month of rows into
+        # Python to add two columns stalled the interface.
+        agg = store.totals(since=start, until=end, project=project,
                            model=model, account=account)
-        spent_usd = sum((r['cost_usd'] or 0) for r in rows)
-        spent_tokens = sum(
-            (r['input_tokens'] or 0)
-            + (r['cache_creation_5m'] or 0)
-            + (r['cache_creation_1h'] or 0)
-            + (r['cache_read'] or 0)
-            + (r['output_tokens'] or 0)
-            for r in rows
-        )
+        spent_usd = float(agg.get('cost_usd') or 0)
+        spent_tokens = int(agg.get('total_tokens') or 0)
         states.append(BudgetState(
             id=b['id'],
             name=b['name'],

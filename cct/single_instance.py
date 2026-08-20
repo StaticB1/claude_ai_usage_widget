@@ -10,7 +10,6 @@ from __future__ import annotations
 import fcntl
 import os
 import signal
-from pathlib import Path
 from typing import Optional, TextIO
 
 from .config import CONFIG_DIR

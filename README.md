@@ -70,9 +70,11 @@ the tray gauge behaves like the original widget.
 - **Per-project / per-model / per-tool** attribution — see which projects, which
   model, and which tool calls (`Bash`, `Read`, `Edit`, `Agent`, …) drive spend.
 - **Cost estimates** — priced from a built-in rate card you can override.
-- **Local 5-hour block + forecast** — a self-computed rolling block with
-  burn-rate and time-to-block-end, derived entirely from your logs (no token
-  required).
+- **5-hour session + forecast** — the window your account is actually billed
+  against, anchored on the reset time the usage API reports, with burn rate and
+  time-to-reset. Without a token it falls back to inferring the window from
+  your logs and says so, because usage from claude.ai, the apps and your other
+  machines counts toward the same window and never appears in local logs.
 - **Budgets** — daily / weekly / monthly **USD or token** caps, scoped globally,
   per-project, or per-model; plus optional **plan-utilization %** budgets that
   ride the live 5h/7d windows. Desktop notification when crossed.
@@ -191,11 +193,11 @@ per-account **"disable polling"** switch in Settings.
 | `ctt models [--period P] [--account A] [--json]` | Per-model breakdown. |
 | `ctt tools [--period P] [--account A] [--json]` | Per-tool attribution (`Bash`, `Read`, `Edit`, `Agent`, …). |
 | `ctt accounts [--period P] [--json]` | List configured accounts and their totals. |
-| `ctt block [--account A] [--json]` | Current 5-hour rolling block, burn rate, and ETA. |
+| `ctt block [--account A] [--no-cloud] [--json]` | Current 5-hour session, burn rate, and ETA. `--no-cloud` skips the live reset time and infers the window from logs. |
 | `ctt cloud [--account A]` | Live cloud usage from claude.ai (raw JSON). |
 | `ctt prompt [--no-cloud] [--account A]` | One-line status for shell prompts / status bars. |
 | `ctt export [--period P] [--project …] [--model …] [--account A] [--format json\|csv]` | Dump rows. |
-| `ctt reprice` | Recompute stored costs after editing the rate card. |
+| `ctt reprice [--rescan]` | Recompute stored costs after editing the rate card. `--rescan` also re-reads every log on disk. |
 | `ctt budget add\|list\|remove` | Manage budgets (see below). |
 | `ctt gui` | Launch the GTK dashboard (Linux). |
 
@@ -297,7 +299,8 @@ cct/
 ├── parser.py    JSONL → Turn (tool_use extraction, sidechain flag)
 ├── pricing.py   Rate card + override loader
 ├── store.py     SQLite store: incremental scan state, budgets, summaries
-├── blocks.py    Anthropic-style 5h rolling blocks + burn-rate forecast
+├── blocks.py    5h session windows (cloud-anchored) + burn-rate forecast
+├── periods.py   Period cutoffs, on the local calendar
 ├── budgets.py   Period evaluation (day/week/month/5h/7d, scoped)
 ├── cloud.py     OAuth + claude.ai usage API (the live widget)
 ├── cli.py       `ctt` commands
@@ -306,7 +309,12 @@ cct/
 
 Scanning is **incremental**: each pass skips session logs whose size/mtime are
 unchanged, so the every-10-seconds refresh only re-parses the active session
-instead of your whole history.
+instead of your whole history. Rows are written as upserts, so when a parsing
+or pricing fix ships, a rescan repairs the history already in the database
+rather than leaving the old numbers in place.
+
+Calendar periods — `today`, and the day/week/month budget windows — follow your
+local calendar, so a monthly cap rolls over at local midnight on the 1st.
 
 ## Platform support
 

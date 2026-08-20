@@ -12,7 +12,7 @@ def _turn(ts, **kw):
     defaults = dict(
         timestamp=ts, project='proj',
         msg_id=None, request_id=None, uuid=None,
-        session_id='s-1', model='claude-sonnet-4-7',
+        session_id='s-1', model='claude-sonnet-4-6',
         input_tokens=1_000_000, cache_creation_5m=0, cache_creation_1h=0,
         cache_read=0, output_tokens=0, is_sidechain=False,
         tool_uses={},
@@ -34,23 +34,51 @@ def rc():
 def test_period_window_day():
     now = datetime(2026, 4, 28, 14, 30, tzinfo=timezone.utc)
     start, end, key = period_window('day', now)
-    assert start == datetime(2026, 4, 28, tzinfo=timezone.utc)
-    assert end == datetime(2026, 4, 29, tzinfo=timezone.utc)
-    assert key == '2026-04-28'
+    local = now.astimezone()
+    # A daily cap rolls over at the user's local midnight, not UTC's.
+    assert start.astimezone() == local.replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    assert end - start == timedelta(days=1)
+    assert key == local.strftime('%Y-%m-%d')
 
 
 def test_period_window_month():
-    now = datetime(2026, 4, 28, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 15, 12, tzinfo=timezone.utc)
     start, end, key = period_window('month', now)
-    assert start == datetime(2026, 4, 1, tzinfo=timezone.utc)
-    assert end == datetime(2026, 5, 1, tzinfo=timezone.utc)
-    assert key == '2026-04'
+    local = now.astimezone()
+    start_l, end_l = start.astimezone(), end.astimezone()
+    assert (start_l.day, start_l.hour, start_l.minute) == (1, 0, 0)
+    assert (end_l.day, end_l.hour, end_l.minute) == (1, 0, 0)
+    assert start_l.month == local.month
+    assert end_l.month == local.month % 12 + 1
+    assert key == local.strftime('%Y-%m')
 
 
 def test_period_window_month_year_rollover():
-    now = datetime(2026, 12, 31, tzinfo=timezone.utc)
+    # Mid-December in any timezone: the month window must end on 1 January.
+    now = datetime(2026, 12, 15, 12, tzinfo=timezone.utc)
     _, end, _ = period_window('month', now)
-    assert end == datetime(2027, 1, 1, tzinfo=timezone.utc)
+    end_l = end.astimezone()
+    assert (end_l.year, end_l.month, end_l.day) == (2027, 1, 1)
+
+
+def test_period_window_week_starts_monday_locally():
+    now = datetime(2026, 4, 15, 12, tzinfo=timezone.utc)  # a Wednesday
+    start, end, _ = period_window('week', now)
+    start_l = start.astimezone()
+    assert start_l.weekday() == 0
+    assert start_l.hour == 0 and start_l.minute == 0
+    assert end - start == timedelta(days=7)
+
+
+def test_plan_windows_anchor_on_resets_at():
+    """5h/7d windows come from the API's reset moment, not from `now`."""
+    now = datetime(2026, 8, 20, 1, 51, tzinfo=timezone.utc)
+    start, end, key = period_window(
+        '5h', now, resets_at='2026-08-20T05:30:00.394599+00:00')
+    assert end == datetime(2026, 8, 20, 5, 30, 0, 394599, tzinfo=timezone.utc)
+    assert end - start == timedelta(hours=5)
+    assert key == '5h@2026-08-20T05:30'
 
 
 def test_global_budget_evaluates_spend(store, rc):

@@ -2,18 +2,19 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
-from .blocks import compute_blocks, forecast_active
+from .blocks import SESSION_LOOKBACK, active_session, forecast
 from .budgets import evaluate_budgets
 from .cloud import (AuthError, CloudApiError, RateLimitError,
                     fetch_cloud_usage, load_token, normalize_utilization)
-from .config import (APP_NAME, APP_VERSION, CLAUDE_DIR, Account,
+from .config import (APP_NAME, APP_VERSION, Account,
                      find_account, load_accounts)
 from .format import fmt, fmt_cost, fmt_duration
 from .parser import iter_project_dirs, parse_jsonl
+from .periods import UnknownPeriod, cutoff, range_text
 from .pricing import RateCard, load_rate_card
 from .store import Store
 
@@ -46,28 +47,32 @@ def _resolve_account(label: Optional[str]) -> Optional[Account]:
 
 
 def _cutoff(period: str) -> Optional[datetime]:
-    now = datetime.now(timezone.utc)
-    if period == 'all':
+    """Period start, or None for all time. See ``cct.periods``."""
+    try:
+        return cutoff(period)
+    except UnknownPeriod as e:
+        raise SystemExit(str(e))
+
+
+def _resets_at_5h(account: Optional[Account]) -> Optional[str]:
+    """The account's live 5-hour reset moment, or None if unreachable.
+
+    The reset time the account is actually billed against is a server-side
+    fact, so the CLI asks for it before reporting a session. Silent on any
+    failure — the caller falls back to inferring the window from local logs.
+    """
+    data = _safe_cloud_data(account)
+    if not data:
         return None
-    if period == 'today':
-        return datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-    if period == '5h':
-        return now - timedelta(hours=5)
-    if period == '7d':
-        return now - timedelta(days=7)
-    if period == '30d':
-        return now - timedelta(days=30)
-    # Custom "<N>d" / "<N>h". Use isascii()+isdecimal() (not isdigit(), which
-    # accepts superscripts and other Unicode digits that then crash int()), and
-    # cap N so an enormous value can't raise OverflowError out of timedelta —
-    # both bad cases fall through to the clean "Unknown period" error below.
-    if period and period[-1] in ('d', 'h'):
-        num = period[:-1]
-        if num.isascii() and num.isdecimal() and int(num) <= 100_000:
-            n = int(num)
-            unit = 'days' if period[-1] == 'd' else 'hours'
-            return now - timedelta(**{unit: n})
-    raise SystemExit(f"Unknown period: {period}")
+    five = data.get('five_hour')
+    return five.get('resets_at') if isinstance(five, dict) else None
+
+
+def _session_rows(store: Store, account: Optional[str]):
+    return store.query(
+        since=datetime.now(timezone.utc) - SESSION_LOOKBACK,
+        account=account,
+    )
 
 
 def scan_into_store(store: Store, rate_card: RateCard,
@@ -172,6 +177,12 @@ def cmd_summary(args):
                   f"{fmt_cost(p['cost_usd'] or 0):>10}")
 
 
+def _period_line(period: str, account: Optional[str]) -> str:
+    """One line naming the window the figures below cover."""
+    scope = f" · account {account}" if account else ""
+    return f"Period: {period} ({range_text(period) or 'all time'}){scope}"
+
+
 def cmd_models(args):
     store = Store()
     cutoff = _cutoff(args.period)
@@ -180,6 +191,7 @@ def cmd_models(args):
     if args.json:
         print(json.dumps(out, indent=2, default=str))
     else:
+        print(_period_line(args.period, account))
         print(f"{'Model':<32} {'Msgs':>6} {'Tokens':>10} {'Cost':>10}")
         print('-' * 62)
         for m in out:
@@ -187,6 +199,19 @@ def cmd_models(args):
                   f"{m['messages']:>6} "
                   f"{fmt(m['total_tokens'] or 0):>10} "
                   f"{fmt_cost(m['cost_usd'] or 0):>10}")
+
+
+def _elide(name: str, width: int) -> str:
+    """Shorten from the middle, keeping both ends.
+
+    MCP tool names share a long prefix (``mcp__chrome-devtools__…``), so
+    cutting the tail rendered several different tools as the same string.
+    """
+    if len(name) <= width:
+        return name
+    keep = width - 1
+    head = (keep + 1) // 2
+    return name[:head] + '…' + name[len(name) - (keep - head):]
 
 
 def cmd_tools(args):
@@ -197,10 +222,15 @@ def cmd_tools(args):
     if args.json:
         print(json.dumps(out, indent=2, default=str))
     else:
-        print(f"{'Tool':<22} {'Calls':>8} {'Msgs':>6} {'Cost':>10}")
-        print('-' * 50)
+        print(_period_line(args.period, account))
+        print(f"{'Tool':<34} {'Calls':>8} {'Msgs':>6} {'Cost':>10}")
+        print("Cost is the whole turn's cost, charged to each tool that turn "
+              "called, so the")
+        print("column neither adds up to your total spend nor divides it "
+              "per call.")
+        print('-' * 62)
         for t in out:
-            print(f"{t['name'][:22]:<22} "
+            print(f"{_elide(t['name'], 34):<34} "
                   f"{int(t['calls']):>8} "
                   f"{int(t['messages']):>6} "
                   f"{fmt_cost(t['cost_usd']):>10}")
@@ -229,6 +259,7 @@ def cmd_accounts(args):
     if args.json:
         print(json.dumps(out, indent=2, default=str))
         return
+    print(_period_line(args.period, None))
     print(f"{'Account':<16} {'Claude dir':<32} {'Msgs':>6} "
           f"{'Tokens':>10} {'Cost':>10}")
     print('-' * 80)
@@ -239,20 +270,23 @@ def cmd_accounts(args):
 
 
 def cmd_block(args):
+    """The current 5-hour session window, anchored on the live reset time."""
     store = Store()
     account = getattr(args, 'account', None)
-    rows = store.query(
-        since=datetime.now(timezone.utc) - timedelta(hours=24),
-        account=account,
-    )
-    blocks = compute_blocks(rows)
-    if not blocks:
-        print(json.dumps({'active': False}, indent=2))
+    resets_at = None
+    if not args.no_cloud:
+        resets_at = _resets_at_5h(_resolve_account(account))
+    block = active_session(_session_rows(store, account), resets_at)
+    if block is None:
+        print(json.dumps({'active': False, 'anchored': bool(resets_at)},
+                         indent=2))
         return
-    fc = forecast_active(blocks)
-    block = blocks[-1]
+    fc = forecast(block)
     payload = {
-        'active': block.is_active(),
+        'active': True,
+        # False means the window was inferred from local logs alone and can be
+        # minutes out; True means it came from the account's own reset time.
+        'anchored': block.anchored,
         'start': block.start.isoformat(),
         'end': block.end.isoformat(),
         'last_message': block.last_message.isoformat(),
@@ -270,12 +304,14 @@ def cmd_block(args):
     if args.json:
         print(json.dumps(payload, indent=2))
     else:
-        rem = block.remaining()
-        print(f"Block: {block.start.astimezone():%Y-%m-%d %H:%M}"
-              f" → {block.end.astimezone():%H:%M}")
-        print(f"  Messages: {block.messages}  Tokens: {fmt(block.total_tokens)}"
+        source = 'live reset time' if block.anchored else 'estimated from logs'
+        print(f"Session: {block.start.astimezone():%Y-%m-%d %H:%M}"
+              f" \u2192 {block.end.astimezone():%H:%M}  ({source})")
+        print(f"  Messages: {block.messages}  "
+              f"Tokens: {fmt(block.total_tokens)}"
               f"  Cost: {fmt_cost(block.cost_usd)}")
-        print(f"  Remaining: {fmt_duration(rem.total_seconds())}")
+        print(f"  Remaining: "
+              f"{fmt_duration(block.remaining().total_seconds())}")
         print(f"  Burn: {fmt(int(fc.burn_rate_per_min_tokens))} tok/min, "
               f"${fc.burn_rate_per_min_cost:.4f}/min")
 
@@ -306,31 +342,23 @@ def cmd_prompt(args):
     """One-line status for shell prompts / status bars / IDE strips."""
     store = Store()
     account = getattr(args, 'account', None)
-    rows = store.query(
-        since=datetime.now(timezone.utc) - timedelta(hours=6),
-        account=account,
-    )
-    blocks = compute_blocks(rows)
-    pieces = []
-    if blocks and blocks[-1].is_active():
-        b = blocks[-1]
-        rem = b.remaining()
-        pieces.append(fmt_duration(rem.total_seconds()))
-        if b.cost_usd > 0:
-            pieces.append(fmt_cost(b.cost_usd))
+    data = None
     if not args.no_cloud:
-        acc = _resolve_account(account)
-        creds = acc.credentials_file if acc else None
-        token = load_token(creds)
-        if token:
-            try:
-                data = fetch_cloud_usage(token)
-                u5 = int(normalize_utilization(
-                    (data.get('five_hour') or {}).get('utilization', 0)) * 100)
-                pieces.append(f"5h:{u5}%")
-            except (RateLimitError, AuthError, CloudApiError):
-                pass
-    print(' '.join(pieces) if pieces else '—')
+        data = _safe_cloud_data(_resolve_account(account))
+    five = data.get('five_hour') if isinstance(data, dict) else None
+    five = five if isinstance(five, dict) else {}
+
+    pieces = []
+    block = active_session(_session_rows(store, account),
+                           five.get('resets_at'))
+    if block is not None:
+        pieces.append(fmt_duration(block.remaining().total_seconds()))
+        if block.cost_usd > 0:
+            pieces.append(fmt_cost(block.cost_usd))
+    if five:
+        pct = int(normalize_utilization(five.get('utilization', 0)) * 100)
+        pieces.append(f"5h:{pct}%")
+    print(' '.join(pieces) if pieces else '\u2014')
 
 
 def cmd_export(args):
@@ -419,6 +447,9 @@ def cmd_budget(args):
 
 def cmd_reprice(args):
     store = Store()
+    if getattr(args, 'rescan', False):
+        store.forget_scans()
+        scan_into_store(store, load_rate_card())
     n = store.reprice_all(load_rate_card())
     print(json.dumps({'repriced': n}, indent=2))
 
@@ -474,8 +505,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument('--json', action='store_true')
     sp.set_defaults(func=cmd_accounts)
 
-    sp = sub.add_parser('block', help='Current 5-hour rolling block + ETA')
+    sp = sub.add_parser(
+        'block', help="Current 5-hour session window + burn rate")
     sp.add_argument('--account', help='filter to one account')
+    sp.add_argument('--no-cloud', action='store_true',
+                    help='skip the live reset-time lookup and infer the '
+                         'window from local logs (less accurate)')
     sp.add_argument('--json', action='store_true')
     sp.set_defaults(func=cmd_block)
 
@@ -497,8 +532,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument('--format', choices=['json', 'csv'], default='json')
     sp.set_defaults(func=cmd_export)
 
-    sp = sub.add_parser('reprice',
-                        help='Recompute cost_usd for stored rows (after rate-card edit)')
+    sp = sub.add_parser(
+        'reprice',
+        help='Recompute stored costs after a rate-card edit')
+    sp.add_argument('--rescan', action='store_true',
+                    help='also re-read every session log first, repairing '
+                         'rows written by an older version')
     sp.set_defaults(func=cmd_reprice)
 
     bp = sub.add_parser('budget', help='Manage spend/usage budgets')

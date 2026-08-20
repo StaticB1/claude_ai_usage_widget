@@ -1,5 +1,5 @@
 from __future__ import annotations
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
 
@@ -31,8 +31,6 @@ def fmt_duration(seconds: float) -> str:
 def fmt_cost(cost: float) -> str:
     if cost >= 100:
         return f"${cost:,.0f}"
-    if cost >= 1:
-        return f"${cost:.2f}"
     if cost >= 0.01:
         return f"${cost:.2f}"
     return f"${cost:.3f}"
@@ -99,21 +97,3 @@ def fmt_reset_absolute(iso: Optional[str], with_weekday: bool = False) -> str:
     if with_weekday:
         return f"{_WEEKDAY_SHORT[end.weekday()]} {body}"
     return body
-
-
-def period_range_text(period: str) -> str:
-    now = datetime.now()
-    if period == 'all':
-        return 'since first recorded message'
-    if period == 'today':
-        return now.strftime('%b %d, %Y')
-    deltas = {'5h': timedelta(hours=5),
-              '7d': timedelta(days=7),
-              '30d': timedelta(days=30)}
-    delta = deltas.get(period)
-    if delta is None:
-        return ''
-    start = now - delta
-    if start.year == now.year:
-        return f"{start.strftime('%b %d')} – {now.strftime('%b %d, %Y')}"
-    return f"{start.strftime('%b %d, %Y')} – {now.strftime('%b %d, %Y')}"

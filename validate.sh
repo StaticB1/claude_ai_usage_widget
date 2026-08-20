@@ -1,100 +1,108 @@
-#!/bin/bash
-# Pre-release validation script
-echo "🔍 Claude Usage Widget - Pre-Release Validation"
-echo "================================================"
+#!/usr/bin/env bash
+# Pre-release validation.
+#
+# Everything here checks the cct/ package. It used to check a single-file v1
+# widget that no longer ships, so it read the version from a file the
+# installer never copied and reported a stale number for every release.
+set -uo pipefail
+
+echo "Claude Usage Widget — pre-release validation"
+echo "==========================================="
 echo ""
 
 ERRORS=0
+fail() { echo "  x $1"; ERRORS=$((ERRORS + 1)); }
+ok()   { echo "  - $1"; }
+warn() { echo "  ! $1"; }
 
-# 1. Check Python syntax
-echo "▸ Checking Python syntax..."
-if python3 -m py_compile claude_usage_widget.py 2>/dev/null; then
-    echo "  ✓ Python syntax valid"
+PYTHON="${PYTHON:-python3}"
+
+echo "> Compiling the package..."
+if "$PYTHON" -m compileall -q cct >/dev/null 2>&1; then
+    ok "cct/ compiles"
 else
-    echo "  ✗ Python syntax errors found"
-    ((ERRORS++))
+    fail "syntax errors in cct/"
+    "$PYTHON" -m compileall -q cct
 fi
 
-# 2. Check shell script syntax
-echo "▸ Checking shell scripts..."
-if bash -n install.sh 2>/dev/null && bash -n uninstall.sh 2>/dev/null; then
-    echo "  ✓ Shell scripts valid"
+echo "> Checking shell scripts..."
+sh_bad=0
+for f in install.sh uninstall.sh upgrade.sh validate.sh; do
+    bash -n "$f" 2>/dev/null || { fail "$f has syntax errors"; sh_bad=1; }
+done
+[ "$sh_bad" -eq 0 ] && ok "shell scripts parse"
+
+echo "> Running the test suite..."
+if "$PYTHON" -m pytest -q >/tmp/ctt-validate-pytest.log 2>&1; then
+    ok "$(tail -1 /tmp/ctt-validate-pytest.log)"
 else
-    echo "  ✗ Shell script syntax errors"
-    ((ERRORS++))
+    fail "tests failed"
+    tail -20 /tmp/ctt-validate-pytest.log
 fi
 
-# 3. Check for sensitive data (real tokens, not placeholders)
-echo "▸ Checking for real tokens in repository..."
-# Look for tokens that aren't followed by "..." (placeholders)
-if grep -rE "sk-ant-oat[0-9a-zA-Z_-]{50,}" . --exclude-dir=.git --exclude-dir=.claude --exclude="*.pyc" >/dev/null 2>&1; then
-    echo "  ✗ WARNING: Real token found in repository!"
-    ((ERRORS++))
+echo "> Checking the CLI runs..."
+if "$PYTHON" -m cct --version >/dev/null 2>&1; then
+    ok "ctt --version works"
 else
-    echo "  ✓ No real tokens in repository (placeholders OK)"
+    fail "the CLI does not start"
 fi
 
-# 4. Check file permissions
-echo "▸ Checking file permissions..."
-if [[ $(stat -c %a claude_usage_widget.py) == "644" ]]; then
-    echo "  ✓ Main script has correct permissions"
+echo "> Checking for real tokens in the repository..."
+if grep -rEq "sk-ant-oat[0-9a-zA-Z_-]{50,}" . \
+        --exclude-dir=.git --exclude-dir=.claude --exclude-dir=__pycache__ \
+        --exclude="*.pyc" 2>/dev/null; then
+    fail "a real OAuth token is committed"
 else
-    echo "  ⚠ Main script permissions: $(stat -c %a claude_usage_widget.py)"
+    ok "no real tokens (placeholders are fine)"
 fi
 
-# 5. Check required files
-echo "▸ Checking required files..."
-REQUIRED_FILES=(
-    "LICENSE"
-    "README.md"
-    "claude_usage_widget.py"
-    "install.sh"
-    "uninstall.sh"
-    ".gitignore"
-    "screenshot.png"
-)
-
-for file in "${REQUIRED_FILES[@]}"; do
-    if [[ -f "$file" ]]; then
-        echo "  ✓ $file exists"
-    else
-        echo "  ✗ $file missing"
-        ((ERRORS++))
-    fi
+echo "> Checking required files..."
+for file in LICENSE README.md CHANGELOG.md pyproject.toml install.sh \
+            uninstall.sh upgrade.sh .gitignore screenshot.png \
+            claude_token_tracker.py cct/__init__.py cct/gui.py cct/cli.py; do
+    [ -f "$file" ] && ok "$file" || fail "$file missing"
 done
 
-# 6. Check for TODO/FIXME comments
-echo "▸ Checking for unresolved TODOs..."
-if grep -rn "TODO\|FIXME\|XXX" --include="*.py" --include="*.sh" . 2>/dev/null; then
-    echo "  ⚠ Found TODO/FIXME comments (review before release)"
+echo "> Checking for unresolved TODOs..."
+# --exclude this file: it greps for those words, so it always matched itself.
+todos=$(grep -rn "TODO\|FIXME\|XXX" --include="*.py" --include="*.sh" \
+        --exclude-dir=__pycache__ --exclude=validate.sh . 2>/dev/null || true)
+if [ -n "$todos" ]; then
+    warn "TODO/FIXME present:"
+    echo "$todos" | sed 's/^/      /'
 else
-    echo "  ✓ No TODO/FIXME found"
+    ok "no TODO/FIXME"
 fi
 
-# 7. Check README placeholders
-echo "▸ Checking README placeholders..."
+echo "> Checking README placeholders..."
 if grep -q "YOUR_USERNAME\|<this-repo>\|TODO" README.md; then
-    echo "  ✗ README contains placeholders"
-    ((ERRORS++))
+    fail "README still contains placeholders"
 else
-    echo "  ✓ README placeholders resolved"
+    ok "README placeholders resolved"
 fi
 
-# 8. Check version consistency
-echo "▸ Checking version consistency..."
-VERSION=$(grep -oP '__version__\s*=\s*"\K[^"]+' claude_usage_widget.py)
-if git tag | grep -q "v$VERSION"; then
-    echo "  ✓ Git tag v$VERSION exists"
+echo "> Checking version consistency..."
+PKG_VERSION=$(grep -oP "^APP_VERSION\s*=\s*'\K[^']+" cct/config.py)
+TOML_VERSION=$(grep -oP '^version\s*=\s*"\K[^"]+' pyproject.toml)
+if [ -z "$PKG_VERSION" ]; then
+    fail "could not read APP_VERSION from cct/config.py"
+elif [ "$PKG_VERSION" != "$TOML_VERSION" ]; then
+    fail "cct/config.py says $PKG_VERSION, pyproject.toml says $TOML_VERSION"
 else
-    echo "  ⚠ Git tag v$VERSION not found"
+    ok "version $PKG_VERSION matches in both places"
+    grep -q "\[$PKG_VERSION\]\|## $PKG_VERSION" CHANGELOG.md \
+        && ok "CHANGELOG has an entry for $PKG_VERSION" \
+        || fail "CHANGELOG has no entry for $PKG_VERSION"
+    git tag | grep -qx "v$PKG_VERSION" \
+        && ok "git tag v$PKG_VERSION exists" \
+        || warn "git tag v$PKG_VERSION not created yet"
 fi
 
 echo ""
-echo "================================================"
-if [[ $ERRORS -eq 0 ]]; then
-    echo "✅ All checks passed! Ready for release."
+echo "==========================================="
+if [ "$ERRORS" -eq 0 ]; then
+    echo "All checks passed."
     exit 0
-else
-    echo "❌ Found $ERRORS error(s). Please fix before releasing."
-    exit 1
 fi
+echo "$ERRORS check(s) failed."
+exit 1
