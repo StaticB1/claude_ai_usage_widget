@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
+from .cloud import utilization_pct as _pct
 from .config import (BURN_RATE_GRACE_HOURS, DEFAULT_BURN_RATE,
                      DEFAULT_THRESHOLDS, NOTIFICATION_STATE_FILE,
                      write_private_file)
@@ -77,17 +78,7 @@ class Notification:
     body: str
 
 
-def _pct(raw) -> Optional[float]:
-    if raw is None:
-        return None
-    try:
-        v = float(raw)
-    except (TypeError, ValueError):
-        return None
-    # Utilization from the usage API is already a percentage (0-100); use it
-    # directly. The old `if v <= 1: v *= 100` heuristic mis-scaled genuine
-    # sub-1% usage into 100% (issue #4).
-    return max(0.0, min(v, 999.0))
+
 
 
 def _parse_iso(iso: Optional[str]) -> Optional[datetime]:
@@ -204,10 +195,6 @@ class NotificationManager:
 
     def reset_account(self, account: str) -> None:
         self._state.pop(account, None)
-        self._save()
-
-    def reset_all(self) -> None:
-        self._state.clear()
         self._save()
 
     def evaluate(self, account: str, snapshot: WindowSnapshot,

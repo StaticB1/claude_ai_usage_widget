@@ -107,19 +107,42 @@ def subscription_summary(info: Optional[dict]) -> Tuple[str, bool]:
     return (sub_type or "Pay-as-you-go API", False)
 
 
+# Upper bound on a reported utilization percentage. Only a guard against a
+# garbage payload: overage above the plan limit is real and must survive, so
+# the ceiling sits far above 100 rather than at it. Progress bars clamp to
+# their own range at the widget instead.
+MAX_UTILIZATION_PCT = 999.0
+
+
+def utilization_pct(raw) -> Optional[float]:
+    """A reported utilization as a 0..999 percentage, or None if unreadable.
+
+    The API already reports a percentage (62.0 means 62%). Do NOT reintroduce
+    a 'fraction vs percent' heuristic: the old `if v <= 1: v *= 100` guess
+    turned genuine sub-1% usage into a full 100% (issue #4).
+    """
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(v, MAX_UTILIZATION_PCT))
+
+
 def normalize_utilization(raw) -> float:
     """The claude.ai usage API reports utilization as a percentage
-    (0-100; e.g. 62.0 means 62%). Convert to a 0..1 fraction for progress
-    bars, clamped to [0, 1].
+    (0-100; e.g. 62.0 means 62%). Convert to a 0..1 fraction.
+
+    A plan can be over its limit, and this used to clamp at 1.0, so 140% of
+    the weekly allowance and exactly 100% of it displayed identically. The
+    fraction now passes through above 1.0 and the caller decides whether to
+    cap it for a bar.
 
     NOTE: do NOT reintroduce a 'fraction vs percent' heuristic here. The old
     `if v > 1: v /= 100` guess mis-scaled genuine sub-1% usage (a value of
     1.0 == 1%) into a full 100% — the false 100% alert in issue #4."""
-    try:
-        v = float(raw or 0)
-    except (TypeError, ValueError):
-        return 0.0
-    return max(0.0, min(v / 100.0, 1.0))
+    return (utilization_pct(raw) or 0.0) / 100.0
 
 
 def extract_model_limits(data: Optional[dict]) -> list:
@@ -207,24 +230,3 @@ def _parse_retry_after(raw: Optional[str]) -> Optional[int]:
         return max(0, int((when - datetime.now(timezone.utc)).total_seconds()))
     except (TypeError, ValueError, OverflowError):
         return None
-
-
-def format_reset_time(iso_str: Optional[str]) -> str:
-    if not iso_str:
-        return "unknown"
-    try:
-        reset_dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        delta = reset_dt - datetime.now(timezone.utc)
-        total_sec = int(delta.total_seconds())
-        if total_sec <= 0:
-            return "any moment"
-        days, rem = divmod(total_sec, 86400)
-        hours, rem = divmod(rem, 3600)
-        mins, _ = divmod(rem, 60)
-        if days > 0:
-            return f"{days}d {hours}h"
-        if hours > 0:
-            return f"{hours}h {mins}m"
-        return f"{mins}m"
-    except (ValueError, TypeError):
-        return iso_str

@@ -34,22 +34,22 @@ except (ValueError, ImportError):
 
 from gi.repository import Gtk, GLib, Gdk, GdkPixbuf, Pango  # noqa: E402
 
-from .blocks import BLOCK_HOURS, compute_blocks, forecast_active
-from .budgets import evaluate_budgets, period_window
+from .blocks import (BLOCK_DURATION, SESSION_LOOKBACK, active_session,
+                     forecast, parse_resets_at)
+from .budgets import evaluate_budgets
 from .cli import scan_into_store
 from .cloud import (AuthError, CloudApiError, RateLimitError,
-                    extract_model_limits, fetch_cloud_usage, format_reset_time,
+                    extract_model_limits, fetch_cloud_usage,
                     load_subscription_info, load_token, normalize_utilization,
                     save_token, subscription_summary)
 from .config import (APP_ID, APP_NAME, APP_VERSION, LOCAL_SCAN_INTERVAL,
-                     NOTIFICATION_THRESHOLDS, PERIOD_LABELS,
-                     DEFAULT_ACCOUNT_LABEL, Account,
-                     load_accounts, load_settings, save_accounts,
+                     PERIOD_LABELS, RATE_CARD_FILE, DEFAULT_ACCOUNT_LABEL,
+                     Account, load_accounts, load_settings, save_accounts,
                      save_settings, Settings)
 from .notifications import NotificationManager, WindowSnapshot
 from .format import (fmt, fmt_cost, fmt_duration, fmt_full,
-                     fmt_reset_absolute, fmt_reset_countdown,
-                     period_range_text, rel_time)
+                     fmt_reset_absolute, fmt_reset_countdown, rel_time)
+from .periods import cutoff_or_none, range_text
 from .pricing import load_rate_card
 from .single_instance import AlreadyRunning, acquire, signal_running_instance
 from .store import Store
@@ -683,7 +683,9 @@ class UsageBar(Gtk.Box):
         self.progress = Gtk.LevelBar()
         self.progress.set_min_value(0)
         self.progress.set_max_value(1.0)
-        self.progress.set_value(percentage)
+        # A plan can be over its limit; the bar caps at full, the label
+        # beside it still reads the true figure (e.g. "140%").
+        self.progress.set_value(min(max(percentage, 0.0), 1.0))
         self.progress.set_size_request(-1, 8)
 
         self._trough_provider = Gtk.CssProvider()
@@ -711,11 +713,11 @@ class UsageBar(Gtk.Box):
     def update(self, percentage: float, label: Optional[str] = None,
                reset_time: Optional[str] = None):
         self._percentage = percentage
-        self.progress.set_value(percentage)
+        self.progress.set_value(min(max(percentage, 0.0), 1.0))
         self.pct_lbl.set_text(f"{int(percentage * 100)}%")
         if label:
             text = label
-            if reset_time and reset_time != 'unknown':
+            if reset_time and reset_time not in ('—', 'now'):
                 text += f"  (resets in {reset_time})"
             self.label_lbl.set_text(text)
         self._apply_bar_css()  # keep trough color in sync with the live theme
@@ -951,14 +953,13 @@ class TrackerWindow(Gtk.Window):
     # ── Period helpers ─────────────────────────────────────────────────────
     @staticmethod
     def _cutoff(period: str) -> Optional[datetime]:
-        now = datetime.now(timezone.utc)
-        if period == 'all':   return None
-        if period == 'today': return datetime(now.year, now.month, now.day,
-                                              tzinfo=timezone.utc)
-        if period == '5h':    return now - timedelta(hours=5)
-        if period == '7d':    return now - timedelta(days=7)
-        if period == '30d':   return now - timedelta(days=30)
-        return None
+        """Period start in UTC, or None for all time.
+
+        Delegates to the shared period rules so the dashboard and the CLI
+        agree — they used to carry separate copies, and 'Today' in particular
+        cut at UTC midnight while the label showed the local date.
+        """
+        return cutoff_or_none(period)
 
     # ── Dashboard ──────────────────────────────────────────────────────────
     def _build_dashboard_view(self) -> Gtk.Widget:
@@ -1140,24 +1141,24 @@ class TrackerWindow(Gtk.Window):
         period = self._dashboard_period
         cutoff = self._cutoff(period)
         acc = self._account_filter
-        rows = store.query(since=cutoff, account=acc)
         self._update_cloud_section()
 
-        total = len(rows)
-        total_tokens = sum(r['input_tokens'] + r['cache_creation_5m']
-                           + r['cache_creation_1h'] + r['cache_read']
-                           + r['output_tokens'] for r in rows)
-        total_input = sum(r['input_tokens'] for r in rows)
-        total_cc = sum(r['cache_creation_5m'] + r['cache_creation_1h']
-                       for r in rows)
-        total_cr = sum(r['cache_read'] for r in rows)
-        total_output = sum(r['output_tokens'] for r in rows)
-        total_cost = sum(r['cost_usd'] or 0 for r in rows)
+        # Summed in SQL. This method runs on the interface thread every few
+        # seconds; reading 160k rows into Python to add up five columns froze
+        # the window for about half a second on every tick.
+        agg = store.totals(since=cutoff, account=acc)
+        total = int(agg.get('messages') or 0)
+        total_tokens = int(agg.get('total_tokens') or 0)
+        total_input = int(agg.get('input_tokens') or 0)
+        total_cc = int(agg.get('cache_creation') or 0)
+        total_cr = int(agg.get('cache_read') or 0)
+        total_output = int(agg.get('output_tokens') or 0)
+        total_cost = float(agg.get('cost_usd') or 0)
         total_cache = total_cc + total_cr
-        projects = len({r['project'] for r in rows})
+        projects = int(agg.get('projects') or 0)
 
         label = PERIOD_LABELS.get(period, 'All Time')
-        rng = period_range_text(period)
+        rng = range_text(period)
         self._dashboard_scope_label.set_markup(
             f'<span foreground="{COLORS["subtext"]}">'
             f'Showing <b>{html.escape(label)}</b>'
@@ -1194,28 +1195,37 @@ class TrackerWindow(Gtk.Window):
             title=f"API Equivalent {suffix}",
         )
 
-        # Block / forecast
-        block_rows = store.query(
-            since=datetime.now(timezone.utc) - timedelta(hours=24),
-            account=acc)
-        blocks = compute_blocks(block_rows)
-        cloud_5h = None
+        # ── Current session window ──────────────────────────────────────────
+        # Anchored on the account's own reset time whenever the cloud has
+        # given us one, because the window covers usage from every surface —
+        # the browser, the desktop and mobile apps, other machines — and none
+        # of that reaches these logs. Inferring the window from local logs
+        # alone put its end 28 minutes out when measured against the account's
+        # real window.
         cv = self.app.account_state(acc)
+        cloud_5h = None
         if cv.usage_data:
             cloud_5h = normalize_utilization(
                 (cv.usage_data.get('five_hour') or {}).get('utilization', 0)
             )
-        fc = forecast_active(blocks, cloud_5h_pct=cloud_5h)
-        if fc.block and fc.block.is_active():
-            b = fc.block
+        session_rows = store.query(
+            since=datetime.now(timezone.utc) - SESSION_LOOKBACK,
+            account=acc)
+        block = active_session(session_rows, cv.last_resets_5h)
+        fc = forecast(block, cloud_5h_pct=cloud_5h)
+        if block is not None:
+            source = ("" if block.anchored
+                      else "  ·  estimated from local logs")
             self._block_window_lbl.set_text(
-                f"{b.start.astimezone():%H:%M} → {b.end.astimezone():%H:%M}  "
-                f"· {b.messages} message{'s' if b.messages != 1 else ''}"
+                f"{block.start.astimezone():%H:%M} → "
+                f"{block.end.astimezone():%H:%M}  "
+                f"· {block.messages} message"
+                f"{'s' if block.messages != 1 else ''}{source}"
             )
             self._set_mini(self._block_remaining,
-                           fmt_duration(b.remaining().total_seconds()))
-            self._set_mini(self._block_tokens, fmt(b.total_tokens))
-            self._set_mini(self._block_cost, fmt_cost(b.cost_usd))
+                           fmt_duration(block.remaining().total_seconds()))
+            self._set_mini(self._block_tokens, fmt(block.total_tokens))
+            self._set_mini(self._block_cost, fmt_cost(block.cost_usd))
             self._set_mini(self._block_burn,
                            f"{fmt(int(fc.burn_rate_per_min_tokens))}/min")
             if fc.eta_to_limit is not None:
@@ -1232,7 +1242,7 @@ class TrackerWindow(Gtk.Window):
                 self._set_mini(self._block_eta, "no cloud data",
                                COLORS['muted'])
         else:
-            self._block_window_lbl.set_text("No activity in the last 5 hours")
+            self._block_window_lbl.set_text("No session open")
             for w in (self._block_remaining, self._block_tokens,
                       self._block_cost, self._block_burn, self._block_eta):
                 self._set_mini(w, "—", COLORS['muted'])
@@ -1240,7 +1250,8 @@ class TrackerWindow(Gtk.Window):
         # Top projects (period)
         for child in self._dashboard_projects_content.get_children():
             self._dashboard_projects_content.remove(child)
-        self._dashboard_projects_subtitle.set_text(rng or label)
+        self._dashboard_projects_subtitle.set_text(
+            f"{rng or label}  ·  by tokens")
         proj = store.project_summary(since=cutoff, account=acc)
         if not proj:
             l = Gtk.Label(label="No activity")
@@ -1254,7 +1265,7 @@ class TrackerWindow(Gtk.Window):
                     self._build_bar_row(p['project'],
                                         p['total_tokens'] or 0,
                                         max_t,
-                                        fmt_cost(p['cost_usd'] or 0)),
+                                        fmt(p['total_tokens'] or 0)),
                     False, False, 0,
                 )
         self._dashboard_projects_content.show_all()
@@ -1262,7 +1273,8 @@ class TrackerWindow(Gtk.Window):
         # Top models (period)
         for child in self._dashboard_models_content.get_children():
             self._dashboard_models_content.remove(child)
-        self._dashboard_models_subtitle.set_text(rng or label)
+        self._dashboard_models_subtitle.set_text(
+            f"{rng or label}  ·  by cost")
         models = store.model_summary(since=cutoff, account=acc)
         if not models:
             l = Gtk.Label(label="No activity")
@@ -1276,7 +1288,7 @@ class TrackerWindow(Gtk.Window):
                     self._build_bar_row(m['model'] or '(unknown)',
                                         m['cost_usd'] or 0,
                                         max_c,
-                                        fmt(m['total_tokens'] or 0)),
+                                        fmt_cost(m['cost_usd'] or 0)),
                     False, False, 0,
                 )
         self._dashboard_models_content.show_all()
@@ -1388,7 +1400,7 @@ class TrackerWindow(Gtk.Window):
         rows = self.app.store.project_summary(since=cutoff, account=acc)
         search = self._projects_search.get_text().lower()
 
-        rng = period_range_text(period) or PERIOD_LABELS.get(period, '')
+        rng = range_text(period) or PERIOD_LABELS.get(period, '')
         total_tokens = sum((r['total_tokens'] or 0) for r in rows)
         total_msgs = sum((r['messages'] or 0) for r in rows)
         total_cost = sum((r['cost_usd'] or 0) for r in rows)
@@ -1401,13 +1413,13 @@ class TrackerWindow(Gtk.Window):
             f'</span>'
         )
 
-        # Pull session rows once, group by project, then attach as children.
-        all_msgs = self.app.store.query(since=cutoff, account=acc)
-        sessions_by_project: Dict[str, Dict[str, list]] = {}
-        for m in all_msgs:
-            proj = m['project'] or 'Unknown'
-            sid = m['session_id'] or '(no-session)'
-            sessions_by_project.setdefault(proj, {}).setdefault(sid, []).append(m)
+        # Session children come pre-aggregated from SQL, already newest
+        # first. Grouping the raw messages here meant reading every row for
+        # the period on the interface thread each refresh.
+        sessions_by_project: Dict[str, list] = {}
+        for srow in self.app.store.session_summary(since=cutoff, account=acc):
+            sessions_by_project.setdefault(
+                srow['project'] or 'Unknown', []).append(srow)
 
         self._projects_store.clear()
         for r in rows:
@@ -1441,26 +1453,19 @@ class TrackerWindow(Gtk.Window):
             # Attach sessions as expandable children — capped to the 50 most
             # recent so a project with hundreds of sessions doesn't bloat the
             # tree.
-            sess_groups = sessions_by_project.get(name) or {}
-            sess_summary = []
-            for sid, msgs in sess_groups.items():
-                msgs.sort(key=lambda x: x['timestamp'])
-                first = datetime.fromisoformat(msgs[0]['timestamp'])
-                last = datetime.fromisoformat(msgs[-1]['timestamp'])
-                inp = sum(m['input_tokens'] or 0 for m in msgs)
-                cc = sum((m['cache_creation_5m'] or 0)
-                         + (m['cache_creation_1h'] or 0) for m in msgs)
-                cr = sum(m['cache_read'] or 0 for m in msgs)
-                out = sum(m['output_tokens'] or 0 for m in msgs)
-                tot = inp + cc + cr + out
-                cost = sum(m['cost_usd'] or 0 for m in msgs)
-                sess_summary.append({
-                    'sid': sid, 'first': first, 'last': last,
-                    'msgs': len(msgs), 'inp': inp, 'cc': cc, 'cr': cr,
-                    'out': out, 'tot': tot, 'cost': cost,
-                })
-            sess_summary.sort(key=lambda s: s['last'], reverse=True)
-            for s in sess_summary[:50]:
+            for srow in (sessions_by_project.get(name) or [])[:50]:
+                s = {
+                    'sid': srow['session_id'],
+                    'first': datetime.fromisoformat(srow['first_used']),
+                    'last': datetime.fromisoformat(srow['last_used']),
+                    'msgs': srow['messages'] or 0,
+                    'inp': srow['input_tokens'] or 0,
+                    'cc': srow['cache_creation'] or 0,
+                    'cr': srow['cache_read'] or 0,
+                    'out': srow['output_tokens'] or 0,
+                    'tot': srow['total_tokens'] or 0,
+                    'cost': srow['cost_usd'] or 0,
+                }
                 self._projects_store.append(parent, [
                     f"  {s['first'].astimezone():%Y-%m-%d %H:%M} · "
                     f"{s['sid'][:8]}",
@@ -1618,7 +1623,7 @@ class TrackerWindow(Gtk.Window):
 
     def _update_breakdowns_totals(self):
         kind = self._breakdowns_kind
-        rng = period_range_text(self._breakdowns_period) or PERIOD_LABELS.get(
+        rng = range_text(self._breakdowns_period) or PERIOD_LABELS.get(
             self._breakdowns_period, '')
         if kind == 'models':
             n = len(self._models_store)
@@ -1889,9 +1894,9 @@ class TrackerWindow(Gtk.Window):
             u5 = normalize_utilization(five.get('utilization', 0))
             u7 = normalize_utilization(seven.get('utilization', 0))
             self._usage_5h.update(u5, "5-Hour Window",
-                                  format_reset_time(five.get('resets_at')))
+                                  fmt_reset_countdown(five.get('resets_at')))
             self._usage_7d.update(u7, "7-Day Window",
-                                  format_reset_time(seven.get('resets_at')))
+                                  fmt_reset_countdown(seven.get('resets_at')))
             # Per-model weekly caps: one bar each, created on first sighting
             # and dropped when the API stops reporting the model.
             model_limits = extract_model_limits(cv.usage_data)
@@ -1906,7 +1911,7 @@ class TrackerWindow(Gtk.Window):
                     self._usage_model_bars[name] = bar
                     self._cloud_usage_box.pack_start(bar, True, True, 0)
                 bar.update(m['fraction'], label,
-                           format_reset_time(m['resets_at']))
+                           fmt_reset_countdown(m['resets_at']))
             for name in list(self._usage_model_bars):
                 if name not in present:
                     bar = self._usage_model_bars.pop(name)
@@ -2489,27 +2494,13 @@ class TrackerWindow(Gtk.Window):
 
 # ─── Tray + App ────────────────────────────────────────────────────────────
 
-def _create_tray_icon(percentage: float, error: bool = False,
-                      label: Optional[str] = None) -> str:
-    if error:
-        color = USAGE_COLORS['unknown']
-        pct_text = label or "!"
-    else:
-        color = get_usage_color(percentage)
-        pct_text = label if label is not None else str(int(percentage * 100))
-    svg = f'''<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
-  <rect width="24" height="24" rx="4" fill="{COLORS['surface']}" stroke="{COLORS['overlay']}" stroke-width="1"/>
-  <circle cx="12" cy="12" r="8" fill="none" stroke="{COLORS['overlay']}" stroke-width="2"/>
-  <circle cx="12" cy="12" r="8" fill="none" stroke="{color}" stroke-width="2"
-    stroke-dasharray="{percentage * 50:.1f} 50" transform="rotate(-90 12 12)"/>
-  <text x="12" y="15" text-anchor="middle" font-family="sans-serif" font-size="7"
-    font-weight="bold" fill="{COLORS['text']}">{pct_text}</text>
-</svg>'''
-    icon_path = Path('/tmp') / APP_ID / 'tray_icon.svg'
-    icon_path.parent.mkdir(exist_ok=True)
-    icon_path.write_text(svg)
-    return str(icon_path)
+def _rate_card_stamp() -> tuple:
+    """(size, mtime) of the user's rate-card override, or () if absent."""
+    try:
+        st = RATE_CARD_FILE.stat()
+    except OSError:
+        return ()
+    return (st.st_size, st.st_mtime)
 
 
 @dataclass
@@ -2563,8 +2554,18 @@ class App:
         if HAS_INDICATOR:
             self._setup_tray()
 
-        # Initial scan to ensure store is up to date even before window opens
-        scan_into_store(self.store, load_rate_card(), accounts=self._accounts)
+        # Initial scan, so the store is current before the window opens.
+        rate_card = load_rate_card()
+        migrated = self.store.needs_reprice()
+        scan_into_store(self.store, rate_card, accounts=self._accounts)
+        if migrated:
+            # This database was written by an earlier version, whose costs came
+            # from a stale rate card and whose tool attribution was
+            # incomplete. The scan above re-read and corrected every log still
+            # on disk; reprice covers rows whose log has since been deleted.
+            n = self.store.reprice_all(rate_card)
+            print(f"[{APP_ID}] upgraded store: repriced {n:,} messages",
+                  file=sys.stderr)
 
         threading.Thread(target=self._local_loop, daemon=True).start()
         threading.Thread(target=self._api_loop, daemon=True).start()
@@ -2637,14 +2638,6 @@ class App:
         self._indicator.set_title(APP_NAME)
         self._indicator.set_label("--", "100%")
         self._set_tray_menu()
-
-    @staticmethod
-    def _bar(pct: float, width: int = 10) -> str:
-        """Unicode block-segment progress bar (renders identically across
-        every desktop because it's plain text)."""
-        pct = max(0.0, min(1.0, pct))
-        filled = int(round(pct * width))
-        return '▰' * filled + '▱' * (width - filled)
 
     def _close_usage_popup(self):
         """Tear down the popup and release its input grab, if any. Safe to
@@ -3020,21 +3013,27 @@ class App:
         if not self._indicator:
             return False
         try:
+            # Filtered to the account whose reset time anchors the window —
+            # otherwise a second account's messages were counted inside the
+            # primary account's session.
+            acc = self._primary_account().label
             rows = self.store.query(
-                since=datetime.now(timezone.utc) - timedelta(hours=24))
-            blocks = compute_blocks(rows)
-            if blocks and blocks[-1].is_active():
-                b = blocks[-1]
-                rem_s = b.remaining().total_seconds()
-                remaining = fmt_duration(rem_s)
-                elapsed_frac = 1.0 - rem_s / (BLOCK_HOURS * 3600.0)
-                bar = self._emoji_bar(elapsed_frac)
+                since=datetime.now(timezone.utc) - SESSION_LOOKBACK,
+                account=acc)
+            block = active_session(rows,
+                                   self._account_states[acc].last_resets_5h)
+            if block is not None:
+                elapsed_frac = (block.elapsed().total_seconds()
+                                / BLOCK_DURATION.total_seconds())
+                mark = '' if block.anchored else ' ~'
                 self._tray_items['block'].set_label(
-                    f"⏳  {bar}  {remaining} left")
+                    f"⏳  {self._emoji_bar(elapsed_frac)}  "
+                    f"{fmt_duration(block.remaining().total_seconds())}"
+                    f" left{mark}")
                 self._tray_items['block_tokens'].set_label(
-                    f"🪙  {fmt(b.total_tokens)} tokens")
+                    f"🪙  {fmt(block.total_tokens)} tokens")
                 self._tray_items['block_cost'].set_label(
-                    f"💸  {fmt_cost(b.cost_usd)} spent")
+                    f"💸  {fmt_cost(block.cost_usd)} spent")
             else:
                 self._tray_items['block'].set_label(
                     f"⏳  {self._emoji_bar(None)}  idle")
@@ -3044,10 +3043,32 @@ class App:
             print(f"[{APP_ID}] tray block update: {e}", file=sys.stderr)
         return False
 
+    def _reprice_after_card_change(self, rc):
+        """Rewrite stored costs from an edited rate card, then redraw."""
+        try:
+            n = self.store.reprice_all(rc)
+            print(f"[{APP_ID}] rate card changed: repriced {n:,} messages",
+                  file=sys.stderr)
+        except Exception as e:
+            print(f"[{APP_ID}] reprice: {e}", file=sys.stderr)
+        if self.window and self._window_visible:
+            self.window.refresh_view(True)
+        return False
+
     def _local_loop(self):
         rc = load_rate_card()
+        rc_stamp = _rate_card_stamp()
         while self._running:
             try:
+                # Pick up an edited rate_card.json without a restart. The card
+                # was read once at thread start, so a corrected price sat
+                # unused until the app was relaunched.
+                stamp = _rate_card_stamp()
+                if stamp != rc_stamp:
+                    rc_stamp = stamp
+                    rc = load_rate_card()
+                    self.store.forget_scans()
+                    GLib.idle_add(self._reprice_after_card_change, rc)
                 counts = scan_into_store(self.store, rc,
                                          accounts=self._accounts)
                 imported = sum(counts.values())
@@ -3221,6 +3242,12 @@ class App:
             # the dashboard's cloud view stops showing stale percentages
             # (the tray still preserves last-known via st.last_pctX).
             st.usage_data = None
+            # If the window we last had numbers for has since reset, that
+            # last-known percentage belongs to a closed window. Flag it so
+            # the tray shows "?" rather than a figure that reads as current.
+            reset = parse_resets_at(st.last_resets_5h)
+            if reset is not None and reset <= datetime.now(timezone.utc):
+                st.awaiting_new_window = True
         self._sync_primary()
         self._rebuild_tray()
         if self.window and self.window._current_view == 'dashboard':

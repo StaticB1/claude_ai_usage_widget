@@ -45,14 +45,23 @@ def test_sorted_highest_first():
         ["Opus", "Haiku", "Sonnet"]
 
 
-def test_percent_normalized_and_clamped():
+def test_overage_is_reported_not_hidden():
+    """Past the limit must read as past the limit, not as exactly 100%."""
     data = {"limits": [
         {"kind": "weekly_scoped", "percent": 250,
          "scope": {"model": {"display_name": "Runaway"}}},
     ]}
     out = extract_model_limits(data)
-    assert out[0]["fraction"] == 1.0
-    assert out[0]["pct"] == 100
+    assert out[0]["fraction"] == 2.5
+    assert out[0]["pct"] == 250
+
+
+def test_garbage_percent_is_capped():
+    data = {"limits": [
+        {"kind": "weekly_scoped", "percent": 10 ** 9,
+         "scope": {"model": {"display_name": "Broken"}}},
+    ]}
+    assert extract_model_limits(data)[0]["pct"] == 999
 
 
 def test_missing_or_empty_limits():
