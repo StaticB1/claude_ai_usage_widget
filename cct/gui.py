@@ -32,7 +32,7 @@ try:
 except (ValueError, ImportError):
     HAS_NOTIFY = False
 
-from gi.repository import Gtk, GLib, Gdk, GdkPixbuf, Pango  # noqa: E402
+from gi.repository import Gtk, GLib, GObject, Gdk, GdkPixbuf, Pango  # noqa: E402
 
 from .blocks import (BLOCK_DURATION, SESSION_LOOKBACK, active_session,
                      forecast, parse_resets_at)
@@ -44,9 +44,11 @@ from .cloud import (AuthError, CloudApiError, RateLimitError,
                     save_token, subscription_summary)
 from .config import (APP_ID, APP_NAME, APP_VERSION, LOCAL_SCAN_INTERVAL,
                      PERIOD_LABELS, RATE_CARD_FILE, DEFAULT_ACCOUNT_LABEL,
+                     BEDROCK_ACCOUNT_LABEL,
                      Account, load_accounts, load_settings, save_accounts,
                      save_settings, Settings)
 from .notifications import NotificationManager, WindowSnapshot
+from . import hop as claudehop
 from .format import (fmt, fmt_cost, fmt_duration, fmt_full,
                      fmt_reset_absolute, fmt_reset_countdown, rel_time)
 from .periods import cutoff_or_none, range_text
@@ -874,7 +876,8 @@ class TrackerWindow(Gtk.Window):
         self._account_combo.connect('changed', self._on_account_filter_changed)
         self._account_combo.set_no_show_all(True)
         header.pack_end(self._account_combo, False, False, 0)
-        self._account_combo.set_visible(len(self.app._accounts) > 1)
+        self._account_combo.set_visible(
+            len(self.app._accounts) > 1 or self._has_bedrock)
 
         refresh_btn = Gtk.Button()
         refresh_btn.set_image(Gtk.Image.new_from_icon_name(
@@ -883,8 +886,103 @@ class TrackerWindow(Gtk.Window):
         refresh_btn.get_style_context().add_class('btn-secondary')
         refresh_btn.connect('clicked', lambda _: self.refresh_data())
         header.pack_end(refresh_btn, False, False, 0)
+        # Which claudehop account this is (hidden when claudehop is not in use).
+        self._hop_badge = Gtk.Label()
+        self._hop_badge.set_no_show_all(True)
+        header.pack_end(self._hop_badge, False, False, 8)
+        self._update_hop_badge()
         self._header_box = header  # so we can re-show the combo on reload
         return header
+
+    def _update_hop_badge(self):
+        """Header badge: which claudehop account the widget is showing, or the
+        provider new sessions run through. Hidden when claudehop is not in use."""
+        try:
+            hs = claudehop.load_state(self.app._primary_state().token)
+        except Exception:
+            hs = None
+        if hs is None or not (hs.active or hs.provider):
+            self._hop_badge.set_visible(False)
+            return
+        acct = hs.profile(hs.active)
+        if hs.provider:
+            head = hs.provider.capitalize()
+            tail = f" · {hs.active} login idle" if hs.active else ""
+            tip = (f"New sessions run through {hs.provider_command}. "
+                   f"The {hs.active or 'saved'} login is not in use.")
+        else:
+            head = hs.active
+            tail = f" · {acct.plan}" if acct and acct.plan else ""
+            tip = (acct.email if acct and acct.email else hs.active)
+        self._hop_badge.set_markup(
+            f'<span foreground="{COLORS["green"]}">●</span> '
+            f'<b>{html.escape(head)}</b>{html.escape(tail)}')
+        self._hop_badge.set_tooltip_text(tip)
+        self._hop_badge.set_visible(True)
+
+    def _update_hop_card(self):
+        """The Accounts card: every claudehop account, which one is live, and
+        the last plan usage seen for each; plus Bedrock when it is registered."""
+        for child in self._hop_card.get_children():
+            self._hop_card.remove(child)
+        live = self.app._primary_state()
+        try:
+            hs = claudehop.load_state(live.token)
+        except Exception:
+            hs = None
+        if hs is None or not (hs.profiles or hs.providers):
+            self._hop_card.set_visible(False)
+            return
+        seen = self.app.store.hop_usage()
+        now = datetime.now(timezone.utc)
+        live_ok = live.cloud_state not in (
+            'auth_error', 'network_error', 'rate_limited', 'no_token')
+
+        def line(markup=None, text=None, sub=False, title=False):
+            lbl = Gtk.Label()
+            if markup is not None:
+                lbl.set_markup(markup)
+            else:
+                lbl.set_text(text or '')
+            if sub:
+                lbl.get_style_context().add_class('subtitle')
+            if title:
+                lbl.get_style_context().add_class('card-title')
+            lbl.set_halign(Gtk.Align.START)
+            lbl.set_xalign(0)
+            lbl.set_line_wrap(True)
+            lbl.show()
+            self._hop_card.pack_start(lbl, False, False, 0)
+
+        line(text='Accounts', title=True)
+        line(text="From claudehop. The live account updates every poll; the others "
+                  "show the last reading taken while they were active.", sub=True)
+        for p in sorted(hs.profiles, key=lambda q: (q.name != hs.active, q.name)):
+            usage, tag = claudehop.usage_text(
+                p.name, hs, live.last_pct5, live.last_pct7, live_ok,
+                seen.get(p.name), now)
+            on = p.name == hs.active and not hs.provider
+            dot = COLORS['green'] if on else COLORS['muted']
+            who = html.escape(p.email or '') + (
+                f" · {html.escape(p.plan)}" if p.plan else '')
+            line(markup=f'<span foreground="{dot}">●</span>  <b>{html.escape(p.name)}</b>'
+                        f'  <span foreground="{COLORS["muted"]}">{who}</span>')
+            extra = (" · login idle while a provider is on"
+                     if (p.name == hs.active and hs.provider) else "")
+            line(text=f"      {usage}" + (f" · {tag}" if tag else "") + extra, sub=True)
+        for prov in hs.providers:
+            on = prov == hs.provider
+            dot = COLORS['green'] if on else COLORS['muted']
+            line(markup=f'<span foreground="{dot}">●</span>  <b>{html.escape(prov.capitalize())}</b>'
+                        f'  <span foreground="{COLORS["muted"]}">{"on" if on else "off"}</span>')
+            if prov == BEDROCK_ACCOUNT_LABEL:
+                t = self.app.store.totals(since=now - timedelta(days=7),
+                                          account=BEDROCK_ACCOUNT_LABEL)
+                n = t.get('messages', 0) or 0
+                detail = (f"{n:,} messages · {fmt_cost(t.get('cost_usd', 0) or 0)} "
+                          f"(list-price estimate)" if n else "no usage yet")
+                line(text=f"      last 7 days: {detail}", sub=True)
+        self._hop_card.set_visible(True)
 
     def _populate_account_combo(self):
         """(Re)build the account-filter combobox items from current accounts.
@@ -901,6 +999,11 @@ class TrackerWindow(Gtk.Window):
         self._account_combo.append('__all__', 'All accounts')
         for a in self.app._accounts:
             self._account_combo.append(a.label, a.label)
+        # Bedrock is not a configured account, so it is offered only once the
+        # store holds Bedrock turns.
+        self._has_bedrock = self.app.store.has_account_rows(BEDROCK_ACCOUNT_LABEL)
+        if self._has_bedrock:
+            self._account_combo.append(BEDROCK_ACCOUNT_LABEL, 'Bedrock')
         active = self._account_filter or '__all__'
         if not self._account_combo.set_active_id(active):
             self._account_combo.set_active_id('__all__')
@@ -911,7 +1014,8 @@ class TrackerWindow(Gtk.Window):
         except TypeError:
             pass
         # Show/hide based on current account count.
-        self._account_combo.set_visible(len(self.app._accounts) > 1)
+        self._account_combo.set_visible(
+            len(self.app._accounts) > 1 or self._has_bedrock)
 
     def _on_account_filter_changed(self, combo: Gtk.ComboBoxText):
         sel = combo.get_active_id()
@@ -1015,6 +1119,13 @@ class TrackerWindow(Gtk.Window):
         # API reports them (keyed by display name).
         self._usage_model_bars: Dict[str, UsageBar] = {}
         c.pack_start(self._cloud_usage_box, False, False, 0)
+
+        # ── Accounts (from claudehop) ───────────────────────────────────────
+        self._hop_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._hop_card.get_style_context().add_class('card')
+        self._hop_card.set_margin_top(12)
+        self._hop_card.set_no_show_all(True)
+        c.pack_start(self._hop_card, False, False, 0)
 
         # Summary cards
         cards = Gtk.FlowBox()
@@ -1356,7 +1467,9 @@ class TrackerWindow(Gtk.Window):
         # 0-9; trailing columns are numeric counterparts used for sorting.
         self._projects_store = Gtk.TreeStore(
             str, str, str, str, str, str, str, str, str, str,   # 0-9 display
-            float, int, int, int, int, int, int, int, int, float,  # 10-19 sort
+            # Token totals pass 2**31 (14 billion for one project), so the counts
+            # are 64-bit; a 32-bit column raised OverflowError and blanked the tab.
+            float, *([GObject.TYPE_INT64] * 8), float,  # 10-19 sort
         )
         DISPLAY = 10
         treeview = Gtk.TreeView(model=self._projects_store)
@@ -1834,6 +1947,15 @@ class TrackerWindow(Gtk.Window):
         for child in self._cloud_status_card.get_children():
             self._cloud_status_card.remove(child)
 
+        self._update_hop_card()
+        if self._account_filter == BEDROCK_ACCOUNT_LABEL:
+            self._cloud_card_msg(
+                "Bedrock: billed per token",
+                "No plan windows apply. Cost here is an estimate at Anthropic "
+                "list price; AWS Cost Explorer has the real charge.")
+            self._cloud_status_card.show_all()
+            self._cloud_usage_box.hide()
+            return
         cv, state = self._cloud_view()
         have = bool(cv.usage_data)
         # When showing 'All accounts' with more than one configured, the bars
@@ -2430,6 +2552,10 @@ class TrackerWindow(Gtk.Window):
         counts = scan_into_store(self.app.store, rc,
                                  accounts=self.app._accounts)
         new = sum(counts.values())
+        if (self.app.store.has_account_rows(BEDROCK_ACCOUNT_LABEL)
+                != getattr(self, '_has_bedrock', False)):
+            self._populate_account_combo()
+        self._update_hop_badge()
         self._last_update_label.set_text(
             f"Updated {datetime.now().strftime('%H:%M:%S')}"
             + (f" · {new} new" if new else ""))
@@ -2816,6 +2942,7 @@ class App:
         # ── LIMITS (primary account) ──────────────────────────────────────
         lim_hdr = Gtk.MenuItem(label='Limits')
         lim_hdr.set_sensitive(False); menu.append(lim_hdr)
+        self._tray_limits_hdr = lim_hdr
         for k in ('5h', '7d'):
             it = self._limit_menu_item()
             menu.append(it)
@@ -2829,6 +2956,26 @@ class App:
             it = self._limit_menu_item()
             menu.append(it)
             self._tray_items[f'model:{name}'] = it
+
+        # ── HOP accounts (from claudehop) ─────────────────────────────────
+        self._tray_hop_items = {}
+        self._tray_hop_names = ()
+        try:
+            hs = claudehop.load_state(self._primary_state().token)
+            self._tray_hop_names = self._hop_names(hs)
+            if hs and (len(hs.profiles) > 1 or hs.providers):
+                hop_hdr = Gtk.MenuItem(label='Hop accounts')
+                hop_hdr.set_sensitive(False); menu.append(hop_hdr)
+                for p in hs.profiles:
+                    it = Gtk.MenuItem(label=f"   {p.name}: —")
+                    it.set_sensitive(False); menu.append(it)
+                    self._tray_hop_items[p.name] = it
+                for prov in hs.providers:
+                    it = Gtk.MenuItem(label=f"   {prov.capitalize()}: —")
+                    it.set_sensitive(False); menu.append(it)
+                    self._tray_hop_items[f'provider:{prov}'] = it
+        except Exception as e:
+            print(f"tracker: hop section skipped: {e}", file=sys.stderr)
 
         # ── ACCOUNTS section (only when more than one configured) ─────────
         if len(self._accounts) > 1:
@@ -2921,6 +3068,10 @@ class App:
         # ── LIMITS section (primary account drives this) ──────────────────
         primary = self._primary_state()
         self._update_tray_limits(primary)
+        try:
+            self._update_tray_hop(primary)
+        except Exception as e:
+            print(f"tracker: hop tray update failed: {e}", file=sys.stderr)
 
         # ── ACCOUNTS section ──────────────────────────────────────────────
         for acc in self._accounts:
@@ -2980,6 +3131,53 @@ class App:
             marker = ' ●' if m['is_active'] else ''
             _set(f"model:{m['model']}",
                  f"   {m['model']}  {bar}  {m['pct']}%{marker} · ↻ {rr}")
+
+    @staticmethod
+    def _hop_names(hs) -> tuple:
+        if not hs:
+            return ()
+        return (tuple(p.name for p in hs.profiles)
+                + tuple(f'provider:{n}' for n in hs.providers))
+
+    def _update_tray_hop(self, primary: 'AccountState'):
+        """Name the account in the tray and keep the hop lines current."""
+        try:
+            hs = claudehop.load_state(primary.token)
+        except Exception:
+            return
+        if self._hop_names(hs) != getattr(self, '_tray_hop_names', ()):
+            self._set_tray_menu()          # accounts added or removed: rebuild
+        hdr = getattr(self, '_tray_limits_hdr', None)
+        if hdr is not None:
+            if hs and hs.active:
+                hdr.set_label(f"Limits · {hs.active}"
+                              + (" (login idle)" if hs.provider else ""))
+            else:
+                hdr.set_label('Limits')
+        if hs is None:
+            return
+        seen = self.store.hop_usage()
+        now = datetime.now(timezone.utc)
+        live_ok = primary.cloud_state not in (
+            'auth_error', 'network_error', 'rate_limited', 'no_token')
+        items = getattr(self, '_tray_hop_items', {})
+        for p in hs.profiles:
+            it = items.get(p.name)
+            if it is None:
+                continue
+            usage, tag = claudehop.usage_text(
+                p.name, hs, primary.last_pct5, primary.last_pct7, live_ok,
+                seen.get(p.name), now)
+            on = p.name == hs.active and not hs.provider
+            short = usage.replace('5-hour', '5h').replace('7-day', '7d')
+            it.set_label(f"   {'●' if on else '○'} {p.name}: {short}"
+                         + (f" · {tag}" if tag else ""))
+        for prov in hs.providers:
+            it = items.get(f'provider:{prov}')
+            if it is not None:
+                on = prov == hs.provider
+                it.set_label(f"   {'●' if on else '○'} {prov.capitalize()}: "
+                             f"{'on' if on else 'off'}")
 
     def _tray_account_line(self, st: AccountState) -> str:
         if st.cloud_state in ('auth_error', 'network_error', 'rate_limited',
@@ -3139,9 +3337,16 @@ class App:
                                   acc.label)
                     continue
                 GLib.idle_add(self._set_cloud, 'loading', "", None, acc.label)
+                # Who claudehop says is live, read before and after the fetch so a
+                # hop in the middle files the reading under neither account.
+                who = (claudehop.active_name(state.token)
+                       if acc.label == primary_label else None)
                 try:
                     data = fetch_cloud_usage(state.token)
-                    GLib.idle_add(self._on_cloud_data, data, acc.label)
+                    if who and claudehop.active_name(
+                            load_token(acc.credentials_file)) != who:
+                        who = None
+                    GLib.idle_add(self._on_cloud_data, data, acc.label, who)
                 except RateLimitError as e:
                     wait = max(e.retry_after or 0, 120)
                     retry_at = datetime.now(timezone.utc) + timedelta(
@@ -3179,7 +3384,8 @@ class App:
             self._api_wake.wait(timeout=sleep_for)
 
     def _on_cloud_data(self, data: Optional[dict],
-                       account_label: str = DEFAULT_ACCOUNT_LABEL):
+                       account_label: str = DEFAULT_ACCOUNT_LABEL,
+                       hop_name: Optional[str] = None):
         st = self._account_states.get(account_label)
         if st is None:
             return False
@@ -3203,6 +3409,11 @@ class App:
             st.last_pct5, st.last_pct7 = pct5, pct7
             st.last_resets_5h, st.last_resets_7d = r5, r7
             st.last_model_limits = extract_model_limits(data)
+            if hop_name and account_label == self._primary_account().label:
+                try:
+                    self.store.save_hop_usage(hop_name, pct5, pct7, r5, r7)
+                except Exception as e:
+                    print(f"tracker: could not save hop usage: {e}", file=sys.stderr)
 
             if account_label == self._primary_account().label:
                 if HAS_NOTIFY:
@@ -3221,6 +3432,7 @@ class App:
         self._rebuild_tray()
         self._update_tray_block()
         if self.window:
+            self.window._update_hop_badge()
             v = self.window._current_view
             if v == 'dashboard':
                 self.window._update_dashboard()

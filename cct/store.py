@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional
 
-from .config import DB_FILE, DEFAULT_ACCOUNT_LABEL
+from .config import BEDROCK_ACCOUNT_LABEL, DB_FILE, DEFAULT_ACCOUNT_LABEL
 from .parser import Turn
 from .pricing import RateCard
 
@@ -139,6 +139,9 @@ class Store:
     def _init(self):
         with self._conn() as c:
             c.executescript(SCHEMA_TABLES)
+            c.execute("""CREATE TABLE IF NOT EXISTS hop_usage (
+                name TEXT PRIMARY KEY, pct5 INTEGER, pct7 INTEGER,
+                resets_5h TEXT, resets_7d TEXT, seen_at TEXT NOT NULL)""")
             bcols = {r['name'] for r in c.execute(
                 "PRAGMA table_info(budgets)").fetchall()}
             if 'limit_pct' not in bcols:
@@ -151,6 +154,11 @@ class Store:
                     "NOT NULL DEFAULT 'default'"
                 )
             c.executescript(SCHEMA_INDEXES)
+            # Bedrock turns live under their own account (see Turn.is_bedrock).
+            # Idempotent, so it also repairs rows imported before this existed.
+            c.execute("UPDATE messages SET account=? "
+                      "WHERE substr(msg_key, 1, 9)='msg_bdrk_' AND account<>?",
+                      (BEDROCK_ACCOUNT_LABEL, BEDROCK_ACCOUNT_LABEL))
             row = c.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
@@ -196,7 +204,7 @@ class Store:
             rows.append((
                 t.dedup_key,
                 t.timestamp.astimezone(timezone.utc).isoformat(),
-                account,
+                BEDROCK_ACCOUNT_LABEL if t.is_bedrock else account,
                 t.project,
                 t.session_id,
                 t.model,
@@ -238,6 +246,29 @@ class Store:
             return len(rows)
 
     # ── Incremental-scan bookkeeping ─────────────────────────────────────────
+
+    def save_hop_usage(self, name: str, pct5: Optional[int], pct7: Optional[int],
+                       resets_5h: Optional[str], resets_7d: Optional[str]) -> None:
+        """Remember the plan usage last seen while claudehop account ``name`` was
+        live, so it can still be shown after you hop to another account."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO hop_usage(name, pct5, pct7, resets_5h, resets_7d, seen_at) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
+                "pct5=excluded.pct5, pct7=excluded.pct7, resets_5h=excluded.resets_5h, "
+                "resets_7d=excluded.resets_7d, seen_at=excluded.seen_at",
+                (name, pct5, pct7, resets_5h, resets_7d,
+                 datetime.now(timezone.utc).isoformat()))
+
+    def hop_usage(self) -> Dict[str, dict]:
+        with self._conn() as c:
+            return {r['name']: dict(r)
+                    for r in c.execute("SELECT * FROM hop_usage").fetchall()}
+
+    def has_account_rows(self, account: str) -> bool:
+        with self._conn() as c:
+            return c.execute("SELECT 1 FROM messages WHERE account=? LIMIT 1",
+                             (account,)).fetchone() is not None
 
     def scanned_file_map(self, account: str) -> Dict[str, tuple]:
         """Return ``{path: (size, mtime)}`` for files already imported for

@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Bedrock usage is tracked as its own account.** Claude Code on Amazon Bedrock
+  logs the same model names as an Anthropic account, so the only tell is the
+  response id, which Bedrock prefixes `msg_bdrk_`. Those turns are filed under the
+  account `bedrock` at ingest and existing rows are relabelled on start, so they
+  never count toward a Claude plan window. The dashboard offers "Bedrock" in the
+  account selector once such turns exist, and `--account bedrock` works on the
+  command-line reports. Cost is Anthropic list price, an estimate.
+- **The widget says which claudehop account it is showing.** A new read-only module
+  (`cct/hop.py`) reads claudehop's saved accounts. The dashboard header names the
+  live account (or the provider new sessions run through), a new Accounts card lists
+  every account with its last 5-hour and 7-day reading, the tray names the account
+  and lists them, and `cct accounts` prints the same view. An account you have hopped
+  away from is not polled, because that would mean renewing its token; it shows the
+  last reading taken while it was active, with its age.
+
+### Fixed
+- **The Projects tab raised OverflowError for a project over 2.1 billion tokens.**
+  The numeric sort columns were 32-bit; they are now 64-bit.
+
 ## [2.1.0] - 2026-08-20
 
 Audit release. The 5-hour session window now matches what `claude /usage`

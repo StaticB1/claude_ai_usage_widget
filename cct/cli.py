@@ -11,7 +11,8 @@ from .budgets import evaluate_budgets
 from .cloud import (AuthError, CloudApiError, RateLimitError,
                     fetch_cloud_usage, load_token, normalize_utilization)
 from .config import (APP_NAME, APP_VERSION, Account,
-                     find_account, load_accounts)
+                     find_account, load_accounts, BEDROCK_ACCOUNT_LABEL)
+from .hop import load_state as load_hop_state, usage_text as hop_usage_text
 from .format import fmt, fmt_cost, fmt_duration
 from .parser import iter_project_dirs, parse_jsonl
 from .periods import UnknownPeriod, cutoff, range_text
@@ -256,6 +257,22 @@ def cmd_accounts(args):
             'cost_usd': s.get('cost_usd', 0.0),
             'last_used': s.get('last_used'),
         })
+    # Bedrock turns are stored under their own label but it is not a configured
+    # account, so show it here as a row of its own once there is any usage.
+    if (BEDROCK_ACCOUNT_LABEL in summary
+            and BEDROCK_ACCOUNT_LABEL not in {a.label for a in accounts}):
+        s = summary[BEDROCK_ACCOUNT_LABEL]
+        out.append({
+            'label': BEDROCK_ACCOUNT_LABEL,
+            'claude_dir': 'Amazon Bedrock (list-price estimate)',
+            'disable_polling': True,
+            'hide_from_tray': True,
+            'messages': s.get('messages', 0),
+            'projects': s.get('projects', 0),
+            'tokens': s.get('total_tokens', 0),
+            'cost_usd': s.get('cost_usd', 0.0),
+            'last_used': s.get('last_used'),
+        })
     if args.json:
         print(json.dumps(out, indent=2, default=str))
         return
@@ -267,6 +284,19 @@ def cmd_accounts(args):
         print(f"{a['label'][:16]:<16} {a['claude_dir'][:32]:<32} "
               f"{a['messages']:>6} {fmt(a['tokens'] or 0):>10} "
               f"{fmt_cost(a['cost_usd'] or 0):>10}")
+    hs = load_hop_state(load_token())
+    if hs:
+        seen = store.hop_usage()
+        now = datetime.now(timezone.utc)
+        print()
+        print(f"Hop: live login is {hs.active or 'unknown'}"
+              + (f"; new sessions run through {hs.provider}" if hs.provider else ""))
+        for p in sorted(hs.profiles, key=lambda q: (q.name != hs.active, q.name)):
+            usage, tag = hop_usage_text(p.name, hs, None, None, False,
+                                        seen.get(p.name), now)
+            mark = '*' if p.name == hs.active and not hs.provider else ' '
+            print(f" {mark} {p.name:<12} {(p.email or ''):<26} {(p.plan or ''):<6} "
+                  f"{usage}" + (f" · {tag}" if tag else ""))
 
 
 def cmd_block(args):

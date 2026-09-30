@@ -27,6 +27,13 @@ class Turn:
     tool_uses: Dict[str, int] = field(default_factory=dict)
 
     @property
+    def is_bedrock(self) -> bool:
+        """Claude Code on Amazon Bedrock logs ordinary model names such as
+        ``claude-sonnet-4-6``; the only tell is the response id, which Bedrock
+        prefixes ``msg_bdrk_`` where Anthropic uses ``msg_01``."""
+        return (self.msg_id or '').startswith('msg_bdrk_')
+
+    @property
     def cache_creation(self) -> int:
         return self.cache_creation_5m + self.cache_creation_1h
 

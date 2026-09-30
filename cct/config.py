@@ -30,6 +30,9 @@ DEFAULT_BURN_RATE = {'enabled': False, 'multiplier': 1.5}
 BURN_RATE_GRACE_HOURS = 8
 
 DEFAULT_ACCOUNT_LABEL = 'default'
+# Turns Claude Code made through Amazon Bedrock are kept under this label so they
+# never count toward a Claude plan window. See Turn.is_bedrock.
+BEDROCK_ACCOUNT_LABEL = 'bedrock'
 
 PERIOD_LABELS = {
     'all':   'All Time',
