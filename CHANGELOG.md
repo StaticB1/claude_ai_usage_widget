@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.3.0] - 2026-10-13
+
+A redesign of the dashboard, the tray icon and the usage panel.
+
+### Changed
+- **A new look.** A warm cream canvas with near-black ink, a warm charcoal dark
+  theme, one coral accent for the interface, a serif for page titles and a sans
+  for everything you read or compare. Panels are a light core inside a cream
+  shell. The app ships Geist, Geist Mono and Instrument Serif (SIL Open Font
+  License) and registers them at start-up, so it no longer depends on the fonts
+  a distribution happens to have.
+- **Usage is coloured by state, not by brand.** Teal while there is room, amber
+  past the warning threshold and red past the critical one, following the
+  thresholds in Settings. The three colours were checked for colour-blind
+  separation and contrast against both themes, and each always sits next to
+  its number.
+- **The dashboard is rebuilt.** Rings for the 5-hour and 7-day windows, with a
+  third column for any separate weekly cap on one model; the current session
+  with time left, burn rate and when the limit falls at this pace; one strip of
+  totals; a 30-day chart of tokens or cost per day with the day's figures on
+  hover; a tile per claudehop account with 5-hour and weekly meters; and the top
+  projects and models as bars. Connection problems (rate limited, token
+  rejected, offline, no token) show in the plan panel with a button that fixes
+  or retries them.
+- **The tray icon is a gauge.** It is drawn as a ring that fills with the
+  5-hour window in the state colour, breaks when the connection fails, and
+  shows a dot before the first reading.
+- **The usage panel is rebuilt** with both rings, the current session, the
+  account with the most room, and buttons to refresh or open the dashboard. It
+  opens under the pointer and stays on screen.
+- **Projects, Breakdowns and Budgets** put their tables in panels with
+  right-aligned figures. Breakdowns shows each model's share of the cost (or
+  each tool's share of the calls) above the table. Budgets lists each budget
+  with a meter and keeps the form beside it, with errors shown in the form.
+- A sidebar gauge shows the live account's 5-hour window on every page and
+  opens the usage panel.
+- Keyboard focus is drawn as an outline only when the keyboard moved it.
+
+### Fixed
+- **A Team seat on a Max rate tier was labelled "Max 5x plan".** The seat type
+  is now checked first, so it reads "Team plan".
+
 ## [2.2.0] - 2026-10-13
 
 Brings the widget up to date with claudehop 1.6 to 1.9, and fixes the weekly

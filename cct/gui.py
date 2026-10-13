@@ -41,7 +41,8 @@ from .cli import scan_into_store
 from .cloud import (AuthError, CloudApiError, RateLimitError,
                     extract_model_limits, fetch_cloud_usage,
                     load_subscription_info, load_token, normalize_utilization,
-                    save_token, subscription_summary, weekly_window)
+                    save_token, subscription_summary, utilization_pct,
+                    weekly_window)
 from .config import (APP_ID, APP_NAME, APP_VERSION, LOCAL_SCAN_INTERVAL,
                      PERIOD_LABELS, RATE_CARD_FILE, DEFAULT_ACCOUNT_LABEL,
                      BEDROCK_ACCOUNT_LABEL,
@@ -49,6 +50,7 @@ from .config import (APP_ID, APP_NAME, APP_VERSION, LOCAL_SCAN_INTERVAL,
                      save_settings, Settings)
 from .notifications import NotificationManager, WindowSnapshot
 from . import hop as claudehop
+from . import ui
 from .format import (fmt, fmt_cost, fmt_duration, fmt_full,
                      fmt_reset_absolute, fmt_reset_countdown, rel_time)
 from .periods import cutoff_or_none, range_text
@@ -58,35 +60,13 @@ from .store import HOP_PREFIX, Store
 
 
 # ─── Theme ─────────────────────────────────────────────────────────────────
-# Light theme keyed off the brand logo: warm orange + ink-black on off-white.
-COLORS_LIGHT = {
-    'bg':      '#FAFAF7',  # paper / app background
-    'surface': '#FFFFFF',  # cards, sidebar, header
-    'overlay': '#ECECE8',  # hover, dividers, subtle fills
-    'text':    '#15151A',  # ink — primary text
-    'subtext': '#4A4A52',  # secondary text
-    'muted':   '#8A8A93',  # tertiary / labels
-    'accent':  '#F5821F',  # brand orange
-    'blue':    '#2563EB',
-    'green':   '#16A34A',
-    'yellow':  '#CA8A04',
-    'red':     '#DC2626',
-    'orange':  '#EA580C',
-}
-COLORS_DARK = {
-    'bg':      '#1E1E22',  # dark app background
-    'surface': '#26262B',  # cards, sidebar, header
-    'overlay': '#333339',  # hover, dividers, subtle fills
-    'text':    '#EDEDEF',  # primary text
-    'subtext': '#B8B8C0',  # secondary text
-    'muted':   '#84848E',  # tertiary / labels
-    'accent':  '#F5821F',  # brand orange
-    'blue':    '#60A5FA',
-    'green':   '#4ADE80',
-    'yellow':  '#FACC15',
-    'red':     '#F87171',
-    'orange':  '#FB923C',
-}
+# The palettes and drawn components live in ui.py. COLORS is the same dict
+# object as ui.P, so a theme switch updates both at once.
+COLORS_LIGHT = ui.LIGHT
+COLORS_DARK = ui.DARK
+CACHE_DIR = Path.home() / '.cache' / APP_ID
+
+
 def _gnome_interface_settings():
     """Return a Gio.Settings for org.gnome.desktop.interface, or None if
     the schema (or the color-scheme key) isn't installed — e.g. non-GNOME
@@ -121,16 +101,30 @@ def _resolve_palette(pref: str) -> dict:
 
 
 from .config import load_settings as _load_settings_for_theme
-# Mutable palette dict: updated in place on theme switch so inline
-# color references pick up the new values on the next redraw.
-COLORS = dict(_resolve_palette(_load_settings_for_theme().theme))
-USAGE_COLORS = {
-    'low':      '#16A34A',
-    'medium':   '#CA8A04',
-    'high':     '#EA580C',
-    'critical': '#DC2626',
-    'unknown':  '#8A8A93',
-}
+COLORS = ui.P
+COLORS.clear()
+COLORS.update(_resolve_palette(_load_settings_for_theme().theme))
+
+
+class _UsageColors(dict):
+    """The old severity names, mapped onto the validated usage states."""
+    _MAP = {'low': 'ok', 'medium': 'warn', 'high': 'warn',
+            'critical': 'danger', 'unknown': 'faint'}
+
+    def __getitem__(self, key):
+        return COLORS[self._MAP[key]]
+
+
+USAGE_COLORS = _UsageColors()
+
+
+def _asset_dirs() -> List[Path]:
+    root = Path(__file__).resolve().parent.parent
+    return [root / 'assets', Path.home() / '.local' / 'share' / APP_ID / 'assets']
+
+
+# Bundled fonts (OFL) must be known to fontconfig before any widget exists.
+ui.register_fonts(_asset_dirs())
 
 
 def _icon_path(size: int = 256) -> Optional[Path]:
@@ -156,582 +150,317 @@ def _icon_path(size: int = 256) -> Optional[Path]:
 
 
 def get_usage_color(pct: float) -> str:
-    if pct < 0.5:
-        return USAGE_COLORS['low']
-    if pct < 0.75:
-        return USAGE_COLORS['medium']
-    if pct < 0.9:
-        return USAGE_COLORS['high']
-    return USAGE_COLORS['critical']
+    """Colour for a 0..1 utilization: teal, amber past the warning threshold,
+    red past the critical one."""
+    return ui.level_color(pct * 100.0)
+
+
+def _ease_css() -> str:
+    return "cubic-bezier(0.32, 0.72, 0, 1)"
 
 
 def _make_css() -> str:
+    C = COLORS
+    grain = ui.grain_png(CACHE_DIR)
+    grain_css = (f'background-image: url("file://{grain}"); '
+                 'background-repeat: repeat;') if grain else ''
+    ez = _ease_css()
+    t = (f"transition: background-color 220ms {ez}, color 220ms {ez}, "
+         f"box-shadow 260ms {ez}, border-color 220ms {ez};")
     return f"""
-window {{
-    background-color: {COLORS['bg']}; color: {COLORS['text']};
-    font-family: "Inter", "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+/* ── Base ───────────────────────────────────────────────────────────── */
+window, .content-area {{
+    background-color: {C['bg']}; color: {C['text']};
+    font-family: "{ui.SANS}", "Cantarell", sans-serif; font-size: 13px;
 }}
+window.background {{ {grain_css} }}
+label {{ color: {C['text']}; }}
+.subtitle {{ font-size: 12.5px; color: {C['muted']}; }}
+.faint {{ color: {C['faint']}; }}
+.mono {{ font-family: "{ui.MONO}", monospace; }}
+.tnum {{ font-feature-settings: "tnum"; }}
+
+/* ── Sidebar ────────────────────────────────────────────────────────── */
 .sidebar {{
-    background-color: {COLORS['surface']};
-    border-right: 1px solid {COLORS['overlay']};
-    padding: 18px 10px;
+    background-color: {C['bg']};
+    border-right: 1px solid {C['hairline']};
+    padding: 22px 14px 18px;
 }}
-.sidebar-section {{
-    font-size: 10px; font-weight: 700; letter-spacing: 0.10em;
-    color: {COLORS['muted']}; padding: 14px 14px 4px;
+.brand {{ font-family: "{ui.SERIF}", serif; font-size: 25px; color: {C['text']}; }}
+.brand-sub {{ font-size: 11.5px; color: {C['faint']}; }}
+.nav-btn {{
+    background: transparent; background-image: none; border: none;
+    border-radius: 12px; color: {C['muted']}; padding: 9px 12px;
+    font-size: 13.5px; font-weight: 500; box-shadow: none; {t}
 }}
-.sidebar-btn {{
-    background: transparent; border: none; border-radius: 8px;
-    color: {COLORS['subtext']}; padding: 10px 14px;
-    font-size: 13px; font-weight: 500; box-shadow: none;
+.nav-btn label {{ color: {C['muted']}; }}
+.nav-btn:hover {{ background-color: {C['overlay']}; }}
+.nav-btn:hover label, .nav-btn:hover .nav-icon {{ color: {C['text']}; }}
+.nav-icon {{ color: {C['faint']}; }}
+.nav-btn.active {{
+    background-color: {C['surface']};
+    box-shadow: inset 0 0 0 1px {C['hairline']}, 0 1px 2px {C['shadow']},
+                0 8px 18px -12px {C['shadow']};
 }}
-.sidebar-btn:hover {{
-    background-color: {COLORS['overlay']};
-    color: {COLORS['text']};
+.nav-btn.active label {{ color: {C['text']}; font-weight: 600; }}
+.nav-btn.active .nav-icon {{ color: {C['accent']}; }}
+button.side-gauge-btn {{
+    padding: 0; border: none; background: transparent; box-shadow: none;
+    border-radius: 18px;
 }}
-.sidebar-btn.active {{
-    background-color: rgba(245, 130, 31, 0.10);
-    color: {COLORS['accent']};
-    font-weight: 600;
+.side-gauge {{
+    background-color: {C['shell']}; border-radius: 18px; padding: 10px 12px;
+    border: 1px solid {C['hairline']}; {t}
 }}
-.content-area {{ background-color: {COLORS['bg']}; }}
+button.side-gauge-btn:hover .side-gauge {{ background-color: {C['overlay']}; }}
+.side-gauge-title {{ font-size: 12px; font-weight: 600; color: {C['text']}; }}
+.side-gauge-sub {{ font-size: 11.5px; color: {C['muted']}; }}
+
+/* ── Header ─────────────────────────────────────────────────────────── */
 .header-bar {{
-    background-color: {COLORS['surface']};
-    border-bottom: 1px solid {COLORS['overlay']};
-    padding: 14px 28px;
+    background-color: transparent; border: none;
+    padding: 22px 32px 10px 32px;
 }}
 .page-title {{
-    font-size: 22px; font-weight: 700; color: {COLORS['text']};
+    font-family: "{ui.SERIF}", serif; font-size: 36px; font-weight: 400;
+    color: {C['text']}; letter-spacing: -0.01em;
 }}
-.subtitle {{ font-size: 12px; color: {COLORS['muted']}; }}
+.page-sub {{ font-size: 12.5px; color: {C['muted']}; }}
+.pill {{
+    background-color: {C['surface']}; border: 1px solid {C['hairline']};
+    border-radius: 999px; padding: 6px 12px 6px 10px; font-size: 12.5px;
+}}
 
+/* ── Panels: a cream shell holding a bright core ───────────────────── */
+.shell {{
+    background-color: {C['shell']}; border-radius: 24px; padding: 5px;
+    border: 1px solid {C['hairline']};
+}}
+.core {{
+    background-color: {C['surface']}; border-radius: 19px;
+    padding: 20px 22px 20px 22px;
+    box-shadow: inset 0 1px 0 {C['highlight']}, 0 1px 2px {C['shadow']},
+                0 18px 36px -26px {C['shadow']};
+}}
+/* Older views use .card; it gets the same two-layer look as a ring. */
 .card {{
-    background-color: {COLORS['surface']};
-    border-radius: 14px;
-    border: 1px solid {COLORS['overlay']};
-    padding: 22px;
-    box-shadow: 0 1px 2px rgba(15, 15, 25, 0.04);
+    background-color: {C['surface']}; border-radius: 19px; padding: 20px 22px;
+    border: 1px solid {C['hairline']};
+    box-shadow: 0 0 0 5px {C['shell']}, 0 0 0 6px {C['hairline']},
+                0 18px 36px -26px {C['shadow']};
+    margin: 6px;
 }}
-.card-title {{
-    font-size: 11px; font-weight: 700; letter-spacing: 0.08em;
-    color: {COLORS['muted']}; margin-bottom: 10px;
+.card-title, .panel-title {{
+    font-family: "{ui.SERIF}", serif; font-size: 22px; font-weight: 400;
+    color: {C['text']};
 }}
-.card-value {{
-    font-size: 30px; font-weight: 700; color: {COLORS['text']};
+.eyebrow {{ font-size: 12px; font-weight: 500; color: {C['muted']}; }}
+.eyebrow-strong {{ font-size: 12.5px; font-weight: 600; color: {C['text']}; }}
+.tag {{
+    border-radius: 999px; padding: 2px 9px; font-size: 11px; font-weight: 600;
+    background-color: {C['accent-soft']}; color: {C['accent-strong']};
 }}
-.card-subtitle {{
-    font-size: 12px; color: {COLORS['subtext']}; margin-top: 6px;
+.tag-ok {{ background-color: alpha({C['ok']}, 0.12); color: {C['ok']}; }}
+.tag-warn {{ background-color: alpha({C['warn']}, 0.14); color: {C['warn']}; }}
+.tag-danger {{ background-color: alpha({C['danger']}, 0.12); color: {C['danger']}; }}
+.tag-muted {{ background-color: {C['sunken']}; color: {C['muted']}; }}
+.figure {{ font-size: 44px; font-weight: 600; letter-spacing: -0.02em; color: {C['text']}; }}
+.figure-unit {{ font-size: 15px; font-weight: 500; color: {C['muted']}; }}
+.stat-value {{ font-size: 25px; font-weight: 600; letter-spacing: -0.01em; color: {C['text']}; }}
+.stat-value-sm {{ font-size: 17px; font-weight: 600; color: {C['text']}; }}
+.stat-label {{ font-size: 12px; font-weight: 500; color: {C['muted']}; }}
+.stat-sub {{ font-size: 11.5px; color: {C['faint']}; }}
+.ring-label {{ font-size: 13px; font-weight: 600; color: {C['text']}; }}
+.ring-sub {{ font-size: 12px; color: {C['muted']}; }}
+.divider-v {{ background-color: {C['hairline']}; min-width: 1px; }}
+.divider-h {{ background-color: {C['hairline']}; min-height: 1px; }}
+.callout {{
+    background-color: {C['accent-soft']}; border-radius: 14px; padding: 11px 14px;
 }}
-.accent-dash {{ border-radius: 2px; }}
+.callout label {{ color: {C['text']}; }}
+.notice {{ border-radius: 14px; padding: 11px 14px; background-color: {C['sunken']}; }}
+.notice-warn {{ background-color: alpha({C['warn']}, 0.10); }}
+.notice-danger {{ background-color: alpha({C['danger']}, 0.09); }}
 
-.search-entry {{
-    background-color: {COLORS['surface']};
-    border: 1px solid #D8D8D2;
-    border-radius: 10px; color: {COLORS['text']};
-    padding: 9px 14px; font-size: 13px;
+/* ── Account tiles ──────────────────────────────────────────────────── */
+.tile {{
+    background-color: {C['sunken']}; border-radius: 16px; padding: 14px 15px;
+    border: 1px solid transparent; {t}
 }}
-.search-entry:focus {{
-    border-color: {COLORS['accent']};
-    box-shadow: 0 0 0 3px rgba(245, 130, 31, 0.18);
+.tile:hover {{ background-color: {C['overlay']}; }}
+.tile.live {{
+    background-color: {C['surface']}; border-color: alpha({C['accent']}, 0.55);
+    box-shadow: 0 0 0 3px {C['accent-soft']};
 }}
+.tile-name {{ font-size: 13.5px; font-weight: 600; color: {C['text']}; }}
+.tile-sub {{ font-size: 11.5px; color: {C['muted']}; }}
+.tile-num {{ font-size: 12px; font-weight: 600; color: {C['subtext']}; font-feature-settings: "tnum"; }}
+.dot-live {{ color: {C['ok']}; }}
+.dot-idle {{ color: {C['faint']}; }}
 
-/* Form controls — force readable colors against the light surface so they
- * don't pick up the user's system dark theme defaults inside our cards. */
-spinbutton, spinbutton entry,
-.card entry {{
-    background-color: {COLORS['surface']};
-    color: {COLORS['text']};
-    border: 1px solid #D8D8D2;
-    border-radius: 8px;
-    padding: 6px 8px;
+/* ── Bar lists ──────────────────────────────────────────────────────── */
+.bar-name {{ font-size: 13px; color: {C['subtext']}; }}
+.bar-value {{ font-size: 12.5px; font-weight: 600; color: {C['text']}; font-feature-settings: "tnum"; }}
+
+/* ── Buttons ────────────────────────────────────────────────────────── */
+button {{
+    background-image: none; background-color: {C['surface']};
+    border: 1px solid {C['hairline']}; border-radius: 999px;
+    color: {C['text']}; padding: 7px 15px; font-size: 13px; font-weight: 500;
+    box-shadow: 0 1px 1px {C['shadow']}; text-shadow: none; -gtk-icon-shadow: none; {t}
 }}
-spinbutton button {{
-    background-color: {COLORS['surface']};
-    color: {COLORS['subtext']};
-    border: 1px solid #D8D8D2;
+button:hover {{ background-color: {C['overlay']}; }}
+button:active, button:checked {{ background-color: {C['sunken']}; box-shadow: none; }}
+button:disabled {{ color: {C['faint']}; background-color: {C['sunken']}; box-shadow: none; }}
+*:focus {{ outline-color: alpha({C['accent']}, 0.55); outline-style: solid; outline-width: 2px; outline-offset: 1px; -gtk-outline-radius: 12px; }}
+button.btn-primary {{
+    background-color: {C['accent']}; border-color: {C['accent']}; color: {C['on-accent']};
+    font-weight: 600; padding: 8px 18px;
+    box-shadow: 0 1px 2px alpha({C['accent']}, 0.30), inset 0 1px 0 rgba(255,255,255,0.18);
 }}
-spinbutton button:hover {{ background-color: {COLORS['overlay']}; }}
-.card label {{ color: {COLORS['text']}; }}
-.card .subtitle {{ color: {COLORS['muted']}; }}
-checkbutton, checkbutton label {{ color: {COLORS['text']}; }}
-checkbutton check {{
-    background-color: {COLORS['surface']};
-    border: 1px solid #C8C8C2;
+button.btn-primary label {{ color: {C['on-accent']}; }}
+button.btn-primary:hover {{ background-color: {C['accent-strong']}; border-color: {C['accent-strong']}; }}
+button.btn-secondary {{ background-color: {C['surface']}; }}
+button.btn-ghost {{ background-color: transparent; border-color: transparent; box-shadow: none; }}
+button.btn-ghost:hover {{ background-color: {C['overlay']}; }}
+button.btn-icon {{ padding: 7px; min-width: 20px; min-height: 20px; }}
+button.btn-link {{
+    background: transparent; border: none; box-shadow: none; padding: 2px 4px;
+    color: {C['accent-strong']}; font-weight: 600;
 }}
-checkbutton check:checked {{
-    background-color: {COLORS['accent']};
-    border-color: {COLORS['accent']};
-    color: {COLORS['surface']};
+button.btn-link label {{ color: {C['accent-strong']}; }}
+button.btn-link:hover {{ background-color: {C['accent-soft']}; }}
+
+/* ── Inputs ─────────────────────────────────────────────────────────── */
+entry, spinbutton, .search-entry {{
+    background-image: none; background-color: {C['sunken']}; color: {C['text']};
+    border: 1px solid {C['hairline']}; border-radius: 12px; padding: 8px 12px;
+    caret-color: {C['accent']}; box-shadow: none; {t}
 }}
-/* Cell-rendered toggles inside a TreeView (CellRendererToggle) — these
- * are drawn by the cell renderer, not real GtkCheckButton widgets, so
- * they need their own selectors. Without these the cells inherit the
- * user's system dark theme and show as black squares against our light
- * surface. */
-treeview.view check, treeview check {{
-    background-color: {COLORS['surface']};
-    border: 1px solid #C8C8C2;
-    border-radius: 3px;
-    min-width: 14px; min-height: 14px;
-    color: {COLORS['text']};
+entry:focus, .search-entry:focus, spinbutton:focus {{
+    border-color: {C['accent']}; background-color: {C['surface']};
+    box-shadow: 0 0 0 3px {C['accent-soft']};
 }}
-treeview.view check:checked, treeview check:checked {{
-    background-color: {COLORS['accent']};
-    border-color: {COLORS['accent']};
-    color: {COLORS['surface']};
+entry selection {{ background-color: alpha({C['accent']}, 0.28); color: {C['text']}; }}
+spinbutton entry {{ border: none; box-shadow: none; background: transparent; padding: 0 4px; }}
+spinbutton button {{ background: transparent; border: none; box-shadow: none; color: {C['muted']}; border-radius: 10px; }}
+spinbutton button:hover {{ background-color: {C['overlay']}; color: {C['text']}; }}
+combobox button {{ padding: 6px 12px; }}
+combobox arrow {{ color: {C['muted']}; }}
+checkbutton, checkbutton label, radiobutton label {{ color: {C['text']}; }}
+checkbutton check, radiobutton radio, treeview check {{
+    background-image: none; background-color: {C['surface']};
+    border: 1px solid {C['hairline']}; border-radius: 5px;
 }}
-treeview.view check:hover, treeview check:hover {{
-    border-color: {COLORS['accent']};
-}}
-/* TreeStore disclosure (▶/▼) arrows for expandable rows — without these
- * the system theme draws them invisible against our light surface. */
-treeview.view expander, treeview expander {{
-    color: {COLORS['muted']};
-    -gtk-icon-source: -gtk-icontheme("pan-end-symbolic");
-}}
-treeview.view expander:hover, treeview expander:hover {{
-    color: {COLORS['accent']};
-}}
-treeview.view expander:checked, treeview expander:checked {{
-    -gtk-icon-source: -gtk-icontheme("pan-down-symbolic");
-    color: {COLORS['accent']};
-}}
-/* Editable cell entries (CellRendererText with editable=True) — the
- * popup edit field needs explicit colors to stay readable. */
-treeview entry, .view entry {{
-    background-color: {COLORS['surface']};
-    color: {COLORS['text']};
-    border: 1px solid {COLORS['accent']};
-}}
-/* StackSwitcher buttons (Breakdowns Models/Tools toggle) — match our
- * sidebar-button feel rather than the system default. */
-stackswitcher button {{
-    background: transparent;
-    color: {COLORS['subtext']};
-    border: none;
-    border-radius: 8px;
-    padding: 6px 14px;
-    font-weight: 500;
-}}
-stackswitcher button:hover {{
-    background-color: {COLORS['overlay']};
-    color: {COLORS['text']};
-}}
-stackswitcher button:checked {{
-    background-color: rgba(245, 130, 31, 0.10);
-    color: {COLORS['accent']};
-    font-weight: 600;
+checkbutton check:checked, radiobutton radio:checked, treeview check:checked {{
+    background-color: {C['accent']}; border-color: {C['accent']}; color: #FFFFFF;
 }}
 switch {{
-    background-color: {COLORS['overlay']};
-    border-radius: 14px;
-    border: 1px solid #D8D8D2;
+    background-image: none; background-color: {C['overlay']};
+    border: 1px solid {C['hairline']}; border-radius: 999px; {t}
 }}
-switch:checked {{
-    background-color: {COLORS['accent']};
-    border-color: {COLORS['accent']};
-}}
+switch:checked {{ background-color: {C['accent']}; border-color: {C['accent']}; }}
 switch slider {{
-    background-color: {COLORS['surface']};
-    border-radius: 12px;
-    border: 1px solid #D8D8D2;
+    background-image: none; background-color: {'#D6D2C9' if ui.is_dark() else '#FFFFFF'};
+    border-radius: 999px; border: 1px solid {C['hairline']};
+    box-shadow: 0 1px 2px {C['shadow']};
 }}
 
+/* ── Segmented control (Breakdowns) ─────────────────────────────────── */
+stackswitcher {{ background-color: {C['sunken']}; border-radius: 999px; padding: 3px; }}
+stackswitcher button {{
+    background: transparent; border: none; box-shadow: none; border-radius: 999px;
+    color: {C['muted']}; padding: 5px 16px; font-weight: 500;
+}}
+stackswitcher button:checked {{
+    background-color: {C['surface']}; color: {C['text']}; font-weight: 600;
+    box-shadow: 0 1px 2px {C['shadow']}, inset 0 0 0 1px {C['hairline']};
+}}
+
+/* ── Segmented control (dashboard chart) ────────────────────────────── */
+.segmented {{ background-color: {C['sunken']}; border-radius: 999px; padding: 3px; }}
+.segmented button {{
+    background: transparent; border: none; box-shadow: none; border-radius: 999px;
+    color: {C['muted']}; padding: 4px 14px; font-weight: 500;
+}}
+.segmented button:checked {{
+    background-color: {C['surface']}; color: {C['text']};
+    box-shadow: 0 1px 2px {C['shadow']}, inset 0 0 0 1px {C['hairline']};
+}}
+.segmented button label {{ color: inherit; }}
+
+/* ── Tables ─────────────────────────────────────────────────────────── */
 treeview {{
-    background-color: {COLORS['surface']}; color: {COLORS['text']};
-    font-family: "JetBrains Mono","Fira Code",monospace;
-    font-size: 13px;
+    background-color: {C['surface']}; color: {C['text']};
+    font-family: "{ui.SANS}", sans-serif; font-size: 13px;
+    font-feature-settings: "tnum";
 }}
 treeview header button {{
-    background-color: {COLORS['bg']};
-    color: {COLORS['muted']};
-    font-weight: 700; font-size: 10px; letter-spacing: 0.06em;
-    border-bottom: 1px solid {COLORS['overlay']};
-    padding: 12px 10px;
+    background-color: {C['surface']}; color: {C['muted']};
+    font-weight: 500; font-size: 12px; border: none; border-radius: 0;
+    border-bottom: 1px solid {C['hairline']}; padding: 10px 8px; box-shadow: none;
 }}
-treeview header button:hover {{
-    background-color: {COLORS['overlay']};
-    color: {COLORS['text']};
-}}
-treeview row {{ padding: 4px 0; }}
-treeview row:nth-child(even) {{ background-color: {COLORS['bg']}; }}
-treeview row:hover {{ background-color: rgba(245, 130, 31, 0.06); }}
-treeview row:selected {{
-    background-color: rgba(245, 130, 31, 0.18);
-    color: {COLORS['text']};
-}}
+treeview header button:hover {{ background-color: {C['sunken']}; color: {C['text']}; }}
+treeview.view:nth-child(even) {{ background-color: {C['sunken']}; }}
+treeview.view:hover {{ background-color: alpha({C['accent']}, 0.06); }}
+treeview.view:selected {{ background-color: alpha({C['accent']}, 0.16); color: {C['text']}; }}
+treeview expander {{ color: {C['faint']}; -gtk-icon-source: -gtk-icontheme("pan-end-symbolic"); }}
+treeview expander:checked {{ color: {C['accent']}; -gtk-icon-source: -gtk-icontheme("pan-down-symbolic"); }}
+treeview entry {{ background-color: {C['surface']}; border: 1px solid {C['accent']}; }}
+.core-table {{ padding: 6px 4px 4px 4px; }}
+.table-wrap {{ border-radius: 14px; border: 1px solid {C['hairline']}; }}
 
-scrollbar {{ background-color: transparent; }}
+scrollbar {{ background-color: transparent; border: none; }}
 scrollbar slider {{
-    background-color: #D8D8D2; border-radius: 6px;
-    min-width: 8px; min-height: 8px;
-    border: 2px solid transparent;
+    background-color: alpha({C['text']}, 0.16); border-radius: 999px;
+    min-width: 6px; min-height: 6px; border: 3px solid transparent;
 }}
-scrollbar slider:hover {{ background-color: {COLORS['muted']}; }}
+scrollbar slider:hover {{ background-color: alpha({C['text']}, 0.32); }}
 
-/* Base button — overrides system theme gradients/dark fills.
-   Sidebar / combobox / treeview headers have their own selectors and
-   keep precedence via class specificity. */
-button {{
-    background-image: none;
-    background-color: {COLORS['surface']};
-    border: 1px solid {COLORS['overlay']};
-    border-radius: 10px;
-    color: {COLORS['text']};
-    padding: 8px 14px;
-    font-size: 13px;
-    box-shadow: none;
-    text-shadow: none;
-    -gtk-icon-shadow: none;
+/* ── Menus, popovers, tooltips ──────────────────────────────────────── */
+menu, .menu, popover, popover.background {{
+    background-image: none; background-color: {C['surface']}; color: {C['text']};
+    border: 1px solid {C['hairline']}; border-radius: 14px; padding: 6px;
+    box-shadow: 0 12px 32px -12px {C['shadow']};
 }}
-button:hover {{
-    background-image: none;
-    background-color: {COLORS['overlay']};
-    color: {COLORS['text']};
+menuitem {{ padding: 7px 12px; border-radius: 8px; color: {C['text']}; }}
+menuitem:hover {{ background-color: {C['accent-soft']}; color: {C['accent-strong']}; }}
+menuitem:disabled {{ color: {C['muted']}; }}
+separator {{ background-color: {C['hairline']}; min-height: 1px; min-width: 1px; margin: 4px 0; }}
+tooltip, tooltip.background {{
+    background-color: {C['text']}; color: {C['bg']}; border-radius: 10px;
+    padding: 7px 10px; text-shadow: none; box-shadow: none;
 }}
-button:active, button:checked {{
-    background-image: none;
-    background-color: #DEDED6;
-}}
-button:disabled {{
-    background-image: none;
-    background-color: {COLORS['surface']};
-    color: {COLORS['muted']};
-    opacity: 0.6;
+tooltip label {{ color: {C['bg']}; font-size: 12.5px; }}
+dialog, messagedialog, filechooser {{ background-color: {C['bg']}; color: {C['text']}; }}
+headerbar, dialog .titlebar {{
+    background-image: none; background-color: {C['surface']}; color: {C['text']};
+    border-bottom: 1px solid {C['hairline']}; box-shadow: none; text-shadow: none;
 }}
 
-button.btn-primary {{
-    background-image: none;
-    background-color: {COLORS['accent']};
-    border: 1px solid {COLORS['accent']};
-    border-radius: 10px; color: #FFFFFF;
-    padding: 9px 18px; font-weight: 600; font-size: 13px;
-    box-shadow: 0 1px 2px rgba(245, 130, 31, 0.20);
-    text-shadow: none;
-}}
-button.btn-primary:hover {{
-    background-image: none;
-    background-color: #E36F0D;
-    border-color: #E36F0D;
-    color: #FFFFFF;
-}}
-button.btn-primary:active {{
-    background-image: none;
-    background-color: #C95F08;
-    border-color: #C95F08;
-}}
-button.btn-secondary {{
-    background-image: none;
-    background-color: {COLORS['surface']};
-    border: 1px solid {COLORS['overlay']};
-    border-radius: 10px; color: {COLORS['text']};
-    padding: 9px 16px; font-size: 13px;
-    text-shadow: none;
-}}
-button.btn-secondary:hover {{
-    background-image: none;
-    background-color: {COLORS['overlay']};
-    color: {COLORS['text']};
-}}
-
+/* ── Status bar ─────────────────────────────────────────────────────── */
 .status-bar {{
-    background-color: {COLORS['surface']};
-    border-top: 1px solid {COLORS['overlay']};
-    padding: 8px 28px;
+    background-color: {C['bg']}; border-top: 1px solid {C['hairline']};
+    padding: 8px 32px;
 }}
+.status-bar label {{ font-size: 11.5px; color: {C['faint']}; }}
 
-combobox button {{
-    background-image: none;
-    background-color: {COLORS['surface']};
-    border: 1px solid {COLORS['overlay']};
-    border-radius: 10px; color: {COLORS['text']};
-    padding: 6px 12px;
-    text-shadow: none;
+/* ── Tray popup ─────────────────────────────────────────────────────── */
+window.usage-popup {{ background-color: transparent; }}
+window.usage-popup.opaque {{ background-color: {C['shell']}; }}
+.popup-shell {{
+    background-color: {C['shell']}; border-radius: 26px; padding: 5px;
+    border: 1px solid {C['hairline']};
 }}
-combobox button:hover {{
-    background-image: none;
-    background-color: {COLORS['overlay']};
+.popup-core {{
+    background-color: {C['surface']}; border-radius: 21px; padding: 18px 20px 16px;
+    box-shadow: inset 0 1px 0 {C['highlight']};
 }}
-combobox arrow {{ color: {COLORS['muted']}; -gtk-icon-shadow: none; }}
-
-/* Dropdown popup itself — combobox menu, right-click menus, etc. */
-menu, .menu, popover, popover.background, popover contents {{
-    background-image: none;
-    background-color: {COLORS['surface']};
-    color: {COLORS['text']};
-    border: 1px solid {COLORS['overlay']};
-    border-radius: 10px;
-    padding: 6px;
-    box-shadow: 0 4px 14px rgba(15, 15, 25, 0.10);
-}}
-menuitem, .menuitem {{
-    background-image: none;
-    background-color: transparent;
-    color: {COLORS['text']};
-    padding: 7px 12px;
-    border-radius: 6px;
-    text-shadow: none;
-}}
-menuitem:hover, .menuitem:hover,
-menuitem:focus, .menuitem:focus {{
-    background-image: none;
-    background-color: rgba(245, 130, 31, 0.10);
-    color: {COLORS['accent']};
-}}
-menuitem:disabled {{
-    color: {COLORS['muted']};
-    opacity: 0.85;
-}}
-window.usage-popup {{
-    background-color: {COLORS['surface']};
-    border: 1px solid {COLORS['overlay']};
-    border-radius: 14px;
-}}
-.usage-popup-title {{
-    font-size: 15px; font-weight: 700; color: {COLORS['text']};
-}}
-.usage-popup-label {{ font-size: 13px; font-weight: 600; color: {COLORS['text']}; }}
-.usage-popup-sub {{ font-size: 12px; color: {COLORS['muted']}; }}
-.usage-popup progressbar trough {{
-    min-height: 8px; border-radius: 4px;
-    background-color: {COLORS['overlay']}; border: none;
-}}
-.usage-popup progressbar progress {{
-    min-height: 8px; border-radius: 4px; border: none;
-}}
-.pb-low progress {{ background-color: {USAGE_COLORS['low']}; background-image: none; }}
-.pb-medium progress {{ background-color: {USAGE_COLORS['medium']}; background-image: none; }}
-.pb-high progress {{ background-color: {USAGE_COLORS['high']}; background-image: none; }}
-.pb-critical progress {{ background-color: {USAGE_COLORS['critical']}; background-image: none; }}
-.pb-unknown progress {{ background-color: {USAGE_COLORS['unknown']}; background-image: none; }}
-menuitem separator, separator {{
-    background-color: {COLORS['overlay']};
-    min-height: 1px; min-width: 1px;
-    margin: 4px 0;
-}}
-
-/* Editable text entries (token field, budget name, etc.) */
-entry {{
-    background-image: none;
-    background-color: {COLORS['surface']};
-    color: {COLORS['text']};
-    border: 1px solid #D8D8D2;
-    border-radius: 10px;
-    padding: 8px 12px;
-    caret-color: {COLORS['accent']};
-}}
-entry:focus {{
-    border-color: {COLORS['accent']};
-    box-shadow: 0 0 0 3px rgba(245, 130, 31, 0.18);
-}}
-entry selection {{
-    background-color: rgba(245, 130, 31, 0.25);
-    color: {COLORS['text']};
-}}
-
-/* Spin buttons (used inside combobox / numeric inputs) */
-spinbutton {{
-    background-image: none;
-    background-color: {COLORS['surface']};
-    color: {COLORS['text']};
-    border: 1px solid {COLORS['overlay']};
-    border-radius: 10px;
-}}
-spinbutton entry {{ border: none; box-shadow: none; }}
-spinbutton button {{
-    background-image: none;
-    background-color: transparent;
-    border: none;
-    color: {COLORS['muted']};
-}}
-spinbutton button:hover {{
-    background-color: {COLORS['overlay']};
-    color: {COLORS['text']};
-}}
-
-/* Dialog windows (file chooser, message dialogs, etc.) */
-dialog, messagedialog, filechooser {{
-    background-color: {COLORS['bg']};
-    color: {COLORS['text']};
-}}
-dialog .titlebar, headerbar {{
-    background-image: none;
-    background-color: {COLORS['surface']};
-    color: {COLORS['text']};
-    border-bottom: 1px solid {COLORS['overlay']};
-    box-shadow: none;
-    text-shadow: none;
-}}
-
-/* Tooltips */
-tooltip {{
-    background-color: {COLORS['text']};
-    color: {COLORS['surface']};
-    border-radius: 6px;
-    padding: 6px 10px;
-    text-shadow: none;
-}}
-tooltip label {{ color: {COLORS['surface']}; }}
-
-/* Checkboxes / radios — keep them brand-colored when active */
-checkbutton check, radiobutton radio {{
-    background-image: none;
-    background-color: {COLORS['surface']};
-    border: 1px solid #C8C8C2;
-}}
-checkbutton check:checked, radiobutton radio:checked {{
-    background-color: {COLORS['accent']};
-    border-color: {COLORS['accent']};
-    color: #FFFFFF;
-}}
-
-/* Frames / labels generally pick up the window background */
-label {{ color: {COLORS['text']}; }}
+.popup-title {{ font-family: "{ui.SERIF}", serif; font-size: 24px; color: {C['text']}; }}
 """
 
 
 # ─── Widgets ───────────────────────────────────────────────────────────────
-
-class SummaryCard(Gtk.Box):
-    def __init__(self, title: str, value: str = "--", subtitle: str = "",
-                 accent_color: str = COLORS['accent'],
-                 color_key: Optional[str] = None):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL)
-        self.get_style_context().add_class('card')
-        self.set_margin_top(8)
-        self.set_margin_bottom(8)
-        # color_key (e.g. 'blue') lets retint() re-derive the accent from
-        # the live COLORS dict after a theme switch; accent_color alone
-        # would stay pinned to the palette active at construction time.
-        self._color_key = color_key
-        self._accent_color = accent_color
-
-        # 28×3px colored accent dash above the title.
-        dash = Gtk.Box()
-        dash.set_size_request(28, 3)
-        dash.set_halign(Gtk.Align.START)
-        dash.get_style_context().add_class('accent-dash')
-        dash_provider = Gtk.CssProvider()
-        dash_provider.load_from_data(
-            f'box {{ background-color: {accent_color}; }}'.encode())
-        dash.get_style_context().add_provider(
-            dash_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        dash.set_margin_bottom(12)
-        self.pack_start(dash, False, False, 0)
-        self._dash = dash
-        self._dash_provider = dash_provider
-
-        self.title_lbl = Gtk.Label(label=title)
-        self.title_lbl.get_style_context().add_class('card-title')
-        self.title_lbl.set_halign(Gtk.Align.START)
-        self.pack_start(self.title_lbl, False, False, 0)
-
-        self.value_lbl = Gtk.Label()
-        self.value_lbl.get_style_context().add_class('card-value')
-        self.value_lbl.set_halign(Gtk.Align.START)
-        self.value_lbl.set_markup(
-            f'<span foreground="{accent_color}">{html.escape(value)}</span>'
-        )
-        self.pack_start(self.value_lbl, False, False, 0)
-
-        self.sub_lbl = Gtk.Label(label=subtitle)
-        self.sub_lbl.get_style_context().add_class('card-subtitle')
-        self.sub_lbl.set_halign(Gtk.Align.START)
-        self.sub_lbl.set_ellipsize(Pango.EllipsizeMode.END)
-        self.pack_start(self.sub_lbl, False, False, 0)
-
-    def update(self, value: str, subtitle: Optional[str] = None,
-               color: Optional[str] = None, title: Optional[str] = None):
-        c = color or self._accent_color
-        self.value_lbl.set_markup(
-            f'<span foreground="{c}">{html.escape(value)}</span>'
-        )
-        if subtitle is not None:
-            self.sub_lbl.set_text(subtitle)
-        if title is not None:
-            self.title_lbl.set_text(title)
-
-    def retint(self):
-        """Re-apply the accent color from the live COLORS dict — call
-        after a theme switch so the dash and value label don't stay
-        pinned to the palette active when the card was constructed."""
-        if self._color_key is None:
-            return
-        self._accent_color = COLORS[self._color_key]
-        self._dash_provider.load_from_data(
-            f'box {{ background-color: {self._accent_color}; }}'.encode())
-        current = self.value_lbl.get_text()
-        self.value_lbl.set_markup(
-            f'<span foreground="{self._accent_color}">'
-            f'{html.escape(current)}</span>'
-        )
-
-
-class UsageBar(Gtk.Box):
-    def __init__(self, label: str, percentage: float):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        self.set_margin_top(8)
-        self.set_margin_bottom(8)
-
-        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        self.label_lbl = Gtk.Label(label=label)
-        self.label_lbl.set_halign(Gtk.Align.START)
-        header.pack_start(self.label_lbl, True, True, 0)
-        self.pct_lbl = Gtk.Label(label=f"{int(percentage * 100)}%")
-        self.pct_lbl.set_halign(Gtk.Align.END)
-        header.pack_end(self.pct_lbl, False, False, 0)
-        self.pack_start(header, False, False, 0)
-
-        self.progress = Gtk.LevelBar()
-        self.progress.set_min_value(0)
-        self.progress.set_max_value(1.0)
-        # A plan can be over its limit; the bar caps at full, the label
-        # beside it still reads the true figure (e.g. "140%").
-        self.progress.set_value(min(max(percentage, 0.0), 1.0))
-        self.progress.set_size_request(-1, 8)
-
-        self._trough_provider = Gtk.CssProvider()
-        self.progress.get_style_context().add_provider(
-            self._trough_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
-        )
-        self._percentage = percentage
-        self._apply_bar_css()
-        self.pack_start(self.progress, False, False, 0)
-
-    def _apply_bar_css(self):
-        bar_color = get_usage_color(self._percentage)
-        css = f"""
-            levelbar trough {{
-                background-color: {COLORS['overlay']};
-                border-radius: 4px; min-height: 8px;
-            }}
-            levelbar trough block.filled {{
-                background-color: {bar_color};
-                border-radius: 4px; min-height: 8px;
-            }}
-        """
-        self._trough_provider.load_from_data(css.encode())
-
-    def update(self, percentage: float, label: Optional[str] = None,
-               reset_time: Optional[str] = None,
-               pct_text: Optional[str] = None, note: Optional[str] = None):
-        self._percentage = percentage
-        self.progress.set_value(min(max(percentage, 0.0), 1.0))
-        self.pct_lbl.set_text(pct_text or f"{int(percentage * 100)}%")
-        if label:
-            text = label
-            if note:
-                text += f"  ({note})"
-            elif reset_time and reset_time not in ('—', 'now'):
-                text += f"  (resets in {reset_time})"
-            self.label_lbl.set_text(text)
-        self._apply_bar_css()  # keep trough color in sync with the live theme
-
-    def retint(self):
-        """Re-apply trough colors from the live COLORS dict after a
-        theme switch, without touching the current percentage/label."""
-        self._apply_bar_css()
-
 
 # ─── Main Window ───────────────────────────────────────────────────────────
 
@@ -779,6 +508,14 @@ class TrackerWindow(Gtk.Window):
         self.show_all()
 
     # ── Layout scaffolding ─────────────────────────────────────────────────
+    PAGE_SUBTITLES = {
+        'dashboard':  'Your plan windows, this session, and what the tokens went on.',
+        'projects':   'Tokens and cost per project, and per session inside it.',
+        'breakdowns': 'Where the tokens went, by model and by tool.',
+        'budgets':    'Limits that warn you before you reach them.',
+        'settings':   'Accounts, alerts, pricing and appearance.',
+    }
+
     def _build_ui(self):
         main_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         self.add(main_box)
@@ -794,8 +531,9 @@ class TrackerWindow(Gtk.Window):
         content.pack_start(self._build_header(), False, False, 0)
 
         self._stack = Gtk.Stack()
-        self._stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
-        self._stack.set_transition_duration(150)
+        self._stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self._stack.set_transition_duration(220)
+
         def _scrolled(widget):
             sw = Gtk.ScrolledWindow()
             sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -803,8 +541,8 @@ class TrackerWindow(Gtk.Window):
             return sw
 
         self._stack.add_named(_scrolled(self._build_dashboard_view()), 'dashboard')
-        self._stack.add_named(_scrolled(self._build_projects_view()), 'projects')
-        self._stack.add_named(_scrolled(self._build_breakdowns_view()), 'breakdowns')
+        self._stack.add_named(self._build_projects_view(), 'projects')
+        self._stack.add_named(self._build_breakdowns_view(), 'breakdowns')
         self._stack.add_named(_scrolled(self._build_budgets_view()), 'budgets')
         self._stack.add_named(_scrolled(self._build_settings_view()), 'settings')
         content.pack_start(self._stack, True, True, 0)
@@ -812,36 +550,32 @@ class TrackerWindow(Gtk.Window):
         content.pack_start(self._build_status_bar(), False, False, 0)
 
     def _build_sidebar(self) -> Gtk.Widget:
-        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         sidebar.get_style_context().add_class('sidebar')
-        sidebar.set_size_request(220, -1)
+        sidebar.set_size_request(204, -1)
 
-        title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        title_box.set_margin_bottom(24)
-        title_box.set_margin_start(8)
-        sidebar_icon = None
-        ip = _icon_path(48)
+        brand = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=11)
+        brand.set_margin_start(6)
+        brand.set_margin_bottom(28)
+        mark = None
+        ip = _icon_path(64)
         if ip is not None:
             try:
-                pix = GdkPixbuf.Pixbuf.new_from_file_at_size(str(ip), 28, 28)
-                sidebar_icon = Gtk.Image.new_from_pixbuf(pix)
+                pix = GdkPixbuf.Pixbuf.new_from_file_at_size(str(ip), 34, 34)
+                mark = Gtk.Image.new_from_pixbuf(pix)
             except Exception:
-                sidebar_icon = None
-        if sidebar_icon is None:
-            sidebar_icon = Gtk.Image.new_from_icon_name(
-                'utilities-terminal-symbolic', Gtk.IconSize.DND)
-        title_box.pack_start(sidebar_icon, False, False, 0)
-        t = Gtk.Label(label="Token Tracker")
-        t.get_style_context().add_class('page-title')
-        t.set_halign(Gtk.Align.START)
-        t.set_ellipsize(Pango.EllipsizeMode.END)
-        title_box.pack_start(t, True, True, 0)
-        sidebar.pack_start(title_box, False, False, 0)
-
-        nav_header = Gtk.Label(label="NAVIGATION")
-        nav_header.get_style_context().add_class('sidebar-section')
-        nav_header.set_halign(Gtk.Align.START)
-        sidebar.pack_start(nav_header, False, False, 0)
+                mark = None
+        if mark is not None:
+            brand.pack_start(mark, False, False, 0)
+        names = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        t = Gtk.Label(label="Token Tracker", xalign=0)
+        t.get_style_context().add_class('brand')
+        names.pack_start(t, False, False, 0)
+        st = Gtk.Label(label="Claude usage, kept", xalign=0)
+        st.get_style_context().add_class('brand-sub')
+        names.pack_start(st, False, False, 0)
+        brand.pack_start(names, False, False, 0)
+        sidebar.pack_start(brand, False, False, 0)
 
         self._nav_buttons: Dict[str, Gtk.Button] = {}
         for vid, label in [
@@ -851,47 +585,114 @@ class TrackerWindow(Gtk.Window):
             ('budgets',    'Budgets'),
             ('settings',   'Settings'),
         ]:
-            btn = Gtk.Button(label=label)
-            btn.get_style_context().add_class('sidebar-btn')
+            btn = Gtk.Button()
+            btn.get_style_context().add_class('nav-btn')
             btn.set_relief(Gtk.ReliefStyle.NONE)
-            child = btn.get_child()
-            if isinstance(child, Gtk.Label):
-                child.set_xalign(0.0)
-            btn.connect('clicked',
-                        lambda _, v=vid: self._switch_view(v))
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=11)
+            icon = ui.NavIcon(vid)
+            icon.get_style_context().add_class('nav-icon')
+            row.pack_start(icon, False, False, 0)
+            row.pack_start(Gtk.Label(label=label, xalign=0), True, True, 0)
+            btn.add(row)
+            btn.connect('clicked', lambda _, v=vid: self._switch_view(v))
             sidebar.pack_start(btn, False, False, 0)
             self._nav_buttons[vid] = btn
+
+        sidebar.pack_start(Gtk.Box(), True, True, 0)
+
+        # A small live gauge that stays in view on every page.
+        gauge_btn = Gtk.Button()
+        gauge_btn.get_style_context().add_class('side-gauge-btn')
+        gauge_btn.set_relief(Gtk.ReliefStyle.NONE)
+        gauge_btn.set_tooltip_text("Open the usage panel")
+        gauge_btn.connect('clicked', lambda _b: self.app._show_usage_popup())
+        g = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=11)
+        g.get_style_context().add_class('side-gauge')
+        self._side_ring = ui.Ring(diameter=46, stroke=4.5)
+        g.pack_start(self._side_ring, False, False, 0)
+        gt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        gt.set_valign(Gtk.Align.CENTER)
+        self._side_title = Gtk.Label(label="5-hour window", xalign=0)
+        self._side_title.get_style_context().add_class('side-gauge-title')
+        self._side_title.set_ellipsize(Pango.EllipsizeMode.END)
+        self._side_title.set_max_width_chars(18)
+        self._side_sub = Gtk.Label(label="waiting for a reading", xalign=0)
+        self._side_sub.get_style_context().add_class('side-gauge-sub')
+        self._side_sub.set_ellipsize(Pango.EllipsizeMode.END)
+        self._side_sub.set_max_width_chars(20)
+        gt.pack_start(self._side_title, False, False, 0)
+        gt.pack_start(self._side_sub, False, False, 0)
+        g.pack_start(gt, True, True, 0)
+        gauge_btn.add(g)
+        sidebar.pack_start(gauge_btn, False, False, 0)
+
+        v = Gtk.Label(label=f"v{APP_VERSION}", xalign=0)
+        v.get_style_context().add_class('brand-sub')
+        v.set_margin_start(8)
+        v.set_margin_top(10)
+        sidebar.pack_start(v, False, False, 0)
         return sidebar
+
+    def _update_side_gauge(self):
+        st = self.app._primary_state()
+        bad = st.cloud_state in ('auth_error', 'network_error', 'rate_limited', 'no_token')
+        try:
+            hs = claudehop.load_state(st.token)
+        except Exception:
+            hs = None
+        who = hs.active if hs and hs.active else "5-hour window"
+        self._side_title.set_text(who)
+        if bad:
+            self._side_ring.set_value(st.last_pct5, dimmed=True)
+            self._side_sub.set_text(st.cloud_state.replace('_', ' '))
+        elif st.last_pct5 is None:
+            self._side_ring.set_value(None)
+            self._side_sub.set_text("waiting for a reading")
+        else:
+            self._side_ring.set_value(st.last_pct5)
+            left = fmt_reset_countdown(st.last_resets_5h)
+            self._side_sub.set_text(f"5h · resets {left}" if left not in ('—', '')
+                                    else "5-hour window")
 
     def _build_header(self) -> Gtk.Widget:
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         header.get_style_context().add_class('header-bar')
-        self._header_title = Gtk.Label(label="Dashboard")
+        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self._header_title = Gtk.Label(label="Dashboard", xalign=0)
         self._header_title.get_style_context().add_class('page-title')
-        header.pack_start(self._header_title, False, False, 0)
-        header.pack_start(Gtk.Box(), True, True, 0)
+        titles.pack_start(self._header_title, False, False, 0)
+        self._header_sub = Gtk.Label(label=self.PAGE_SUBTITLES['dashboard'], xalign=0)
+        self._header_sub.get_style_context().add_class('page-sub')
+        self._header_sub.set_ellipsize(Pango.EllipsizeMode.END)
+        titles.pack_start(self._header_sub, False, False, 0)
+        header.pack_start(titles, True, True, 0)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        right.set_valign(Gtk.Align.CENTER)
+        # Which claudehop account this is (hidden when claudehop is not in use).
+        self._hop_badge_box = Gtk.Box()
+        self._hop_badge_box.get_style_context().add_class('pill')
+        self._hop_badge_box.set_no_show_all(True)
+        self._hop_badge = Gtk.Label()
+        self._hop_badge.show()
+        self._hop_badge_box.add(self._hop_badge)
+        right.pack_start(self._hop_badge_box, False, False, 0)
 
         # Account filter — only meaningful when more than one account.
-        # Always pack it so changes via Settings can show/hide it without
-        # rebuilding the header.
         self._account_combo = Gtk.ComboBoxText()
         self._populate_account_combo()
         self._account_combo.connect('changed', self._on_account_filter_changed)
         self._account_combo.set_no_show_all(True)
-        header.pack_end(self._account_combo, False, False, 0)
+        right.pack_start(self._account_combo, False, False, 0)
         self._account_combo.set_visible(self._combo_wanted())
 
         refresh_btn = Gtk.Button()
-        refresh_btn.set_image(Gtk.Image.new_from_icon_name(
-            'view-refresh-symbolic', Gtk.IconSize.BUTTON))
-        refresh_btn.set_tooltip_text("Refresh (Ctrl+R)")
-        refresh_btn.get_style_context().add_class('btn-secondary')
+        refresh_btn.add(ui.NavIcon('refresh', 16))
+        refresh_btn.set_tooltip_text("Rescan the logs (Ctrl+R)")
+        refresh_btn.get_style_context().add_class('btn-icon')
         refresh_btn.connect('clicked', lambda _: self.refresh_data())
-        header.pack_end(refresh_btn, False, False, 0)
-        # Which claudehop account this is (hidden when claudehop is not in use).
-        self._hop_badge = Gtk.Label()
-        self._hop_badge.set_no_show_all(True)
-        header.pack_end(self._hop_badge, False, False, 8)
+        right.pack_start(refresh_btn, False, False, 0)
+        header.pack_end(right, False, False, 0)
         self._update_hop_badge()
         self._header_box = header  # so we can re-show the combo on reload
         return header
@@ -904,7 +705,7 @@ class TrackerWindow(Gtk.Window):
         except Exception:
             hs = None
         if hs is None or not (hs.active or hs.provider):
-            self._hop_badge.set_visible(False)
+            self._hop_badge_box.set_visible(False)
             return
         acct = hs.profile(hs.active)
         if hs.provider:
@@ -914,119 +715,14 @@ class TrackerWindow(Gtk.Window):
                    f"The {hs.active or 'saved'} login is not in use.")
         else:
             head = hs.active
-            tail = f" · {acct.plan}" if acct and acct.plan else ""
+            tail = f" · {acct.plan.capitalize()}" if acct and acct.plan else ""
             tip = (acct.email if acct and acct.email else hs.active)
         self._hop_badge.set_markup(
-            f'<span foreground="{COLORS["green"]}">●</span> '
-            f'<b>{html.escape(head)}</b>{html.escape(tail)}')
-        self._hop_badge.set_tooltip_text(tip)
-        self._hop_badge.set_visible(True)
-
-    def _update_hop_card(self):
-        """The Accounts card: every claudehop account, which one is live, its
-        newest plan reading, any `hop run` terminals open on it, and which login
-        has the most room; plus Bedrock when it is registered."""
-        for child in self._hop_rows.get_children():
-            self._hop_rows.remove(child)
-        live = self.app._primary_state()
-        try:
-            hs = claudehop.load_state(live.token)
-        except Exception:
-            hs = None
-        if hs is None or not (hs.profiles or hs.providers):
-            self._hop_card.set_visible(False)
-            return
-        now = datetime.now(timezone.utc)
-        names = [p.name for p in hs.profiles]
-        readings = self.app.hop_readings(hs)
-        runs = claudehop.run_terminals()
-        read_at, result = self.app._hop_read_result or (None, None)
-        fresh_notes = read_at is not None and now - read_at < timedelta(minutes=30)
-        notes = result.notes if result is not None else {}
-
-        def line(markup=None, text=None, sub=False):
-            lbl = Gtk.Label()
-            if markup is not None:
-                lbl.set_markup(markup)
-            else:
-                lbl.set_text(text or '')
-            if sub:
-                lbl.get_style_context().add_class('subtitle')
-            lbl.set_halign(Gtk.Align.START)
-            lbl.set_xalign(0)
-            lbl.set_line_wrap(True)
-            lbl.show()
-            self._hop_rows.pack_start(lbl, False, False, 0)
-
-        since = self.app.store.hop_tracking_since()
-        sub = ("From claudehop. The live login updates every poll; the others "
-               "show their newest reading, taken by claudehop or by this widget "
-               "while they were live.")
-        if since is not None:
-            sub += (f" Tokens are split by account since "
-                    f"{since.astimezone():%d %b %H:%M}; pick one in the account "
-                    "filter above.")
-        self._hop_sub.set_text(sub)
-
-        muted = COLORS['muted']
-        for p in sorted(hs.profiles, key=lambda q: (q.name != hs.active, q.name)):
-            usage, tag = claudehop.usage_text(readings.get(p.name), now)
-            on = p.name == hs.active and not hs.provider
-            dot = COLORS['green'] if on else muted
-            who = html.escape(p.email or '') + (
-                f" · {html.escape(p.plan)}" if p.plan else '')
-            n_run = runs.get(p.name, 0)
-            if n_run:
-                who += (f" · open in {n_run} <tt>hop run</tt> terminal"
-                        + ("s" if n_run != 1 else ""))
-            line(markup=f'<span foreground="{dot}">●</span>  <b>{html.escape(p.name)}</b>'
-                        f'  <span foreground="{muted}">{who}</span>')
-            extra = (" · login idle while a provider is on"
-                     if (p.name == hs.active and hs.provider) else "")
-            note = notes.get(p.name) if fresh_notes else None
-            if note:
-                extra += f" · claudehop at {read_at.astimezone():%H:%M}: {note}"
-            line(text=f"      {usage}" + (f" · {tag}" if tag else "") + extra, sub=True)
-        for prov in hs.providers:
-            on = prov == hs.provider
-            dot = COLORS['green'] if on else muted
-            line(markup=f'<span foreground="{dot}">●</span>  <b>{html.escape(prov.capitalize())}</b>'
-                        f'  <span foreground="{muted}">{"on" if on else "off"}</span>')
-            if prov == BEDROCK_ACCOUNT_LABEL:
-                t = self.app.store.totals(since=now - timedelta(days=7),
-                                          account=BEDROCK_ACCOUNT_LABEL)
-                n = t.get('messages', 0) or 0
-                detail = (f"{n:,} messages · {fmt_cost(t.get('cost_usd', 0) or 0)} "
-                          f"(list-price estimate)" if n else "no usage yet")
-                line(text=f"      last 7 days: {detail}", sub=True)
-
-        pick = claudehop.most_room(readings, names, hs.active, now)
-        if pick is not None:
-            head = ("Next (hop next would pick)" if pick.listed
-                    else "Most 5-hour room")
-            body = (f"<b>{html.escape(pick.name)}</b> · {html.escape(pick.why)}"
-                    if pick.name else html.escape(pick.why))
-            line(markup=f'<span foreground="{COLORS["accent"]}">➜</span>  '
-                        f'{head}: {body}')
-
-        if self.app._hop_reading_all:
-            self._hop_read_btn.set_label('Reading…')
-            self._hop_read_btn.set_sensitive(False)
-        else:
-            self._hop_read_btn.set_label('Read all accounts')
-            self._hop_read_btn.set_sensitive(True)
-        if result is not None and fresh_notes:
-            when = f"{read_at.astimezone():%H:%M}"
-            if result.status == 'done':
-                ok = sum(1 for n in names if not notes.get(n))
-                line(text=f"Read all accounts at {when}: {ok} of {len(names)} "
-                          "answered.", sub=True)
-            else:
-                color = COLORS['red'] if result.status == 'error' else COLORS['yellow']
-                line(markup=f'<span foreground="{color}">'
-                            f'{html.escape(f"{when}: {result.message}")}</span>',
-                     sub=True)
-        self._hop_card.set_visible(True)
+            f'<span foreground="{COLORS["ok"]}">●</span>  '
+            f'<b>{html.escape(head)}</b>'
+            f'<span foreground="{COLORS["muted"]}">{html.escape(tail)}</span>')
+        self._hop_badge_box.set_tooltip_text(tip)
+        self._hop_badge_box.set_visible(True)
 
     def _populate_account_combo(self):
         """(Re)build the account-filter combobox items from current accounts.
@@ -1107,6 +803,7 @@ class TrackerWindow(Gtk.Window):
             'budgets':    'Budgets',
             'settings':   'Settings',
         }.get(view_id, 'Token Tracker'))
+        self._header_sub.set_text(self.PAGE_SUBTITLES.get(view_id, ''))
 
         if view_id == 'dashboard':    self._update_dashboard()
         elif view_id == 'projects':   self._update_projects_view()
@@ -1125,73 +822,366 @@ class TrackerWindow(Gtk.Window):
         return cutoff_or_none(period)
 
     # ── Dashboard ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _bezel(child: Gtk.Widget) -> Gtk.Widget:
+        """A panel: a cream shell with a hairline holding a brighter core."""
+        shell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        shell.get_style_context().add_class('shell')
+        core = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        core.get_style_context().add_class('core')
+        core.pack_start(child, True, True, 0)
+        shell.pack_start(core, True, True, 0)
+        return shell
+
+    @staticmethod
+    def _label(text: str = '', cls: Optional[str] = None, xalign: float = 0,
+               wrap: bool = False, ellipsize: bool = False) -> Gtk.Label:
+        lbl = Gtk.Label(label=text, xalign=xalign)
+        if cls:
+            for c in cls.split():
+                lbl.get_style_context().add_class(c)
+        if wrap:
+            lbl.set_line_wrap(True)
+            lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        if ellipsize:
+            lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        return lbl
+
+    def _panel_head(self, title: str, sub: Optional[str] = None) -> tuple:
+        """(row, title label, sub label, right-hand box) for a panel header."""
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        t = self._label(title, 'panel-title')
+        texts.pack_start(t, False, False, 0)
+        s = self._label(sub or '', 'subtitle', wrap=True)
+        texts.pack_start(s, False, False, 0)
+        row.pack_start(texts, True, True, 0)
+        right = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        right.set_valign(Gtk.Align.START)
+        row.pack_end(right, False, False, 0)
+        return row, t, s, right
+
     def _build_dashboard_view(self) -> Gtk.Widget:
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        c = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        c.set_margin_top(10); c.set_margin_bottom(30)
+        c.set_margin_start(32); c.set_margin_end(32)
 
-        c = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        c.set_margin_top(24); c.set_margin_bottom(24)
-        c.set_margin_start(24); c.set_margin_end(24)
-        scrolled.add(c)
+        # ── Row 1: plan rings + the current session ────────────────────────
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
+        top.pack_start(self._build_plan_panel(), True, True, 0)
+        session = self._build_session_panel()
+        session.set_size_request(300, -1)
+        top.pack_start(session, False, False, 0)
+        c.pack_start(top, False, False, 0)
 
-        # Period selector
-        scope = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        h = Gtk.Label(label="Period")
-        # Styled via the .subtitle CSS class (not inline markup) so it
-        # picks up the live palette automatically when the global CSS
-        # provider is swapped on a theme switch — no manual retint needed.
-        h.get_style_context().add_class('subtitle')
-        scope.pack_start(h, False, False, 0)
+        # ── Row 2: totals for the chosen period ────────────────────────────
+        c.pack_start(self._build_totals_panel(), False, False, 0)
+
+        # ── Row 3: daily usage chart ───────────────────────────────────────
+        c.pack_start(self._build_chart_panel(), False, False, 0)
+
+        # ── Row 4: claudehop accounts ──────────────────────────────────────
+        # Shown by _update_hop_card only while claudehop is in use.
+        self._hop_card = self._build_accounts_panel()
+        c.pack_start(self._hop_card, False, False, 0)
+
+        # ── Row 5: top projects and models ─────────────────────────────────
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
+        bottom.set_homogeneous(True)
+        for key, title in (('projects', 'Top projects'), ('models', 'Top models')):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+            head, _t, sub, _r = self._panel_head(title)
+            box.pack_start(head, False, False, 0)
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            box.pack_start(content, False, False, 0)
+            setattr(self, f'_dashboard_{key}_subtitle', sub)
+            setattr(self, f'_dashboard_{key}_content', content)
+            bottom.pack_start(self._bezel(box), True, True, 0)
+        c.pack_start(bottom, False, False, 0)
+        return c
+
+    # Plan panel ------------------------------------------------------------
+    def _build_plan_panel(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self._plan_eyebrow = self._label('Plan limits', 'eyebrow')
+        self._plan_title = self._label('Claude', 'panel-title', ellipsize=True)
+        texts.pack_start(self._plan_eyebrow, False, False, 0)
+        texts.pack_start(self._plan_title, False, False, 0)
+        head.pack_start(texts, True, True, 0)
+        self._plan_tag = self._label('', 'tag')
+        self._plan_tag.set_valign(Gtk.Align.START)
+        head.pack_end(self._plan_tag, False, False, 0)
+        box.pack_start(head, False, False, 0)
+
+        # Equal columns: the two rings, plus a third for any one-model weekly
+        # caps when the plan has them (hidden columns take no share).
+        rings = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=24)
+        rings.set_homogeneous(True)
+        rings.set_margin_top(4)
+        self._plan_rings = {}
+        for key, name in (('5h', '5-hour window'), ('week', '7-day window')):
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            ring = ui.Ring(diameter=152, caption='used')
+            ring.set_halign(Gtk.Align.CENTER)
+            col.pack_start(ring, False, False, 0)
+            lab = self._label(name, 'ring-label', xalign=0.5)
+            lab.set_margin_top(6)
+            sub = self._label('', 'ring-sub', xalign=0.5)
+            col.pack_start(lab, False, False, 0)
+            col.pack_start(sub, False, False, 0)
+            rings.pack_start(col, False, False, 0)
+            self._plan_rings[key] = (ring, lab, sub)
+        # Other weekly meters (a separate cap for one model) beside the rings.
+        self._plan_models = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self._plan_models.set_valign(Gtk.Align.CENTER)
+        self._plan_models.set_no_show_all(True)
+        rings.pack_start(self._plan_models, True, True, 0)
+        box.pack_start(rings, False, False, 0)
+
+        self._plan_notice = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self._plan_notice.get_style_context().add_class('notice')
+        self._plan_notice_lbl = self._label('', wrap=True)
+        self._plan_notice.pack_start(self._plan_notice_lbl, True, True, 0)
+        self._plan_notice_btn = Gtk.Button()
+        self._plan_notice_btn.set_valign(Gtk.Align.CENTER)
+        self._plan_notice_btn.connect('clicked', self._on_plan_notice_action)
+        self._plan_notice.pack_end(self._plan_notice_btn, False, False, 0)
+        self._plan_notice.set_no_show_all(True)
+        self._plan_notice_lbl.show()
+        box.pack_start(self._plan_notice, False, False, 0)
+
+        self._plan_foot = self._label('', 'stat-sub')
+        box.pack_start(self._plan_foot, False, False, 0)
+        self._plan_action = None
+        return self._bezel(box)
+
+    def _on_plan_notice_action(self, _btn):
+        if self._plan_action == 'token':
+            self.app._on_set_token()
+        elif self._plan_action == 'read':
+            self.app.read_all_hop()
+        else:
+            self.app._refresh_cloud()
+
+    def _set_notice(self, text: Optional[str], kind: str = '',
+                    action: Optional[str] = None, label: str = ''):
+        ctx = self._plan_notice.get_style_context()
+        for k in ('notice-warn', 'notice-danger'):
+            ctx.remove_class(k)
+        if not text:
+            self._plan_notice.hide()
+            return
+        if kind:
+            ctx.add_class(f'notice-{kind}')
+        self._plan_notice_lbl.set_text(text)
+        self._plan_action = action
+        if label:
+            self._plan_notice_btn.set_label(label)
+            self._plan_notice_btn.get_style_context().add_class('btn-secondary')
+            self._plan_notice_btn.show()
+        else:
+            self._plan_notice_btn.hide()
+        self._plan_notice.show()
+
+    def _set_tag(self, text: str, kind: str = ''):
+        ctx = self._plan_tag.get_style_context()
+        for k in ('tag-ok', 'tag-warn', 'tag-danger', 'tag-muted'):
+            ctx.remove_class(k)
+        if kind:
+            ctx.add_class(f'tag-{kind}')
+        self._plan_tag.set_text(text)
+        self._plan_tag.set_visible(bool(text))
+
+    @staticmethod
+    def _reset_text(iso: Optional[str], weekly: bool = False) -> str:
+        if not iso:
+            return "Window not started"
+        left = fmt_reset_countdown(iso)
+        if left in ('—', '', 'now'):
+            return "Resetting now"
+        try:
+            at = datetime.fromisoformat(iso.replace('Z', '+00:00')).astimezone()
+        except ValueError:
+            return f"Resets in {left}"
+        when = at.strftime('%a %H:%M' if weekly else '%H:%M')
+        return f"Resets in {left} · {when}"
+
+    def _set_rings(self, five: Optional[float], r5: Optional[str],
+                   week: Optional[float], r7: Optional[str], scope: Optional[str],
+                   dimmed: bool = False, models: Optional[list] = None,
+                   was5: Optional[float] = None, was7: Optional[float] = None):
+        ring, lab, sub = self._plan_rings['5h']
+        ring.set_value(five, dimmed=dimmed)
+        sub.set_text(f"Reset since, was {was5:.0f}%" if was5
+                     else (self._reset_text(r5) if five is not None else "No reading"))
+        ring, lab, sub = self._plan_rings['week']
+        ring.set_value(week, dimmed=dimmed)
+        lab.set_text("7-day window" + (f" · {scope}" if scope else ""))
+        if week is None:
+            sub.set_text("No weekly limit reported")
+        else:
+            sub.set_text(f"Reset since, was {was7:.0f}%" if was7
+                         else self._reset_text(r7, weekly=True))
+        for child in self._plan_models.get_children():
+            self._plan_models.remove(child)
+        models = models or []
+        for m in models[:4]:
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            top.pack_start(self._label(f"{m['model']} weekly", 'eyebrow-strong'), True, True, 0)
+            top.pack_end(self._label(f"{m['pct']}%", 'bar-value'), False, False, 0)
+            row.pack_start(top, False, False, 0)
+            meter = ui.Meter(height=6)
+            meter.set_value(m['pct'])
+            row.pack_start(meter, False, False, 0)
+            row.pack_start(self._label(self._reset_text(m.get('resets_at'), True),
+                                       'stat-sub'), False, False, 0)
+            row.set_tooltip_text("The model you are using now" if m.get('is_active') else None)
+            self._plan_models.pack_start(row, False, False, 0)
+            row.show_all()
+        self._plan_models.set_visible(bool(models))
+
+    # Session panel ---------------------------------------------------------
+    def _build_session_panel(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.pack_start(self._label('Current session', 'eyebrow'), False, False, 0)
+        fig = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._sess_left = self._label('—', 'figure')
+        fig.pack_start(self._sess_left, False, False, 0)
+        self._sess_unit = self._label('left', 'figure-unit')
+        self._sess_unit.set_valign(Gtk.Align.END)
+        self._sess_unit.set_margin_bottom(9)
+        fig.pack_start(self._sess_unit, False, False, 0)
+        box.pack_start(fig, False, False, 0)
+        self._block_window_lbl = self._label('No session open', 'subtitle', ellipsize=True)
+        box.pack_start(self._block_window_lbl, False, False, 0)
+        self._sess_meter = ui.Meter(height=8, color='accent')
+        self._sess_meter.set_margin_top(4)
+        box.pack_start(self._sess_meter, False, False, 0)
+        grid = Gtk.Grid()
+        grid.set_column_spacing(18); grid.set_row_spacing(14)
+        grid.set_column_homogeneous(True)
+        grid.set_margin_top(12)
+        self._sess_stats = {}
+        for i, (key, label) in enumerate((('tokens', 'Tokens'), ('cost', 'API equivalent'),
+                                          ('burn', 'Burn rate'), ('eta', 'Limit at this pace'))):
+            cell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            cell.pack_start(self._label(label, 'stat-label'), False, False, 0)
+            v = self._label('—', 'stat-value-sm')
+            cell.pack_start(v, False, False, 0)
+            grid.attach(cell, i % 2, i // 2, 1, 1)
+            self._sess_stats[key] = v
+        box.pack_start(grid, False, False, 0)
+        return self._bezel(box)
+
+    # Totals panel ----------------------------------------------------------
+    def _build_totals_panel(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        head, _t, self._dashboard_scope_label, right = self._panel_head('Totals')
         self._dashboard_period_combo = Gtk.ComboBoxText()
         for k in ('all', 'today', '7d', '30d'):
             self._dashboard_period_combo.append(k, PERIOD_LABELS[k])
         self._dashboard_period_combo.set_active_id(self._dashboard_period)
         self._dashboard_period_combo.connect(
             'changed', lambda combo: (
-                setattr(self, '_dashboard_period',
-                        combo.get_active_id() or 'all'),
+                setattr(self, '_dashboard_period', combo.get_active_id() or 'all'),
                 self._update_dashboard()))
-        scope.pack_start(self._dashboard_period_combo, False, False, 0)
-        self._dashboard_scope_label = Gtk.Label()
-        self._dashboard_scope_label.set_halign(Gtk.Align.START)
-        self._dashboard_scope_label.set_hexpand(True)
-        self._dashboard_scope_label.set_ellipsize(Pango.EllipsizeMode.END)
-        scope.pack_start(self._dashboard_scope_label, True, True, 0)
-        c.pack_start(scope, False, False, 0)
+        right.pack_start(self._dashboard_period_combo, False, False, 0)
+        box.pack_start(head, False, False, 0)
 
-        # ── Plan limits (was its own tab) ───────────────────────────────────
-        self._cloud_status_card = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self._cloud_status_card.get_style_context().add_class('card')
-        self._cloud_status_card.set_margin_top(16)
-        c.pack_start(self._cloud_status_card, False, False, 0)
+        strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self._summary_cards = {}
+        cells = (('total', 'Total tokens'), ('input', 'Fresh input'),
+                 ('cache', 'Cache'), ('output', 'Output'), ('cost', 'API equivalent'))
+        for i, (key, label) in enumerate(cells):
+            if i:
+                sep = Gtk.Box()
+                sep.get_style_context().add_class('divider-v')
+                sep.set_margin_start(20); sep.set_margin_end(20)
+                strip.pack_start(sep, False, False, 0)
+            cell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            cell.pack_start(self._label(label, 'stat-label'), False, False, 0)
+            val = self._label('0', 'stat-value')
+            cell.pack_start(val, False, False, 0)
+            sub = self._label('', 'stat-sub', ellipsize=True)
+            cell.pack_start(sub, False, False, 0)
+            strip.pack_start(cell, True, True, 0)
+            self._summary_cards[key] = (val, sub)
+        self._summary_cards_cost_cell = cell
+        cell.set_tooltip_text(
+            "What these tokens would cost on the pay-as-you-go API. On a Pro, "
+            "Max or Team plan you pay a flat fee; this is the API-equivalent "
+            "value, not your bill.")
+        box.pack_start(strip, False, False, 0)
+        return self._bezel(box)
 
-        self._cloud_usage_box = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        self._cloud_usage_box.set_margin_top(12)
-        self._cloud_usage_box.set_homogeneous(True)
-        self._usage_5h = UsageBar("5-Hour Window", 0.0)
-        self._cloud_usage_box.pack_start(self._usage_5h, True, True, 0)
-        self._usage_7d = UsageBar("7-Day Window", 0.0)
-        self._cloud_usage_box.pack_start(self._usage_7d, True, True, 0)
-        # Per-model weekly caps get their own bars, created on demand as the
-        # API reports them (keyed by display name).
-        self._usage_model_bars: Dict[str, UsageBar] = {}
-        c.pack_start(self._cloud_usage_box, False, False, 0)
+    # Chart panel -----------------------------------------------------------
+    def _build_chart_panel(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        head, self._chart_title, self._chart_sub, right = self._panel_head(
+            'Daily usage', 'Last 30 days. Point at a day for its figures.')
+        seg = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        seg.get_style_context().add_class('segmented')
+        self._chart_key = 'total_tokens'
+        self._chart_btns = {}
+        group = None
+        for key, label in (('total_tokens', 'Tokens'), ('cost_usd', 'Cost')):
+            b = Gtk.RadioButton.new_with_label_from_widget(group, label)
+            b.set_mode(False)
+            group = group or b
+            b.connect('toggled', self._on_chart_key, key)
+            seg.pack_start(b, False, False, 0)
+            self._chart_btns[key] = b
+        right.pack_start(seg, False, False, 0)
+        box.pack_start(head, False, False, 0)
 
-        # ── Accounts (from claudehop) ───────────────────────────────────────
-        # Header and button are built once; only the rows are rebuilt on each
-        # refresh, so a click on the button is never lost to a rebuild.
-        self._hop_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self._hop_card.get_style_context().add_class('card')
-        self._hop_card.set_margin_top(12)
-        self._hop_card.set_no_show_all(True)
-        hop_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        ht = Gtk.Label(label='Accounts')
-        ht.get_style_context().add_class('card-title')
-        ht.set_halign(Gtk.Align.START)
-        hop_head.pack_start(ht, False, False, 0)
-        hop_head.pack_start(Gtk.Box(), True, True, 0)
+        def tip(row: dict) -> str:
+            day = row.get('day') or ''
+            try:
+                day = datetime.fromisoformat(day).strftime('%A %-d %B')
+            except ValueError:
+                pass
+            return (f"<b>{html.escape(day)}</b>\n"
+                    f"{fmt(int(row.get('total_tokens') or 0))} tokens · "
+                    f"{fmt_cost(row.get('cost_usd') or 0)}\n"
+                    f"{int(row.get('messages') or 0):,} messages")
+        self._chart = ui.DailyBars(height=200, fmt_value=fmt, tooltip=tip)
+        box.pack_start(self._chart, False, False, 0)
+        return self._bezel(box)
+
+    def _on_chart_key(self, btn, key):
+        if btn.get_active():
+            self._chart_key = key
+            self._chart.fmt_value = fmt_cost if key == 'cost_usd' else (lambda v: fmt(int(v)))
+            self._update_chart()
+
+    def _update_chart(self):
+        acc = self._account_filter
+        rows = {r['day']: r for r in self.app.store.daily_series(days=30, account=acc)}
+        today = datetime.now().date()
+        series = []
+        for i in range(29, -1, -1):
+            d = (today - timedelta(days=i)).isoformat()
+            series.append(rows.get(d) or {'day': d, 'total_tokens': 0,
+                                          'cost_usd': 0.0, 'messages': 0})
+        self._chart.set_rows(series, self._chart_key)
+        total = sum(float(r.get(self._chart_key) or 0) for r in series)
+        busiest = max(series, key=lambda r: float(r.get(self._chart_key) or 0))
+        if total > 0:
+            val = (fmt_cost(total) if self._chart_key == 'cost_usd'
+                   else f"{fmt(int(total))} tokens")
+            self._chart_sub.set_text(
+                f"Last 30 days: {val}. Busiest day {ui._short_day(busiest['day'])}. "
+                "Point at a day for its figures.")
+        else:
+            self._chart_sub.set_text("Last 30 days. Nothing recorded yet.")
+
+    # Accounts panel (claudehop) ---------------------------------------------
+    def _build_accounts_panel(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        head, _t, self._hop_sub, right = self._panel_head('Accounts')
         self._hop_read_btn = Gtk.Button(label='Read all accounts')
         self._hop_read_btn.get_style_context().add_class('btn-secondary')
         self._hop_read_btn.set_tooltip_text(
@@ -1200,147 +1190,215 @@ class TrackerWindow(Gtk.Window):
             "spends a little of the usage endpoint's allowance, so it only "
             "runs when you press this.")
         self._hop_read_btn.connect('clicked', lambda _b: self.app.read_all_hop())
-        hop_head.pack_end(self._hop_read_btn, False, False, 0)
-        hop_head.show_all()
-        self._hop_card.pack_start(hop_head, False, False, 0)
-        self._hop_sub = Gtk.Label()
-        self._hop_sub.get_style_context().add_class('subtitle')
-        self._hop_sub.set_halign(Gtk.Align.START)
-        self._hop_sub.set_xalign(0)
-        self._hop_sub.set_line_wrap(True)
-        self._hop_sub.show()
-        self._hop_card.pack_start(self._hop_sub, False, False, 0)
-        self._hop_rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self._hop_rows.show()
-        self._hop_card.pack_start(self._hop_rows, False, False, 0)
-        c.pack_start(self._hop_card, False, False, 0)
+        right.pack_start(self._hop_read_btn, False, False, 0)
+        box.pack_start(head, False, False, 0)
 
-        # Summary cards
-        cards = Gtk.FlowBox()
-        cards.set_selection_mode(Gtk.SelectionMode.NONE)
-        cards.set_column_spacing(16); cards.set_row_spacing(16)
-        cards.set_margin_top(16); cards.set_homogeneous(True)
-        cards.set_max_children_per_line(5); cards.set_min_children_per_line(2)
-        self._summary_cards = {
-            'total':  SummaryCard("Total Tokens", "0", "", COLORS['accent'],
-                                  color_key='accent'),
-            'input':  SummaryCard("Input Tokens", "0", "", COLORS['blue'],
-                                  color_key='blue'),
-            'cache':  SummaryCard("Cache Tokens", "0", "", COLORS['orange'],
-                                  color_key='orange'),
-            'output': SummaryCard("Output Tokens", "0", "", COLORS['green'],
-                                  color_key='green'),
-            'cost':   SummaryCard("API Equivalent", "$0.00", "",
-                                  COLORS['yellow'], color_key='yellow'),
-        }
-        self._summary_cards['cost'].set_tooltip_text(
-            "What these tokens would cost on the pay-as-you-go API.\n"
-            "If you're on Pro/Max/Team, you pay a flat fee — this is the\n"
-            "API-equivalent value, not your actual bill."
-        )
-        for card in self._summary_cards.values():
-            cards.add(card)
-        c.pack_start(cards, False, False, 0)
+        self._hop_next = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self._hop_next.get_style_context().add_class('callout')
+        arrow = ui.NavIcon('arrow', 16)
+        arrow.get_style_context().add_class('nav-icon')
+        self._hop_next.pack_start(arrow, False, False, 0)
+        self._hop_next_lbl = self._label('', wrap=True)
+        self._hop_next.pack_start(self._hop_next_lbl, True, True, 0)
+        self._hop_next.set_no_show_all(True)
+        arrow.show(); self._hop_next_lbl.show()
+        box.pack_start(self._hop_next, False, False, 0)
 
-        # Active block / forecast card
-        block_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        block_box.get_style_context().add_class('card')
-        block_box.set_margin_top(16)
-        bt = Gtk.Label(label="Current 5h Block")
-        bt.get_style_context().add_class('card-title')
-        bt.set_halign(Gtk.Align.START)
-        block_box.pack_start(bt, False, False, 0)
-        self._block_window_lbl = Gtk.Label()
-        self._block_window_lbl.set_halign(Gtk.Align.START)
-        self._block_window_lbl.get_style_context().add_class('subtitle')
-        block_box.pack_start(self._block_window_lbl, False, False, 0)
+        self._hop_tiles = Gtk.FlowBox()
+        self._hop_tiles.set_selection_mode(Gtk.SelectionMode.NONE)
+        self._hop_tiles.set_homogeneous(True)
+        self._hop_tiles.set_min_children_per_line(2)
+        self._hop_tiles.set_max_children_per_line(4)
+        self._hop_tiles.set_column_spacing(10)
+        self._hop_tiles.set_row_spacing(10)
+        box.pack_start(self._hop_tiles, False, False, 0)
+        self._hop_tile_widgets: Dict[str, dict] = {}
+        self._hop_tile_names: tuple = ()
 
-        block_grid = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=24)
-        block_grid.set_margin_top(8)
-        self._block_remaining = self._mini_stat("Remaining", "—",
-                                                COLORS['accent'])
-        self._block_tokens = self._mini_stat("Tokens", "0", COLORS['blue'])
-        self._block_cost = self._mini_stat("Cost", "$0.00", COLORS['yellow'])
-        self._block_burn = self._mini_stat("Burn", "—/min", COLORS['orange'])
-        self._block_eta = self._mini_stat("ETA to limit", "—", COLORS['red'])
-        for w in (self._block_remaining, self._block_tokens, self._block_cost,
-                  self._block_burn, self._block_eta):
-            block_grid.pack_start(w, False, False, 0)
-        block_box.pack_start(block_grid, False, False, 0)
-        c.pack_start(block_box, False, False, 0)
+        self._hop_status = self._label('', 'stat-sub', wrap=True)
+        box.pack_start(self._hop_status, False, False, 0)
+        return self._bezel(box)
 
-        # Bottom: top projects + top models
-        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=24)
-        bottom.set_margin_top(24)
-        c.pack_start(bottom, True, True, 0)
+    def _make_hop_tile(self, name: str) -> dict:
+        tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
+        tile.get_style_context().add_class('tile')
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        dot = self._label('●', 'dot-idle')
+        top.pack_start(dot, False, False, 0)
+        nm = self._label(name, 'tile-name', ellipsize=True)
+        top.pack_start(nm, True, True, 0)
+        tag = self._label('', 'tag')
+        top.pack_end(tag, False, False, 0)
+        tile.pack_start(top, False, False, 0)
+        who = self._label('', 'tile-sub', ellipsize=True)
+        tile.pack_start(who, False, False, 0)
+        meters = {}
+        for key, short in (('5h', '5h'), ('week', '7d')):
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            lab = self._label(short, 'tile-sub')
+            lab.set_size_request(18, -1)
+            row.pack_start(lab, False, False, 0)
+            m = ui.Meter(height=5)
+            row.pack_start(m, True, True, 0)
+            num = self._label('—', 'tile-num', xalign=1)
+            num.set_size_request(40, -1)
+            row.pack_end(num, False, False, 0)
+            tile.pack_start(row, False, False, 0)
+            meters[key] = (m, num, lab)
+        fresh = self._label('', 'tile-sub', ellipsize=True)
+        tile.pack_start(fresh, False, False, 0)
+        child = Gtk.FlowBoxChild()
+        child.add(tile)
+        child.show_all()
+        return {'child': child, 'tile': tile, 'dot': dot, 'tag': tag, 'who': who,
+                'meters': meters, 'fresh': fresh}
 
-        # Projects
-        pbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        pbox.get_style_context().add_class('card')
-        pbox.set_hexpand(True)
-        pt = Gtk.Label(label="Top Projects")
-        pt.get_style_context().add_class('card-title')
-        pt.set_halign(Gtk.Align.START)
-        pbox.pack_start(pt, False, False, 0)
-        self._dashboard_projects_subtitle = Gtk.Label()
-        self._dashboard_projects_subtitle.get_style_context().add_class('subtitle')
-        self._dashboard_projects_subtitle.set_halign(Gtk.Align.START)
-        pbox.pack_start(self._dashboard_projects_subtitle, False, False, 0)
-        self._dashboard_projects_content = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        pbox.pack_start(self._dashboard_projects_content, True, True, 0)
-        bottom.pack_start(pbox, True, True, 0)
+    def _fill_hop_tile(self, w: dict, *, live: bool, email: str, plan: str,
+                       reading, usage: str, fresh: str, runs: int, note: str,
+                       now: datetime):
+        ctx = w['tile'].get_style_context()
+        (ctx.add_class if live else ctx.remove_class)('live')
+        dctx = w['dot'].get_style_context()
+        dctx.remove_class('dot-live'); dctx.remove_class('dot-idle')
+        dctx.add_class('dot-live' if live else 'dot-idle')
+        tctx = w['tag'].get_style_context()
+        for k in ('tag-ok', 'tag-muted'):
+            tctx.remove_class(k)
+        if live:
+            w['tag'].set_text('live'); tctx.add_class('tag-ok')
+        elif runs:
+            w['tag'].set_text(f"{runs} hop run"); tctx.add_class('tag-muted')
+        else:
+            w['tag'].set_text('')
+        w['tag'].set_visible(bool(w['tag'].get_text()))
+        w['who'].set_text(" · ".join(x for x in (email, plan.capitalize() if plan else '') if x))
+        p5 = p7 = None
+        scope = None
+        if reading is not None and reading.has_figures:
+            p5, _l5, _w5 = claudehop.window_now(reading.pct5, reading.resets_5h, now)
+            p7, _l7, _w7 = claudehop.window_now(reading.pct7, reading.resets_7d, now)
+            scope = reading.week_scope
+        for key, val in (('5h', p5), ('week', p7)):
+            m, num, lab = w['meters'][key]
+            m.set_value(val)
+            num.set_text('—' if val is None else f"{val:.0f}%")
+        w['meters']['week'][2].set_text('7d')
+        w['meters']['week'][2].set_tooltip_text(f"Weekly meter for {scope}" if scope else "7-day window")
+        line = fresh + (f" · {note}" if note else "")
+        w['fresh'].set_text(line)
+        w['tile'].set_tooltip_text(f"{usage}\n{line}".strip())
 
-        # Models
-        mbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        mbox.get_style_context().add_class('card')
-        mbox.set_hexpand(True)
-        mt = Gtk.Label(label="Top Models")
-        mt.get_style_context().add_class('card-title')
-        mt.set_halign(Gtk.Align.START)
-        mbox.pack_start(mt, False, False, 0)
-        self._dashboard_models_subtitle = Gtk.Label()
-        self._dashboard_models_subtitle.get_style_context().add_class('subtitle')
-        self._dashboard_models_subtitle.set_halign(Gtk.Align.START)
-        mbox.pack_start(self._dashboard_models_subtitle, False, False, 0)
-        self._dashboard_models_content = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        mbox.pack_start(self._dashboard_models_content, True, True, 0)
-        bottom.pack_start(mbox, True, True, 0)
+    def _update_hop_card(self):
+        """The Accounts panel: one tile per claudehop account with its newest
+        5-hour and weekly reading, any `hop run` terminals on it, and the login
+        with the most room. Hidden when claudehop is not in use."""
+        live = self.app._primary_state()
+        try:
+            hs = claudehop.load_state(live.token)
+        except Exception:
+            hs = None
+        if hs is None or not (hs.profiles or hs.providers):
+            self._hop_card.set_visible(False)
+            return
+        now = datetime.now(timezone.utc)
+        names = [p.name for p in hs.profiles]
+        readings = self.app.hop_readings(hs)
+        runs = claudehop.run_terminals()
+        read_at, result = self.app._hop_read_result or (None, None)
+        fresh_notes = read_at is not None and now - read_at < timedelta(minutes=30)
+        notes = result.notes if result is not None else {}
 
-        return scrolled
+        since = self.app.store.hop_tracking_since()
+        sub = ("The live login updates every poll; the others show their newest "
+               "reading, from claudehop or from the last time they were live.")
+        if since is not None:
+            sub += f" Tokens are split by account since {since.astimezone():%-d %b %H:%M}."
+        self._hop_sub.set_text(sub)
 
-    def _mini_stat(self, title: str, value: str, color: str) -> Gtk.Box:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        t = Gtk.Label(label=title)
-        t.get_style_context().add_class('subtitle')
-        t.set_halign(Gtk.Align.START)
-        box.pack_start(t, False, False, 0)
-        v = Gtk.Label()
-        v.set_markup(
-            f'<span foreground="{color}" font_weight="bold" '
-            f'font_size="14pt">{html.escape(value)}</span>'
-        )
-        v.set_halign(Gtk.Align.START)
-        box.pack_start(v, False, False, 0)
-        box._value_lbl = v  # type: ignore[attr-defined]
-        box._color = color  # type: ignore[attr-defined]
-        return box
+        order = sorted(hs.profiles, key=lambda q: (q.name != hs.active, q.name))
+        keys = tuple(p.name for p in order) + tuple(f'provider:{n}' for n in hs.providers)
+        if keys != self._hop_tile_names:
+            for child in self._hop_tiles.get_children():
+                self._hop_tiles.remove(child)
+            self._hop_tile_widgets = {}
+            for k in keys:
+                label = k.split(':', 1)[1].capitalize() if k.startswith('provider:') else k
+                w = self._make_hop_tile(label)
+                self._hop_tile_widgets[k] = w
+                self._hop_tiles.add(w['child'])
+            self._hop_tile_names = keys
 
-    @staticmethod
-    def _set_mini(box: Gtk.Box, value: str, color: Optional[str] = None):
-        c = color or box._color  # type: ignore[attr-defined]
-        box._value_lbl.set_markup(  # type: ignore[attr-defined]
-            f'<span foreground="{c}" font_weight="bold" '
-            f'font_size="14pt">{html.escape(value)}</span>'
-        )
+        for p in order:
+            w = self._hop_tile_widgets[p.name]
+            r = readings.get(p.name)
+            usage, fresh = claudehop.usage_text(r, now)
+            on = p.name == hs.active and not hs.provider
+            note = notes.get(p.name) if fresh_notes else ''
+            if fresh == 'live':
+                fresh = "polled by this widget"
+            self._fill_hop_tile(w, live=on, email=p.email or '', plan=p.plan or '',
+                                reading=r, usage=usage, fresh=fresh,
+                                runs=runs.get(p.name, 0), note=note or '', now=now)
+            if p.name == hs.active and hs.provider:
+                w['fresh'].set_text("login idle while a provider is on")
+        for prov in hs.providers:
+            w = self._hop_tile_widgets[f'provider:{prov}']
+            on = prov == hs.provider
+            detail = ''
+            if prov == BEDROCK_ACCOUNT_LABEL:
+                t = self.app.store.totals(since=now - timedelta(days=7),
+                                          account=BEDROCK_ACCOUNT_LABEL)
+                n = t.get('messages', 0) or 0
+                detail = (f"7 days: {n:,} messages, {fmt_cost(t.get('cost_usd', 0) or 0)}"
+                          if n else "no usage in 7 days")
+            self._fill_hop_tile(w, live=on, email='Provider', plan='',
+                                reading=None, usage='Billed per token',
+                                fresh=detail or ('on' if on else 'off'), runs=0,
+                                note='', now=now)
+            for m, num, lab in w['meters'].values():
+                m.get_parent().hide()
 
+        pick = claudehop.most_room(readings, names, hs.active, now)
+        if pick is not None:
+            head = "Next, as hop next would pick" if pick.listed else "Most 5-hour room"
+            body = (f"<b>{html.escape(pick.name)}</b>  "
+                    f"<span foreground=\"{COLORS['muted']}\">{html.escape(pick.why)}</span>"
+                    if pick.name else html.escape(pick.why))
+            self._hop_next_lbl.set_markup(f"{head}: {body}")
+            self._hop_next.show()
+        else:
+            self._hop_next.hide()
+
+        busy = self.app._hop_reading_all
+        self._hop_read_btn.set_label('Reading…' if busy else 'Read all accounts')
+        self._hop_read_btn.set_sensitive(not busy)
+        status = ''
+        if result is not None and fresh_notes:
+            when = f"{read_at.astimezone():%H:%M}"
+            if result.status == 'done':
+                ok = sum(1 for n in names if not notes.get(n))
+                status = f"Read all accounts at {when}: {ok} of {len(names)} answered."
+            else:
+                status = f"{when}: {result.message}"
+        self._hop_status.set_text(status)
+        self._hop_status.set_visible(bool(status))
+        self._hop_card.show_all()
+        self._hop_next.set_visible(pick is not None)
+        self._hop_status.set_visible(bool(status))
+        for k, w in self._hop_tile_widgets.items():
+            w['tag'].set_visible(bool(w['tag'].get_text()))
+            if k.startswith('provider:'):
+                for m, num, lab in w['meters'].values():
+                    m.get_parent().hide()
+
+    # The update ------------------------------------------------------------
     def _update_dashboard(self):
         store = self.app.store
         period = self._dashboard_period
         cutoff = self._cutoff(period)
         acc = self._account_filter
         self._update_cloud_section()
+        self._update_side_gauge()
 
         # Summed in SQL. This method runs on the interface thread every few
         # seconds; reading 160k rows into Python to add up five columns froze
@@ -1353,212 +1411,183 @@ class TrackerWindow(Gtk.Window):
         total_cr = int(agg.get('cache_read') or 0)
         total_output = int(agg.get('output_tokens') or 0)
         total_cost = float(agg.get('cost_usd') or 0)
-        total_cache = total_cc + total_cr
         projects = int(agg.get('projects') or 0)
 
         label = PERIOD_LABELS.get(period, 'All Time')
         rng = range_text(period)
-        self._dashboard_scope_label.set_markup(
-            f'<span foreground="{COLORS["subtext"]}">'
-            f'Showing <b>{html.escape(label)}</b>'
-            + (f' · {html.escape(rng)}' if rng else '')
-            + f' · {projects} project{"s" if projects != 1 else ""}'
-            + f' · {total} message{"s" if total != 1 else ""}'
-            '</span>'
-        )
+        self._dashboard_scope_label.set_text(
+            (f"{rng} · " if rng else "")
+            + f"{projects} project{'s' if projects != 1 else ''} · "
+            f"{total:,} message{'s' if total != 1 else ''}")
 
-        suffix = f"· {label}"
-        self._summary_cards['total'].update(
-            fmt(total_tokens),
-            f"{fmt_full(total_tokens)} across {projects} projects",
-            title=f"Total Tokens {suffix}",
-        )
-        self._summary_cards['input'].update(
-            fmt(total_input), "Fresh prompt tokens (not cached)",
-            title=f"Input Tokens {suffix}",
-        )
-        self._summary_cards['cache'].update(
-            fmt(total_cache),
-            f"create: {fmt(total_cc)} · read: {fmt(total_cr)}",
-            title=f"Cache Tokens {suffix}",
-        )
-        self._summary_cards['output'].update(
-            fmt(total_output), "Generated text",
-            title=f"Output Tokens {suffix}",
-        )
+        def put(key, value, sub):
+            v, s = self._summary_cards[key]
+            v.set_text(value)
+            s.set_text(sub)
+        put('total', fmt(total_tokens), f"{fmt_full(total_tokens)} tokens")
+        put('input', fmt(total_input), "not served from cache")
+        put('cache', fmt(total_cc + total_cr),
+            f"{fmt(total_cc)} written · {fmt(total_cr)} read")
+        put('output', fmt(total_output), "generated")
         plan, flat = subscription_summary(self.app.subscription_info)
-        sub = (f"API equiv. — you're on {plan} (flat fee)"
-               if flat else "API per-token pricing from logs")
-        self._summary_cards['cost'].update(
-            fmt_cost(total_cost), sub,
-            title=f"API Equivalent {suffix}",
-        )
+        put('cost', fmt_cost(total_cost),
+            f"you pay the {plan} flat fee" if flat else "at API prices")
 
         # ── Current session window ──────────────────────────────────────────
         # Anchored on the account's own reset time whenever the cloud has
         # given us one, because the window covers usage from every surface —
         # the browser, the desktop and mobile apps, other machines — and none
-        # of that reaches these logs. Inferring the window from local logs
-        # alone put its end 28 minutes out when measured against the account's
-        # real window.
+        # of that reaches these logs.
         cv = self.app.account_state(acc)
         cloud_5h = None
         resets_5h = cv.last_resets_5h
         hop_name = self._hop_filter()
         hop_r = self._hop_idle_reading(hop_name) if hop_name else None
         if hop_r is not None:
-            # A claudehop account that is not live: its own last reading.
             p5, _, _ = claudehop.window_now(hop_r.pct5, hop_r.resets_5h,
                                             datetime.now(timezone.utc))
             cloud_5h = p5 / 100.0 if p5 is not None else None
             resets_5h = hop_r.resets_5h
+        elif acc == BEDROCK_ACCOUNT_LABEL:
+            resets_5h = None        # Bedrock has no plan window to anchor on
         elif cv.usage_data:
             cloud_5h = normalize_utilization(
-                (cv.usage_data.get('five_hour') or {}).get('utilization', 0)
-            )
+                (cv.usage_data.get('five_hour') or {}).get('utilization', 0))
         session_rows = store.query(
-            since=datetime.now(timezone.utc) - SESSION_LOOKBACK,
-            account=acc)
+            since=datetime.now(timezone.utc) - SESSION_LOOKBACK, account=acc)
         block = active_session(session_rows, resets_5h)
         fc = forecast(block, cloud_5h_pct=cloud_5h)
         if block is not None:
-            source = ("" if block.anchored
-                      else "  ·  estimated from local logs")
+            source = "" if block.anchored else " · estimated from local logs"
             self._block_window_lbl.set_text(
-                f"{block.start.astimezone():%H:%M} → "
-                f"{block.end.astimezone():%H:%M}  "
-                f"· {block.messages} message"
-                f"{'s' if block.messages != 1 else ''}{source}"
-            )
-            self._set_mini(self._block_remaining,
-                           fmt_duration(block.remaining().total_seconds()))
-            self._set_mini(self._block_tokens, fmt(block.total_tokens))
-            self._set_mini(self._block_cost, fmt_cost(block.cost_usd))
-            self._set_mini(self._block_burn,
-                           f"{fmt(int(fc.burn_rate_per_min_tokens))}/min")
-            if fc.eta_to_limit is not None:
-                secs = int(fc.eta_to_limit.total_seconds())
-                if secs <= 0:
-                    self._set_mini(self._block_eta, "at limit",
-                                   USAGE_COLORS['critical'])
-                else:
-                    self._set_mini(self._block_eta,
-                                   fmt_duration(secs),
-                                   get_usage_color(min((cloud_5h or 0)
-                                                       + 0.01, 0.95)))
+                f"{block.start.astimezone():%H:%M} → {block.end.astimezone():%H:%M}"
+                f" · {block.messages:,} message{'s' if block.messages != 1 else ''}"
+                f"{source}")
+            self._sess_left.set_text(fmt_duration(block.remaining().total_seconds()))
+            self._sess_unit.set_text('left')
+            self._sess_meter.set_value(
+                100.0 * block.elapsed().total_seconds() / BLOCK_DURATION.total_seconds())
+            self._sess_stats['tokens'].set_text(fmt(block.total_tokens))
+            self._sess_stats['cost'].set_text(fmt_cost(block.cost_usd))
+            self._sess_stats['burn'].set_text(f"{fmt(int(fc.burn_rate_per_min_tokens))}/min")
+            eta = self._sess_stats['eta']
+            if fc.eta_to_limit is None:
+                eta.set_text("no plan data")
             else:
-                self._set_mini(self._block_eta, "no cloud data",
-                               COLORS['muted'])
+                secs = int(fc.eta_to_limit.total_seconds())
+                eta.set_text("at the limit" if secs <= 0 else f"in {fmt_duration(secs)}")
         else:
-            self._block_window_lbl.set_text("No session open")
-            for w in (self._block_remaining, self._block_tokens,
-                      self._block_cost, self._block_burn, self._block_eta):
-                self._set_mini(w, "—", COLORS['muted'])
+            self._sess_left.set_text("Idle")
+            self._sess_unit.set_text('')
+            self._block_window_lbl.set_text("No session open. The next message starts one.")
+            self._sess_meter.set_value(0)
+            for v in self._sess_stats.values():
+                v.set_text("—")
 
-        # Top projects (period)
-        for child in self._dashboard_projects_content.get_children():
-            self._dashboard_projects_content.remove(child)
-        self._dashboard_projects_subtitle.set_text(
-            f"{rng or label}  ·  by tokens")
-        proj = store.project_summary(since=cutoff, account=acc)
-        if not proj:
-            l = Gtk.Label(label="No activity")
-            l.get_style_context().add_class('subtitle')
-            self._dashboard_projects_content.pack_start(l, True, True, 0)
-        else:
-            top = proj[:5]
-            max_t = top[0]['total_tokens'] or 1
-            for p in top:
-                self._dashboard_projects_content.pack_start(
-                    self._build_bar_row(p['project'],
-                                        p['total_tokens'] or 0,
-                                        max_t,
-                                        fmt(p['total_tokens'] or 0)),
-                    False, False, 0,
-                )
-        self._dashboard_projects_content.show_all()
+        self._update_chart()
 
-        # Top models (period)
-        for child in self._dashboard_models_content.get_children():
-            self._dashboard_models_content.remove(child)
-        self._dashboard_models_subtitle.set_text(
-            f"{rng or label}  ·  by cost")
-        models = store.model_summary(since=cutoff, account=acc)
-        if not models:
-            l = Gtk.Label(label="No activity")
-            l.get_style_context().add_class('subtitle')
-            self._dashboard_models_content.pack_start(l, True, True, 0)
-        else:
-            top = models[:5]
-            max_c = max((m['cost_usd'] or 0) for m in top) or 1
-            for m in top:
-                self._dashboard_models_content.pack_start(
-                    self._build_bar_row(m['model'] or '(unknown)',
-                                        m['cost_usd'] or 0,
-                                        max_c,
-                                        fmt_cost(m['cost_usd'] or 0)),
-                    False, False, 0,
-                )
-        self._dashboard_models_content.show_all()
+        # Top projects / models (period)
+        def bars(container, sub_lbl, rows, name_key, value_key, fmt_fn, unit):
+            for child in container.get_children():
+                container.remove(child)
+            sub_lbl.set_text(f"{rng or label} · by {unit}")
+            if not rows:
+                container.pack_start(self._label("Nothing recorded in this period.",
+                                                 'subtitle'), False, False, 0)
+                container.show_all()
+                return
+            top_rows = rows[:6]
+            vmax = max(float(r[value_key] or 0) for r in top_rows) or 1
+            for r in top_rows:
+                row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+                line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+                line.pack_start(self._label(r[name_key] or '(unknown)', 'bar-name',
+                                            ellipsize=True), True, True, 0)
+                line.pack_end(self._label(fmt_fn(r[value_key] or 0), 'bar-value'),
+                              False, False, 0)
+                row.pack_start(line, False, False, 0)
+                m = ui.Meter(height=5, color='chart')
+                m.set_value(100.0 * float(r[value_key] or 0) / vmax)
+                row.pack_start(m, False, False, 0)
+                container.pack_start(row, False, False, 0)
+            container.show_all()
 
+        bars(self._dashboard_projects_content, self._dashboard_projects_subtitle,
+             store.project_summary(since=cutoff, account=acc), 'project',
+             'total_tokens', lambda v: fmt(int(v)), 'tokens')
+        bars(self._dashboard_models_content, self._dashboard_models_subtitle,
+             store.model_summary(since=cutoff, account=acc), 'model',
+             'cost_usd', fmt_cost, 'API-equivalent cost')
+
+    # ── Tables ─────────────────────────────────────────────────────────────
     @staticmethod
-    def _build_bar_row(name: str, value: float, max_value: float,
-                       right_text: str) -> Gtk.Widget:
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        row.set_margin_top(4)
-        n = Gtk.Label(label=name)
-        n.set_halign(Gtk.Align.START)
-        n.set_ellipsize(Pango.EllipsizeMode.END)
-        n.set_size_request(150, -1)
-        row.pack_start(n, False, False, 0)
-        bar = Gtk.LevelBar()
-        bar.set_min_value(0); bar.set_max_value(1.0)
-        bar.set_value(min(value / max_value, 1.0) if max_value else 0.0)
-        bar.set_size_request(80, 6)
-        row.pack_start(bar, True, True, 0)
-        r = Gtk.Label(label=right_text)
-        r.set_halign(Gtk.Align.END)
-        row.pack_end(r, False, False, 0)
-        return row
+    def _add_columns(tree: Gtk.TreeView, cols, sort_offset: Optional[int] = None):
+        """Columns as (title, index, min width, kind) where kind is 'text',
+        'grow' (takes the spare width) or 'num' (right-aligned figures)."""
+        for title, idx, width, kind in cols:
+            r = Gtk.CellRendererText()
+            r.set_property('xpad', 8); r.set_property('ypad', 7)
+            if kind == 'num':
+                r.set_property('xalign', 1.0)
+            if kind == 'grow':
+                # Ask for a modest width and take the spare room, so a long
+                # name ellipsizes instead of pushing the figures off the edge.
+                r.set_property('ellipsize', Pango.EllipsizeMode.END)
+                r.set_property('width-chars', 16)
+            col = Gtk.TreeViewColumn(title, r, text=idx)
+            col.set_expand(kind == 'grow'); col.set_resizable(True)
+            col.set_min_width(width)
+            if kind == 'num':
+                col.set_alignment(1.0)
+            if sort_offset is not None:
+                col.set_sort_column_id(idx + sort_offset)
+            tree.append_column(col)
+
+    def _table_panel(self, tree: Gtk.TreeView) -> Gtk.Widget:
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled.add(tree)
+        shell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        shell.get_style_context().add_class('shell')
+        core = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        core.get_style_context().add_class('core')
+        core.get_style_context().add_class('core-table')
+        core.pack_start(scrolled, True, True, 0)
+        shell.pack_start(core, True, True, 0)
+        return shell
+
+    def _period_combo(self, current: str, on_change) -> Gtk.ComboBoxText:
+        combo = Gtk.ComboBoxText()
+        for k in ('all', 'today', '7d', '30d'):
+            combo.append(k, PERIOD_LABELS[k])
+        combo.set_active_id(current)
+        combo.connect('changed', lambda cb: on_change(cb.get_active_id() or 'all'))
+        return combo
 
     # ── Projects view ──────────────────────────────────────────────────────
     def _build_projects_view(self) -> Gtk.Widget:
-        c = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        c.set_margin_top(16); c.set_margin_bottom(16)
-        c.set_margin_start(16); c.set_margin_end(16)
+        c = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        c.set_margin_top(10); c.set_margin_bottom(22)
+        c.set_margin_start(32); c.set_margin_end(32)
 
-        fb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        fb.set_margin_bottom(16)
+        fb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         self._projects_search = Gtk.SearchEntry()
-        self._projects_search.set_placeholder_text("Search projects...")
+        self._projects_search.set_placeholder_text("Search projects")
         self._projects_search.get_style_context().add_class('search-entry')
         self._projects_search.connect('search-changed',
                                       lambda _: self._update_projects_view())
         fb.pack_start(self._projects_search, True, True, 0)
-        pl = Gtk.Label(label="Period:")
-        pl.get_style_context().add_class('subtitle')
-        self._projects_period_combo = Gtk.ComboBoxText()
-        for k in ('all', 'today', '7d', '30d'):
-            self._projects_period_combo.append(k, PERIOD_LABELS[k])
-        self._projects_period_combo.set_active_id(self._projects_period)
-        self._projects_period_combo.connect(
-            'changed', lambda combo: (
-                setattr(self, '_projects_period',
-                        combo.get_active_id() or 'all'),
-                self._update_projects_view()))
+
+        def _set(period):
+            self._projects_period = period
+            self._update_projects_view()
+        self._projects_period_combo = self._period_combo(self._projects_period, _set)
         fb.pack_end(self._projects_period_combo, False, False, 0)
-        fb.pack_end(pl, False, False, 0)
         c.pack_start(fb, False, False, 0)
 
-        self._projects_totals = Gtk.Label()
-        self._projects_totals.set_halign(Gtk.Align.START)
-        self._projects_totals.set_ellipsize(Pango.EllipsizeMode.END)
-        self._projects_totals.set_margin_bottom(12)
+        self._projects_totals = self._label('', 'subtitle', ellipsize=True)
+        self._projects_totals.set_margin_start(4)
         c.pack_start(self._projects_totals, False, False, 0)
-
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        c.pack_start(scrolled, True, True, 0)
 
         # TreeStore (parent = project, children = sessions). Display columns
         # 0-9; trailing columns are numeric counterparts used for sorting.
@@ -1568,34 +1597,26 @@ class TrackerWindow(Gtk.Window):
             # are 64-bit; a 32-bit column raised OverflowError and blanked the tab.
             float, *([GObject.TYPE_INT64] * 8), float,  # 10-19 sort
         )
-        DISPLAY = 10
         treeview = Gtk.TreeView(model=self._projects_store)
         treeview.set_headers_visible(True)
-        for title, idx, width, expand in [
-            ('Project / Session', 0, 220, True),
-            ('Last Used', 1, 110, False),
-            ('Sessions', 2, 80, False),
-            ('Messages', 3, 80, False),
-            ('Input', 4, 90, False),
-            ('Cache Create', 5, 100, False),
-            ('Cache Read', 6, 100, False),
-            ('Output', 7, 90, False),
-            ('Total', 8, 100, False),
-            ('Cost', 9, 90, False),
-        ]:
-            r = Gtk.CellRendererText()
-            r.set_property('xpad', 8); r.set_property('ypad', 6)
-            if expand:
-                r.set_property('ellipsize', Pango.EllipsizeMode.END)
-            col = Gtk.TreeViewColumn(title, r, text=idx)
-            col.set_expand(expand); col.set_resizable(True)
-            col.set_min_width(width)
-            col.set_sort_column_id(idx + DISPLAY)
-            treeview.append_column(col)
-        scrolled.add(treeview)
+        self._add_columns(treeview, [
+            ('Project / session', 0, 170, 'grow'),
+            ('Last used', 1, 92, 'text'),
+            ('Sessions', 2, 74, 'num'),
+            ('Messages', 3, 84, 'num'),
+            ('Input', 4, 74, 'num'),
+            ('Cache write', 5, 92, 'num'),
+            ('Cache read', 6, 90, 'num'),
+            ('Output', 7, 78, 'num'),
+            ('Total', 8, 82, 'num'),
+            ('Cost', 9, 82, 'num'),
+        ], sort_offset=10)
+        c.pack_start(self._table_panel(treeview), True, True, 0)
 
         bb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        bb.set_margin_top(16)
+        hint = self._label("Expand a project to see its 50 most recent sessions.",
+                           'stat-sub')
+        bb.pack_start(hint, False, False, 0)
         export_btn = Gtk.Button(label="Export CSV")
         export_btn.get_style_context().add_class('btn-secondary')
         export_btn.connect('clicked', self._export_csv)
@@ -1615,13 +1636,9 @@ class TrackerWindow(Gtk.Window):
         total_msgs = sum((r['messages'] or 0) for r in rows)
         total_cost = sum((r['cost_usd'] or 0) for r in rows)
         self._projects_totals.set_markup(
-            f'<span foreground="{COLORS["subtext"]}">'
-            f'<b>{len(rows)}</b> projects · '
-            f'<b>{fmt(total_tokens)}</b> tokens · '
-            f'{total_msgs} msg · '
-            f'<b>{fmt_cost(total_cost)}</b> · {html.escape(rng)}'
-            f'</span>'
-        )
+            f'<b>{len(rows)}</b> projects · <b>{fmt(total_tokens)}</b> tokens · '
+            f'{total_msgs:,} messages · <b>{fmt_cost(total_cost)}</b> at API prices'
+            f' · {html.escape(rng)}')
 
         # Session children come pre-aggregated from SQL, already newest
         # first. Grouping the raw messages here meant reading every row for
@@ -1641,8 +1658,8 @@ class TrackerWindow(Gtk.Window):
             parent = self._projects_store.append(None, [
                 name,
                 rel_time(last_used_dt),
-                str(r['sessions'] or 0),
-                str(r['messages'] or 0),
+                f"{r['sessions'] or 0:,}",
+                f"{r['messages'] or 0:,}",
                 fmt(r['input_tokens'] or 0),
                 fmt(r['cache_creation'] or 0),
                 fmt(r['cache_read'] or 0),
@@ -1664,133 +1681,88 @@ class TrackerWindow(Gtk.Window):
             # recent so a project with hundreds of sessions doesn't bloat the
             # tree.
             for srow in (sessions_by_project.get(name) or [])[:50]:
-                s = {
-                    'sid': srow['session_id'],
-                    'first': datetime.fromisoformat(srow['first_used']),
-                    'last': datetime.fromisoformat(srow['last_used']),
-                    'msgs': srow['messages'] or 0,
-                    'inp': srow['input_tokens'] or 0,
-                    'cc': srow['cache_creation'] or 0,
-                    'cr': srow['cache_read'] or 0,
-                    'out': srow['output_tokens'] or 0,
-                    'tot': srow['total_tokens'] or 0,
-                    'cost': srow['cost_usd'] or 0,
-                }
+                first = datetime.fromisoformat(srow['first_used'])
+                last = datetime.fromisoformat(srow['last_used'])
+                cost = srow['cost_usd'] or 0
                 self._projects_store.append(parent, [
-                    f"  {s['first'].astimezone():%Y-%m-%d %H:%M} · "
-                    f"{s['sid'][:8]}",
-                    rel_time(s['last']),
+                    f"{first.astimezone():%d %b %H:%M} · {srow['session_id'][:8]}",
+                    rel_time(last),
                     "—",
-                    str(s['msgs']),
-                    fmt(s['inp']),
-                    fmt(s['cc']),
-                    fmt(s['cr']),
-                    fmt(s['out']),
-                    fmt(s['tot']),
-                    fmt_cost(s['cost']),
-                    s['last'].timestamp(),
+                    f"{srow['messages'] or 0:,}",
+                    fmt(srow['input_tokens'] or 0),
+                    fmt(srow['cache_creation'] or 0),
+                    fmt(srow['cache_read'] or 0),
+                    fmt(srow['output_tokens'] or 0),
+                    fmt(srow['total_tokens'] or 0),
+                    fmt_cost(cost),
+                    last.timestamp(),
                     0,
-                    s['msgs'],
-                    s['inp'],
-                    s['cc'],
-                    s['cr'],
-                    s['out'],
-                    s['tot'],
-                    int(s['cost'] * 1000),
-                    s['cost'],
+                    srow['messages'] or 0,
+                    srow['input_tokens'] or 0,
+                    srow['cache_creation'] or 0,
+                    srow['cache_read'] or 0,
+                    srow['output_tokens'] or 0,
+                    srow['total_tokens'] or 0,
+                    int(cost * 1000),
+                    cost,
                 ])
 
-    # ── Breakdowns view (was: separate Models / Tools / Sessions tabs) ─────
+    # ── Breakdowns view ────────────────────────────────────────────────────
     def _build_breakdowns_view(self) -> Gtk.Widget:
-        c = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        c.set_margin_top(16); c.set_margin_bottom(16)
-        c.set_margin_start(16); c.set_margin_end(16)
+        c = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        c.set_margin_top(10); c.set_margin_bottom(22)
+        c.set_margin_start(32); c.set_margin_end(32)
 
-        # Top bar: kind switcher + period selector
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        top.set_margin_bottom(16)
-
         self._breakdowns_stack = Gtk.Stack()
-        self._breakdowns_stack.set_transition_type(
-            Gtk.StackTransitionType.CROSSFADE)
-        self._breakdowns_stack.set_transition_duration(120)
-
+        self._breakdowns_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self._breakdowns_stack.set_transition_duration(180)
         switcher = Gtk.StackSwitcher()
         switcher.set_stack(self._breakdowns_stack)
         top.pack_start(switcher, False, False, 0)
+        self._breakdowns_totals = self._label('', 'subtitle', ellipsize=True)
+        top.pack_start(self._breakdowns_totals, True, True, 0)
 
-        top.pack_start(Gtk.Box(), True, True, 0)
-
-        pl = Gtk.Label(label="Period:")
-        pl.get_style_context().add_class('subtitle')
-        self._breakdowns_period_combo = Gtk.ComboBoxText()
-        for k in ('all', 'today', '7d', '30d'):
-            self._breakdowns_period_combo.append(k, PERIOD_LABELS[k])
-        self._breakdowns_period_combo.set_active_id(self._breakdowns_period)
-        self._breakdowns_period_combo.connect(
-            'changed', lambda cb: (
-                setattr(self, '_breakdowns_period',
-                        cb.get_active_id() or 'all'),
-                self._update_breakdowns_view()))
+        def _set(period):
+            self._breakdowns_period = period
+            self._update_breakdowns_view()
+        self._breakdowns_period_combo = self._period_combo(self._breakdowns_period, _set)
         top.pack_end(self._breakdowns_period_combo, False, False, 0)
-        top.pack_end(pl, False, False, 0)
         c.pack_start(top, False, False, 0)
 
-        self._breakdowns_totals = Gtk.Label()
-        self._breakdowns_totals.set_halign(Gtk.Align.START)
-        self._breakdowns_totals.set_margin_bottom(12)
-        c.pack_start(self._breakdowns_totals, False, False, 0)
+        # Share of the period, as bars: the table below has the exact figures.
+        share = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        head, self._share_title, self._share_sub, _r = self._panel_head('Share')
+        share.pack_start(head, False, False, 0)
+        self._share_rows = Gtk.Grid()
+        self._share_rows.set_column_spacing(28); self._share_rows.set_row_spacing(12)
+        self._share_rows.set_column_homogeneous(True)
+        share.pack_start(self._share_rows, False, False, 0)
+        c.pack_start(self._bezel(share), False, False, 0)
 
-        # Models page
-        models_scrolled = Gtk.ScrolledWindow()
-        models_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC,
-                                   Gtk.PolicyType.AUTOMATIC)
-        self._models_store = Gtk.ListStore(
-            str, str, str, str, str, str, str, str)
+        self._models_store = Gtk.ListStore(str, str, str, str, str, str, str, str)
         models_tv = Gtk.TreeView(model=self._models_store)
-        models_tv.set_headers_visible(True)
-        for title, idx, w in [('Model', 0, 240),
-                              ('Messages', 1, 90),
-                              ('Input', 2, 90),
-                              ('Cache Create', 3, 110),
-                              ('Cache Read', 4, 100),
-                              ('Output', 5, 90),
-                              ('Total', 6, 100),
-                              ('Cost', 7, 100)]:
-            r = Gtk.CellRendererText()
-            r.set_property('xpad', 8)
-            col = Gtk.TreeViewColumn(title, r, text=idx)
-            col.set_resizable(True); col.set_min_width(w)
-            models_tv.append_column(col)
-        models_scrolled.add(models_tv)
-        self._breakdowns_stack.add_titled(models_scrolled, 'models', 'Models')
+        self._add_columns(models_tv, [
+            ('Model', 0, 220, 'grow'), ('Messages', 1, 90, 'num'),
+            ('Input', 2, 84, 'num'), ('Cache write', 3, 100, 'num'),
+            ('Cache read', 4, 96, 'num'), ('Output', 5, 84, 'num'),
+            ('Total', 6, 90, 'num'), ('Cost', 7, 90, 'num')])
+        self._breakdowns_stack.add_titled(self._table_panel(models_tv), 'models', 'Models')
 
-        # Tools page
-        tools_scrolled = Gtk.ScrolledWindow()
-        tools_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC,
-                                  Gtk.PolicyType.AUTOMATIC)
         self._tools_store = Gtk.ListStore(str, str, str, str, str, str)
         tools_tv = Gtk.TreeView(model=self._tools_store)
-        tools_tv.set_headers_visible(True)
-        for title, idx, w in [('Tool', 0, 200),
-                              ('Calls', 1, 80),
-                              ('Messages', 2, 100),
-                              ('Input tok', 3, 110),
-                              ('Output tok', 4, 110),
-                              ('Cost (turns)', 5, 120)]:
-            r = Gtk.CellRendererText()
-            r.set_property('xpad', 8)
-            col = Gtk.TreeViewColumn(title, r, text=idx)
-            col.set_resizable(True); col.set_min_width(w)
-            tools_tv.append_column(col)
-        tools_scrolled.add(tools_tv)
-        self._breakdowns_stack.add_titled(tools_scrolled, 'tools', 'Tools')
+        self._add_columns(tools_tv, [
+            ('Tool', 0, 220, 'grow'), ('Calls', 1, 80, 'num'),
+            ('Messages', 2, 90, 'num'), ('Input', 3, 96, 'num'),
+            ('Output', 4, 96, 'num'), ('Cost of those turns', 5, 140, 'num')])
+        self._breakdowns_stack.add_titled(self._table_panel(tools_tv), 'tools', 'Tools')
 
         c.pack_start(self._breakdowns_stack, True, True, 0)
         self._breakdowns_stack.set_visible_child_name(self._breakdowns_kind)
         self._breakdowns_stack.connect(
             'notify::visible-child-name',
             lambda *_: self._on_breakdowns_kind_changed())
+        self._breakdown_rows = {'models': [], 'tools': []}
         return c
 
     def _on_breakdowns_kind_changed(self):
@@ -1808,7 +1780,7 @@ class TrackerWindow(Gtk.Window):
         for r in models:
             self._models_store.append([
                 r['model'] or '(unknown)',
-                str(r['messages'] or 0),
+                f"{r['messages'] or 0:,}",
                 fmt(r['input_tokens'] or 0),
                 fmt(r['cache_creation'] or 0),
                 fmt(r['cache_read'] or 0),
@@ -1822,179 +1794,190 @@ class TrackerWindow(Gtk.Window):
         for r in tools:
             self._tools_store.append([
                 r['name'],
-                str(int(r['calls'])),
-                str(int(r['messages'])),
+                f"{int(r['calls']):,}",
+                f"{int(r['messages']):,}",
                 fmt(int(r['input_tokens'])),
                 fmt(int(r['output_tokens'])),
                 fmt_cost(r['cost_usd']),
             ])
-
+        self._breakdown_rows = {'models': models, 'tools': tools}
         self._update_breakdowns_totals()
 
     def _update_breakdowns_totals(self):
         kind = self._breakdowns_kind
         rng = range_text(self._breakdowns_period) or PERIOD_LABELS.get(
             self._breakdowns_period, '')
+        rows = self._breakdown_rows.get(kind) or []
         if kind == 'models':
-            n = len(self._models_store)
-            self._breakdowns_totals.set_markup(
-                f'<span foreground="{COLORS["subtext"]}">'
-                f'<b>{n}</b> models · {html.escape(rng)}</span>')
+            self._breakdowns_totals.set_text(f"{len(rows)} models · {rng}")
+            self._share_title.set_text("Share of cost")
+            self._share_sub.set_text("API-equivalent cost by model, largest first.")
+            items = [(r['model'] or '(unknown)', float(r['cost_usd'] or 0),
+                      fmt_cost(r['cost_usd'] or 0)) for r in rows]
         else:
-            n = len(self._tools_store)
-            self._breakdowns_totals.set_markup(
-                f'<span foreground="{COLORS["subtext"]}">'
-                f'<b>{n}</b> tools · {html.escape(rng)} '
-                f'· cost is the parent turn\'s cost, not per-call</span>')
+            self._breakdowns_totals.set_text(
+                f"{len(rows)} tools · {rng} · a turn's cost counts once for "
+                "each tool it called")
+            self._share_title.set_text("Share of calls")
+            self._share_sub.set_text("Tool calls, largest first.")
+            items = [(r['name'], float(r['calls'] or 0), f"{int(r['calls']):,} calls")
+                     for r in rows]
+        for child in self._share_rows.get_children():
+            self._share_rows.remove(child)
+        total = sum(v for _n, v, _t in items) or 1.0
+        if not items:
+            self._share_rows.attach(self._label("Nothing recorded in this period.",
+                                                'subtitle'), 0, 0, 1, 1)
+        for i, (name, value, text) in enumerate(items[:8]):
+            cell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            line.pack_start(self._label(name, 'bar-name', ellipsize=True), True, True, 0)
+            line.pack_end(self._label(f"{100 * value / total:.1f}%", 'bar-value'),
+                          False, False, 0)
+            cell.pack_start(line, False, False, 0)
+            m = ui.Meter(height=5, color='chart')
+            m.set_value(100 * value / total)
+            cell.pack_start(m, False, False, 0)
+            cell.set_tooltip_text(text)
+            self._share_rows.attach(cell, i % 2, i // 2, 1, 1)
+        self._share_rows.show_all()
 
     # ── Budgets view ───────────────────────────────────────────────────────
     def _build_budgets_view(self) -> Gtk.Widget:
-        c = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        c.set_margin_top(24); c.set_margin_bottom(24)
-        c.set_margin_start(24); c.set_margin_end(24)
+        c = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
+        c.set_margin_top(10); c.set_margin_bottom(28)
+        c.set_margin_start(32); c.set_margin_end(32)
 
-        intro = Gtk.Label()
-        intro.set_halign(Gtk.Align.START)
-        intro.set_line_wrap(True)
-        intro.get_style_context().add_class('subtitle')
-        intro.set_text(
-            "Budgets warn you when you cross a limit. Choose USD or tokens "
-            "per day/week/month, or — on Max/Pro/Team plans — a % of plan "
-            "utilization over the rolling 5h or 7d window pulled from "
-            "claude.ai. Plan-% budgets need a working OAuth token."
-        )
-        c.pack_start(intro, False, False, 0)
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        head, _t, _s, _r = self._panel_head(
+            'Your budgets',
+            "A budget warns you when you cross a limit: dollars or tokens per "
+            "day, week or month, or a share of your plan's 5-hour or 7-day "
+            "window. Plan budgets need a working OAuth token.")
+        left.pack_start(head, False, False, 0)
+        self._budgets_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        left.pack_start(self._budgets_list, False, False, 0)
+        lp = self._bezel(left)
+        lp.set_valign(Gtk.Align.START)
+        c.pack_start(lp, True, True, 0)
 
-        self._budgets_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
-                                     spacing=8)
-        c.pack_start(self._budgets_list, False, False, 0)
+        form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        fh, _t, _s, _r = self._panel_head('Add a budget')
+        form.pack_start(fh, False, False, 0)
 
-        # Add form
-        form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        form.get_style_context().add_class('card')
-        form.set_margin_top(12)
-        ft = Gtk.Label(label="Add a budget")
-        ft.get_style_context().add_class('card-title')
-        ft.set_halign(Gtk.Align.START)
-        form.pack_start(ft, False, False, 0)
-
-        grid = Gtk.Grid()
-        grid.set_column_spacing(8); grid.set_row_spacing(6)
         self._budget_name = Gtk.Entry()
-        self._budget_name.set_placeholder_text("Name (e.g. 'monthly cap')")
+        self._budget_name.set_placeholder_text("Monthly cap")
         self._budget_scope = Gtk.Entry()
         self._budget_scope.set_text("global")
-        self._budget_scope.set_placeholder_text(
-            "global | project:NAME | model:MODEL_ID")
+        self._budget_scope.set_placeholder_text("global, project:NAME or model:ID")
         self._budget_period = Gtk.ComboBoxText()
-        for pid, plabel in (('day', 'day'), ('week', 'week'),
-                            ('month', 'month'),
-                            ('5h', '5h (plan window)'),
-                            ('7d', '7d (plan window)')):
+        for pid, plabel in (('day', 'Day'), ('week', 'Week'), ('month', 'Month'),
+                            ('5h', '5-hour plan window'), ('7d', '7-day plan window')):
             self._budget_period.append(pid, plabel)
         self._budget_period.set_active_id('month')
         self._budget_usd = Gtk.Entry()
-        self._budget_usd.set_placeholder_text("USD limit (or leave blank)")
+        self._budget_usd.set_placeholder_text("e.g. 150")
         self._budget_tokens = Gtk.Entry()
-        self._budget_tokens.set_placeholder_text("Token limit (or leave blank)")
+        self._budget_tokens.set_placeholder_text("e.g. 500000000")
         self._budget_plan_pct = Gtk.Entry()
-        self._budget_plan_pct.set_placeholder_text(
-            "Plan utilization % (Max/Pro/Team — uses 5h or 7d)")
+        self._budget_plan_pct.set_placeholder_text("e.g. 80, with a plan window")
         self._budget_notify_pct = Gtk.SpinButton.new_with_range(50, 100, 5)
         self._budget_notify_pct.set_value(80)
 
-        def lbl(text):
-            l = Gtk.Label(label=text); l.set_halign(Gtk.Align.START); return l
-        grid.attach(lbl("Name:"), 0, 0, 1, 1)
-        grid.attach(self._budget_name, 1, 0, 2, 1)
-        grid.attach(lbl("Scope:"), 0, 1, 1, 1)
-        grid.attach(self._budget_scope, 1, 1, 2, 1)
-        grid.attach(lbl("Period:"), 0, 2, 1, 1)
-        grid.attach(self._budget_period, 1, 2, 1, 1)
-        grid.attach(lbl("USD:"), 0, 3, 1, 1)
-        grid.attach(self._budget_usd, 1, 3, 1, 1)
-        grid.attach(lbl("Tokens:"), 0, 4, 1, 1)
-        grid.attach(self._budget_tokens, 1, 4, 1, 1)
-        grid.attach(lbl("Plan %:"), 0, 5, 1, 1)
-        grid.attach(self._budget_plan_pct, 1, 5, 1, 1)
-        grid.attach(lbl("Notify at %:"), 0, 6, 1, 1)
-        grid.attach(self._budget_notify_pct, 1, 6, 1, 1)
-        form.pack_start(grid, False, False, 0)
+        def field(label, widget, hint=None):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+            box.pack_start(self._label(label, 'stat-label'), False, False, 0)
+            box.pack_start(widget, False, False, 0)
+            if hint:
+                box.pack_start(self._label(hint, 'stat-sub', wrap=True), False, False, 0)
+            form.pack_start(box, False, False, 0)
+        field("Name", self._budget_name)
+        field("Scope", self._budget_scope)
+        field("Period", self._budget_period)
+        limits = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        limits.set_homogeneous(True)
+        for label, w in (("Dollars", self._budget_usd), ("Tokens", self._budget_tokens)):
+            b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+            b.pack_start(self._label(label, 'stat-label'), False, False, 0)
+            b.pack_start(w, False, False, 0)
+            limits.pack_start(b, True, True, 0)
+        form.pack_start(limits, False, False, 0)
+        field("Plan share (%)", self._budget_plan_pct,
+              "Only with a 5-hour or 7-day period, and scope global.")
+        field("Warn me at (%) of the limit", self._budget_notify_pct)
 
-        add_btn = Gtk.Button(label="Add Budget")
+        add_btn = Gtk.Button(label="Add budget")
         add_btn.get_style_context().add_class('btn-primary')
         add_btn.set_halign(Gtk.Align.START)
+        add_btn.set_margin_top(4)
         add_btn.connect('clicked', self._on_budget_add)
         form.pack_start(add_btn, False, False, 0)
-
-        c.pack_start(form, False, False, 0)
+        self._budget_error = self._label('', 'stat-sub', wrap=True)
+        form.pack_start(self._budget_error, False, False, 0)
+        panel = self._bezel(form)
+        panel.set_size_request(360, -1)
+        panel.set_valign(Gtk.Align.START)
+        c.pack_start(panel, False, False, 0)
         return c
 
     def _update_budgets_view(self):
         for child in self._budgets_list.get_children():
             self._budgets_list.remove(child)
-        states = evaluate_budgets(self.app.store,
-                                  usage_data=self.app.usage_data)
+        states = evaluate_budgets(self.app.store, usage_data=self.app.usage_data)
         if not states:
-            l = Gtk.Label(label="No budgets configured.")
-            l.get_style_context().add_class('subtitle')
-            l.set_halign(Gtk.Align.START)
-            self._budgets_list.pack_start(l, False, False, 0)
+            empty = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            empty.get_style_context().add_class('notice')
+            empty.pack_start(self._label("No budgets yet", 'eyebrow-strong'), False, False, 0)
+            empty.pack_start(self._label(
+                "Add one on the right. A monthly dollar cap is a good start; a "
+                "plan budget at 80% of the 5-hour window warns you before Claude "
+                "slows you down.", 'subtitle', wrap=True), False, False, 0)
+            self._budgets_list.pack_start(empty, False, False, 0)
             self._budgets_list.show_all()
             return
         for s in states:
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-            row.get_style_context().add_class('card')
-            left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            t = Gtk.Label()
-            kind = ' · plan-%' if s.is_pct_based else ''
-            t.set_markup(
-                f'<b>{html.escape(s.name)}</b>  '
-                f'<span foreground="{COLORS["subtext"]}">'
-                f'· {html.escape(s.scope)} · {s.period}{kind}</span>'
-            )
-            t.set_halign(Gtk.Align.START)
-            left.pack_start(t, False, False, 0)
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            row.get_style_context().add_class('tile')
+            top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            kind = ' · plan share' if s.is_pct_based else ''
+            name = self._label('', ellipsize=True)
+            name.set_markup(f"<b>{html.escape(s.name)}</b>  "
+                            f"<span foreground=\"{COLORS['muted']}\">"
+                            f"{html.escape(s.scope)} · {s.period}{kind}</span>")
+            top.pack_start(name, True, True, 0)
+            del_btn = Gtk.Button(label="Remove")
+            del_btn.get_style_context().add_class('btn-link')
+            del_btn.connect('clicked', lambda _, bid=s.id: self._on_budget_remove(bid))
+            top.pack_end(del_btn, False, False, 0)
+            row.pack_start(top, False, False, 0)
 
             if s.is_pct_based:
-                limit = f"{s.limit_pct:.0f}% of plan"
+                limit = f"{s.limit_pct:.0f}% of the plan window"
                 if s.data_available:
                     spent = f"{s.spent_pct:.0f}% used"
-                    pct_text = f"{s.pct * 100:.0f}%"
-                    color = get_usage_color(s.pct)
+                    pct = s.pct * 100
                 else:
-                    spent = "no cloud data — connect token in Cloud tab"
-                    pct_text = "—"
-                    color = COLORS["subtext"]
+                    spent, pct = "no plan data yet", None
             else:
                 spent = (fmt_cost(s.spent_usd) if s.limit_usd
-                         else f"{s.spent_tokens:,} tok")
+                         else f"{s.spent_tokens:,} tokens")
                 limit = (fmt_cost(s.limit_usd) if s.limit_usd
-                         else f"{s.limit_tokens:,} tok"
-                         if s.limit_tokens else '—')
-                pct_text = f"{s.pct * 100:.0f}%"
-                color = get_usage_color(s.pct)
-            d = Gtk.Label()
-            d.set_markup(
-                f'<span foreground="{color}" font_weight="bold">'
-                f'{pct_text}</span>  '
-                f'<span foreground="{COLORS["subtext"]}">'
-                f'{html.escape(spent)} of {html.escape(limit)} '
-                f'(period {html.escape(s.period_key)})</span>'
-            )
-            d.set_halign(Gtk.Align.START)
-            left.pack_start(d, False, False, 0)
-            row.pack_start(left, True, True, 0)
-
-            del_btn = Gtk.Button(label="Remove")
-            del_btn.get_style_context().add_class('btn-secondary')
-            del_btn.connect('clicked',
-                            lambda _, bid=s.id: self._on_budget_remove(bid))
-            row.pack_end(del_btn, False, False, 0)
+                         else f"{s.limit_tokens:,} tokens" if s.limit_tokens else '—')
+                pct = s.pct * 100
+            m = ui.Meter(height=6)
+            m.set_value(pct)
+            row.pack_start(m, False, False, 0)
+            row.pack_start(self._label(
+                f"{'—' if pct is None else f'{pct:.0f}%'} · {spent} of {limit} · "
+                f"warns at {s.notify_at_pct}% · period {s.period_key}",
+                'tile-sub', ellipsize=True), False, False, 0)
             self._budgets_list.pack_start(row, False, False, 0)
         self._budgets_list.show_all()
 
     def _on_budget_add(self, _btn):
+        def fail(msg):
+            self._budget_error.set_markup(
+                f"<span foreground=\"{COLORS['danger']}\">{html.escape(msg)}</span>")
         name = self._budget_name.get_text().strip()
         scope = self._budget_scope.get_text().strip() or 'global'
         period = self._budget_period.get_active_id() or 'month'
@@ -2003,25 +1986,21 @@ class TrackerWindow(Gtk.Window):
         plan_pct_text = self._budget_plan_pct.get_text().strip()
         notify_pct = int(self._budget_notify_pct.get_value())
         if not name:
-            self._status_label.set_text("Budget needs a name")
-            return
+            return fail("Give the budget a name.")
         try:
             usd = float(usd_text) if usd_text else None
             tokens = int(tok_text) if tok_text else None
             plan_pct = float(plan_pct_text) if plan_pct_text else None
         except ValueError:
-            self._status_label.set_text("USD/Tokens/Plan-% must be numbers")
-            return
+            return fail("Dollars, tokens and plan share must be numbers.")
         if not (usd or tokens or plan_pct):
-            self._status_label.set_text(
-                "Budget needs a USD, token, or plan-% limit")
-            return
+            return fail("Set a dollar, token or plan-share limit.")
         try:
             self.app.store.add_budget(name, scope, period, usd, tokens,
                                       notify_pct, plan_pct)
         except ValueError as e:
-            self._status_label.set_text(str(e))
-            return
+            return fail(str(e))
+        self._budget_error.set_text("")
         self._budget_name.set_text(""); self._budget_usd.set_text("")
         self._budget_tokens.set_text(""); self._budget_plan_pct.set_text("")
         self._update_budgets_view()
@@ -2057,195 +2036,131 @@ class TrackerWindow(Gtk.Window):
         return claudehop.all_readings([name], self.app.store.hop_usage()).get(name) \
             or claudehop.Reading(None, None, None, None, None, None, 'widget')
 
-    def _set_week_bar(self, week: Optional[dict], note: Optional[str] = None,
-                      missing: str = "no weekly limit reported"):
-        """The weekly bar: the all-model 7-day window, or for a Team seat the
-        fullest weekly meter with the model it covers."""
-        if not week:
-            self._usage_7d.update(0.0, "7-Day Window", pct_text="—",
-                                  note=missing)
-            return
-        scope = week.get('scope')
-        self._usage_7d.update(
-            normalize_utilization(week.get('utilization', 0)),
-            "7-Day Window" + (f" · {scope}" if scope else ""),
-            fmt_reset_countdown(week.get('resets_at')), note=note)
-
-    def _show_model_bars(self, model_limits: list):
-        """Per-model weekly caps: one bar each, created on first sighting and
-        dropped when the API stops reporting the model."""
-        present = set()
-        for m in model_limits:
-            name = m['model']
-            present.add(name)
-            label = f"{name} (weekly)" + (" ●" if m['is_active'] else "")
-            bar = self._usage_model_bars.get(name)
-            if bar is None:
-                bar = UsageBar(label, m['fraction'])
-                self._usage_model_bars[name] = bar
-                self._cloud_usage_box.pack_start(bar, True, True, 0)
-            bar.update(m['fraction'], label,
-                       fmt_reset_countdown(m['resets_at']))
-        for name in list(self._usage_model_bars):
-            if name not in present:
-                bar = self._usage_model_bars.pop(name)
-                self._cloud_usage_box.remove(bar)
-                bar.destroy()
-
     def _update_hop_cloud(self, name: str) -> bool:
-        """Plan limits for a claudehop account that is not the live login,
-        from its last reading. False when it is live, so the caller shows the
-        live figures instead."""
+        """Plan rings for a claudehop account that is not the live login, from
+        its last reading. False when it is live, so the caller shows the live
+        figures instead."""
         r = self._hop_idle_reading(name)
         if r is None:
             return False
         now = datetime.now(timezone.utc)
+        self._plan_eyebrow.set_text("Plan limits · last reading")
+        self._plan_title.set_text(name)
+        self._plan_foot.set_text('')
         if r.has_figures:
+            p5, _l5, was5 = claudehop.window_now(r.pct5, r.resets_5h, now)
+            p7, _l7, was7 = claudehop.window_now(r.pct7, r.resets_7d, now)
+            self._set_rings(p5, r.resets_5h if was5 is None else None,
+                            p7, r.resets_7d if was7 is None else None,
+                            r.week_scope, was5=was5, was7=was7)
             who = {'probe': "claudehop, through claude", 'claudehop': "claudehop",
-                   'widget': "this widget, while it was live"}.get(r.source, r.source)
-            self._cloud_card_msg(
-                f"{name}: last reading, {claudehop.ago(r.at, now)}",
-                f"Taken by {who}. Only the live login is polled; hop to {name} "
-                "or press Read all accounts for a fresh one.",
-                color=COLORS['subtext'])
+                   'widget': "this widget while it was live"}.get(r.source, r.source)
+            self._set_tag(f"Read {claudehop.ago(r.at, now)}", 'muted')
+            self._set_notice(
+                f"Only the live login is polled. This reading was taken by {who}. "
+                f"Hop to {name}, or read every account now.",
+                action='read', label='Read all accounts')
         else:
-            self._cloud_card_msg(
-                f"{name}: no reading yet",
-                "Only the live login is polled. Press Read all accounts below "
-                "to have claudehop read it.")
-        self._cloud_status_card.show_all()
-        if not r.has_figures:
-            self._cloud_usage_box.hide()
-            return True
-        p5, _l5, was5 = claudehop.window_now(r.pct5, r.resets_5h, now)
-        self._usage_5h.update(
-            (p5 or 0) / 100.0, "5-Hour Window",
-            fmt_reset_countdown(r.resets_5h) if was5 is None else None,
-            pct_text=None if p5 is not None else "?",
-            note=f"reset since, was {was5:.0f}%" if was5 else None)
-        p7, _l7, was7 = claudehop.window_now(r.pct7, r.resets_7d, now)
-        self._set_week_bar(
-            {'utilization': p7, 'resets_at': r.resets_7d if was7 is None else None,
-             'scope': r.week_scope} if p7 is not None else None,
-            note=f"reset since, was {was7:.0f}%" if was7 else None,
-            missing="no weekly reading yet")
-        self._show_model_bars([])
-        self._cloud_usage_box.show_all()
+            self._set_rings(None, None, None, None, None)
+            self._set_tag("No reading", 'muted')
+            self._set_notice(
+                "Only the live login is polled, and nothing has read this "
+                "account yet.", action='read', label='Read all accounts')
         return True
 
     # ── Plan-limits section (lives inside the dashboard view) ──────────────
     def _update_cloud_section(self):
-        for child in self._cloud_status_card.get_children():
-            self._cloud_status_card.remove(child)
-
         self._update_hop_card()
         hop_name = self._hop_filter()
         if hop_name and self._update_hop_cloud(hop_name):
             return
         if self._account_filter == BEDROCK_ACCOUNT_LABEL:
-            self._cloud_card_msg(
-                "Bedrock: billed per token",
-                "No plan windows apply. Cost here is an estimate at Anthropic "
-                "list price; AWS Cost Explorer has the real charge.")
-            self._cloud_status_card.show_all()
-            self._cloud_usage_box.hide()
+            self._plan_eyebrow.set_text("Amazon Bedrock")
+            self._plan_title.set_text("Billed per token")
+            self._set_tag("No plan windows", 'muted')
+            self._set_rings(None, None, None, None, None)
+            self._set_notice(
+                "Bedrock has no 5-hour or weekly windows. Costs here are an "
+                "estimate at Anthropic list price; AWS Cost Explorer has the "
+                "real charge.")
+            self._plan_foot.set_text('')
             return
+
         cv, state = self._cloud_view()
-        have = bool(cv.usage_data)
-        # When showing 'All accounts' with more than one configured, the bars
-        # below reflect only the primary account — say so.
-        primary_only = ((self._account_filter is None
-                         and len(self.app._accounts) > 1)
-                        or hop_name is not None)
+        primary = self.app._primary_state()
+        plan_name, _flat = subscription_summary(cv.subscription_info)
+        try:
+            hs = claudehop.load_state(primary.token)
+        except Exception:
+            hs = None
+        if hop_name or (cv is primary and hs and hs.active and not hs.provider):
+            title = hop_name or hs.active
+        elif len(self.app._accounts) > 1:
+            title = cv.account.label
+        else:
+            title = plan_name
+        eyebrow = f"Plan limits · {plan_name}"
+        if self._account_filter is None and len(self.app._accounts) > 1:
+            eyebrow += " · primary account"
+        self._plan_eyebrow.set_text(eyebrow)
+        self._plan_title.set_text(title)
+
+        data = cv.usage_data if cv.usage_data else None
+        if data:
+            five = data.get('five_hour') or {}
+            week = weekly_window(data) or {}
+            p5 = utilization_pct(five.get('utilization'))
+            r5 = five.get('resets_at')
+            p7 = utilization_pct(week.get('utilization')) if week else None
+            r7, scope = week.get('resets_at'), week.get('scope')
+            models = [m for m in extract_model_limits(data) if m['model'] != scope]
+        else:
+            p5, r5 = cv.last_pct5, cv.last_resets_5h
+            p7, r7, scope = cv.last_pct7, cv.last_resets_7d, cv.last_week_scope
+            models = [m for m in cv.last_model_limits if m['model'] != scope]
+        dimmed = state in ('auth_error', 'network_error', 'rate_limited', 'no_token')
+        self._set_rings(p5, r5, p7, r7, scope, dimmed=dimmed, models=models)
 
         if state == 'no_token':
-            self._cloud_card_msg("No OAuth token configured",
-                                 "Run `claude` to log in, or paste a token "
-                                 "in Settings.")
-            btn = Gtk.Button(label="Set Token")
-            btn.get_style_context().add_class('btn-primary')
-            btn.set_halign(Gtk.Align.START)
-            btn.connect('clicked', lambda _: self.app._on_set_token())
-            self._cloud_status_card.pack_start(btn, False, False, 0)
+            self._set_tag("Not connected", 'muted')
+            self._set_notice("No OAuth token. Run `claude` to log in, or paste a "
+                             "token.", action='token', label='Set token')
+            self._plan_foot.set_text('')
         elif state == 'rate_limited':
-            retry = cv.cloud_retry_at
             extra = ""
-            if retry:
-                secs = max(0, int((retry - datetime.now(timezone.utc))
+            if cv.cloud_retry_at:
+                secs = max(0, int((cv.cloud_retry_at - datetime.now(timezone.utc))
                                   .total_seconds()))
-                extra = f" Next retry in {fmt_duration(secs)}."
-            self._cloud_card_msg("Rate limited",
-                                 (cv.cloud_error or "") + extra,
-                                 color=COLORS['yellow'])
-            self._cloud_refresh_btn("Retry now")
+                extra = f" Next try in {fmt_duration(secs)}."
+            self._set_tag("Rate limited", 'warn')
+            self._set_notice((cv.cloud_error or "Claude.ai is rate-limiting this "
+                              "token.") + extra + " The rings show the last reading.",
+                             'warn', action='retry', label='Try now')
+            self._plan_foot.set_text('')
         elif state == 'auth_error':
-            self._cloud_card_msg("Token rejected",
-                                 cv.cloud_error or
-                                 "OAuth token expired or invalid.",
-                                 color=COLORS['red'])
-            self._cloud_refresh_btn("Retry")
+            self._set_tag("Token rejected", 'danger')
+            self._set_notice(cv.cloud_error or "The OAuth token expired or is "
+                             "invalid. Run `claude` to refresh it.", 'danger',
+                             action='retry', label='Retry')
+            self._plan_foot.set_text('')
         elif state == 'network_error':
-            self._cloud_card_msg("Couldn't reach Claude.ai",
-                                 cv.cloud_error or "Network error.",
-                                 color=COLORS['red'])
-            self._cloud_refresh_btn("Retry")
-        elif state == 'loading' and not have:
-            self._cloud_card_msg("Loading cloud usage…",
-                                 "Contacting api.anthropic.com…")
+            self._set_tag("Offline", 'danger')
+            self._set_notice(f"Couldn't reach Claude.ai: {cv.cloud_error or 'network error'}.",
+                             'danger', action='retry', label='Retry')
+            self._plan_foot.set_text('')
+        elif state == 'loading' and not data and p5 is None:
+            self._set_tag("Connecting", 'muted')
+            self._set_notice(None)
+            self._plan_foot.set_text("Asking api.anthropic.com for the current windows…")
         else:
-            sub = cv.subscription_info or {}
-            line = sub.get('type') or 'Claude.ai'
-            if sub.get('tier'):
-                line += f" · {sub['tier']}"
-            detail = "Live 5-hour and 7-day windows."
-            if hop_name:
-                detail += f" {hop_name} is the live login."
-            elif primary_only:
-                detail += f" Showing the primary account ({cv.account.label})."
-            self._cloud_card_msg(f"Connected — {line}", detail,
-                                 color=COLORS['green'])
-            self._cloud_refresh_btn("Refresh")
-        self._cloud_status_card.show_all()
-
-        if have:
-            five = cv.usage_data.get('five_hour', {}) or {}
-            week = weekly_window(cv.usage_data)
-            u5 = normalize_utilization(five.get('utilization', 0))
-            self._usage_5h.update(u5, "5-Hour Window",
-                                  fmt_reset_countdown(five.get('resets_at')))
-            self._set_week_bar(week)
-            # A Team seat's weekly bar already is its fullest model meter;
-            # don't show that meter a second time.
-            shown = (week or {}).get('scope')
-            self._show_model_bars([m for m in extract_model_limits(cv.usage_data)
-                                   if m['model'] != shown])
-            self._cloud_usage_box.show_all()
-        else:
-            self._cloud_usage_box.hide()
-
-    def _cloud_card_msg(self, title_text: str, sub_text: str,
-                        color: Optional[str] = None):
-        t = Gtk.Label()
-        t.get_style_context().add_class('card-title')
-        t.set_halign(Gtk.Align.START)
-        if color:
-            t.set_markup(f'<span foreground="{color}" font_weight="bold">'
-                         f'{html.escape(title_text)}</span>')
-        else:
-            t.set_text(title_text)
-        self._cloud_status_card.pack_start(t, False, False, 0)
-        s = Gtk.Label(label=sub_text)
-        s.get_style_context().add_class('subtitle')
-        s.set_halign(Gtk.Align.START)
-        s.set_line_wrap(True); s.set_xalign(0)
-        self._cloud_status_card.pack_start(s, False, False, 0)
-
-    def _cloud_refresh_btn(self, label: str):
-        btn = Gtk.Button(label=label)
-        btn.get_style_context().add_class('btn-secondary')
-        btn.set_halign(Gtk.Align.START)
-        btn.connect('clicked', lambda _: self.app._refresh_cloud())
-        self._cloud_status_card.pack_start(btn, False, False, 0)
+            self._set_tag("Live", 'ok')
+            self._set_notice(None)
+            when = (cv.last_read_at.astimezone().strftime('%H:%M')
+                    if cv.last_read_at else '—')
+            every = max(1, self.app._settings.poll_interval_seconds // 60)
+            self._plan_foot.set_text(
+                f"Updated {when} · checked every {every} min · "
+                f"{ui.level_word(p5).capitalize()} in this window")
 
     # ── Settings view ──────────────────────────────────────────────────────
     def _apply_theme(self, pref: str):
@@ -2259,17 +2174,11 @@ class TrackerWindow(Gtk.Window):
         Gtk.StyleContext.add_provider_for_screen(
             screen, new_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self._css_provider = new_provider
-        # Retint widgets that bake colors into a per-widget CssProvider or
-        # markup at construction time — the global provider swap above
-        # doesn't reach those; without this they'd stay stale until the
-        # next full data refresh (or forever, if not on the dashboard view).
-        self._usage_5h.retint()
-        self._usage_7d.retint()
-        for bar in self._usage_model_bars.values():
-            bar.retint()
-        for card in self._summary_cards.values():
-            card.retint()
-        self.refresh_data()  # redraw everything else
+        # Drawn widgets read the palette when they draw; markup-coloured
+        # labels are rebuilt by the refresh.
+        self.queue_draw()
+        self.refresh_data()
+        self.app._rebuild_tray()
 
     def _on_system_scheme_changed(self, *_args):
         from .config import load_settings
@@ -2290,7 +2199,7 @@ class TrackerWindow(Gtk.Window):
 
         cloud = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         cloud.get_style_context().add_class('card')
-        t = Gtk.Label(label="Cloud Integration")
+        t = Gtk.Label(label="Cloud connection")
         t.get_style_context().add_class('card-title')
         t.set_halign(Gtk.Align.START)
         cloud.pack_start(t, False, False, 0)
@@ -2312,7 +2221,7 @@ class TrackerWindow(Gtk.Window):
         self._token_saved_label = Gtk.Label()
         self._token_saved_label.set_no_show_all(True)
         tb.pack_end(self._token_saved_label, False, False, 0)
-        sb = Gtk.Button(label="Save Token")
+        sb = Gtk.Button(label="Save token")
         sb.get_style_context().add_class('btn-primary')
         sb.connect('clicked', self._on_save_token)
         tb.pack_end(sb, False, False, 0)
@@ -2347,7 +2256,7 @@ class TrackerWindow(Gtk.Window):
         rc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         rc_box.get_style_context().add_class('card')
         rc_box.set_margin_top(16)
-        rt = Gtk.Label(label="Rate Card")
+        rt = Gtk.Label(label="Rate card")
         rt.get_style_context().add_class('card-title')
         rt.set_halign(Gtk.Align.START)
         rc_box.pack_start(rt, False, False, 0)
@@ -2859,6 +2768,7 @@ class App:
 
         self._notif_mgr = NotificationManager()
         self._settings = load_settings()
+        ui.THRESHOLDS.update(self._settings.thresholds)  # gauge colours follow Settings
         self._startup_notified = False
         if HAS_NOTIFY:
             Notify.init(APP_NAME)
@@ -3009,12 +2919,14 @@ class App:
         win.destroy()
 
     def _show_usage_popup(self, *_a):
-        """Small themed panel with real progress bars (opened from the
-        tray menu or a middle-click on the indicator icon)."""
+        """The usage panel: the two plan rings, the current session and the
+        login with the most room, in a small floating panel (opened from the
+        tray menu, a middle-click on the indicator, or the sidebar gauge)."""
         if getattr(self, '_usage_popup', None):
             self._close_usage_popup()
             return
         st = self._primary_state()
+        now = datetime.now(timezone.utc)
 
         # Gtk.WindowType.POPUP (override-redirect) + an explicit pointer
         # grab, rather than a TOPLEVEL window relying on focus-out: WM/
@@ -3025,105 +2937,150 @@ class App:
         # dismisses deterministically on any click outside the window.
         win = Gtk.Window(type=Gtk.WindowType.POPUP)
         win.set_resizable(False)
-        win.set_default_size(380, -1)
         win.get_style_context().add_class('usage-popup')
-
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
-        for side in ('top', 'bottom', 'start', 'end'):
-            getattr(outer, f'set_margin_{side}')(20)
-        win.add(outer)
-
-        title = Gtk.Label(label='Claude Usage')
-        title.get_style_context().add_class('usage-popup-title')
-        outer.pack_start(title, False, False, 0)
-
-        def _pb_class(frac: Optional[float]) -> str:
-            if frac is None:
-                return 'pb-unknown'
-            if frac < 0.5:
-                return 'pb-low'
-            if frac < 0.75:
-                return 'pb-medium'
-            if frac < 0.9:
-                return 'pb-high'
-            return 'pb-critical'
-
-        def section(name: str, pct: Optional[int], reset_iso, window: str):
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-            lab = Gtk.Label(label=name)
-            lab.get_style_context().add_class('usage-popup-label')
-            lab.set_halign(Gtk.Align.START)
-            row.pack_start(lab, True, True, 0)
-            reset = Gtk.Label(label='Resets ' + fmt_reset_absolute(
-                reset_iso, with_weekday=(window == '7d')))
-            reset.get_style_context().add_class('usage-popup-sub')
-            reset.set_halign(Gtk.Align.END)
-            row.pack_end(reset, False, False, 0)
-            box.pack_start(row, False, False, 0)
-
-            frac = None if pct is None else max(0.0, min(1.0, pct / 100.0))
-            pb = Gtk.ProgressBar()
-            pb.set_fraction(frac or 0.0)
-            pb.get_style_context().add_class(_pb_class(frac))
-            box.pack_start(pb, False, False, 0)
-
-            used = Gtk.Label(
-                label='?' if pct is None else f'{pct}% used')
-            used.get_style_context().add_class('usage-popup-sub')
-            box.pack_start(used, False, False, 0)
-            return box
-
-        outer.pack_start(section('Session (5 hour)', st.last_pct5,
-                                 st.last_resets_5h, '5h'), False, False, 0)
-        week_name = ('Weekly (7 day)' if not st.last_week_scope
-                     else f'Weekly · {st.last_week_scope}')
-        outer.pack_start(section(week_name, st.last_pct7,
-                                 st.last_resets_7d, '7d'), False, False, 0)
-
-        outer.pack_start(Gtk.Separator(), False, False, 0)
-
-        status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        # Only the account's actual error states count as "bad" — 'idle'
-        # (no fetch yet) and 'loading' (fetch in flight) are normal,
-        # transient states, not failures, and shouldn't render as red.
-        error_states = {'auth_error', 'network_error', 'rate_limited',
-                        'no_token'}
-        state = st.cloud_state if st.token else 'no_token'
-        is_error = state in error_states
-        ok = state == 'ok'
-        dot = Gtk.Label()
-        color = USAGE_COLORS['critical' if is_error else 'low']
-        dot.set_markup(f'<span foreground="{color}">●</span>')
-        status_row.pack_start(dot, False, False, 0)
-        if ok:
-            status_txt = 'Cloud connection OK'
-        elif is_error:
-            status_txt = state.replace('_', ' ')
+        screen = win.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual is not None and screen.is_composited():
+            win.set_visual(visual)          # rounded corners over the desktop
+            win.set_app_paintable(True)
         else:
-            status_txt = 'Checking…' if state == 'loading' else 'Waiting for first update'
-        stl = Gtk.Label(label=status_txt)
-        stl.get_style_context().add_class('usage-popup-label')
-        status_row.pack_start(stl, False, False, 0)
-        outer.pack_start(status_row, False, False, 0)
+            win.get_style_context().add_class('opaque')
 
-        outer.pack_start(Gtk.Separator(), False, False, 0)
+        def lbl(text='', cls=None, xalign=0.0, ellipsize=False):
+            l = Gtk.Label(label=text, xalign=xalign)
+            for c in (cls or '').split():
+                l.get_style_context().add_class(c)
+            if ellipsize:
+                l.set_ellipsize(Pango.EllipsizeMode.END)
+            return l
 
-        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        upd = Gtk.Label(
-            label='Last updated: ' + datetime.now().strftime('%H:%M'))
-        upd.get_style_context().add_class('usage-popup-sub')
-        upd.set_halign(Gtk.Align.START)
-        bottom.pack_start(upd, True, True, 0)
-        rb = Gtk.Button(label='Refresh')
-        rb.get_style_context().add_class('btn-secondary')
+        shell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        shell.get_style_context().add_class('popup-shell')
+        core = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        core.get_style_context().add_class('popup-core')
+        core.set_size_request(340, -1)
+        shell.pack_start(core, True, True, 0)
+        win.add(shell)
+
+        try:
+            hs = claudehop.load_state(st.token)
+        except Exception:
+            hs = None
+        plan, _flat = subscription_summary(st.subscription_info)
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        texts.pack_start(lbl(f"Claude usage · {plan}", 'eyebrow'), False, False, 0)
+        texts.pack_start(lbl(hs.active if hs and hs.active else "Plan limits",
+                             'popup-title', ellipsize=True), False, False, 0)
+        head.pack_start(texts, True, True, 0)
+        state = st.cloud_state if st.token else 'no_token'
+        tag_text, tag_kind = {
+            'ok': ('Live', 'ok'), 'rate_limited': ('Rate limited', 'warn'),
+            'auth_error': ('Token rejected', 'danger'),
+            'network_error': ('Offline', 'danger'),
+            'no_token': ('Not connected', 'muted'),
+        }.get(state, ('Checking', 'muted'))
+        tag = lbl(tag_text, f'tag tag-{tag_kind}')
+        tag.set_valign(Gtk.Align.START)
+        head.pack_end(tag, False, False, 0)
+        core.pack_start(head, False, False, 0)
+
+        bad = state in ('auth_error', 'network_error', 'rate_limited', 'no_token')
+        rings = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        rings.set_homogeneous(True)
+        for pct, iso, name, weekly in (
+                (st.last_pct5, st.last_resets_5h, '5-hour window', False),
+                (st.last_pct7, st.last_resets_7d,
+                 '7-day' + (f' · {st.last_week_scope}' if st.last_week_scope else ''),
+                 True)):
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            ring = ui.Ring(diameter=112, caption='used')
+            ring.set_halign(Gtk.Align.CENTER)
+            ring.set_value(pct, dimmed=bad)
+            col.pack_start(ring, False, False, 0)
+            name_l = lbl(name, 'ring-label', 0.5)
+            name_l.set_margin_top(4)
+            col.pack_start(name_l, False, False, 0)
+            if pct is None:
+                sub = "no reading" if not weekly else "none reported"
+            else:
+                left = fmt_reset_countdown(iso)
+                sub = f"resets in {left}" if iso and left not in ('—', '') else "not started"
+            col.pack_start(lbl(sub, 'ring-sub', 0.5), False, False, 0)
+            rings.pack_start(col, True, True, 0)
+        core.pack_start(rings, False, False, 0)
+
+        # The current session, from the local logs, anchored on the reset time.
+        try:
+            acc = self._primary_account().label
+            rows = self.store.query(since=now - SESSION_LOOKBACK, account=acc)
+            block = active_session(rows, st.last_resets_5h)
+        except Exception:
+            block = None
+        sess = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
+        sess.get_style_context().add_class('notice')
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        top.pack_start(lbl('Current session', 'eyebrow-strong'), True, True, 0)
+        if block is not None:
+            top.pack_end(lbl(f"{fmt_duration(block.remaining().total_seconds())} left",
+                             'bar-value'), False, False, 0)
+            sess.pack_start(top, False, False, 0)
+            m = ui.Meter(height=6, color='accent')
+            m.set_value(100.0 * block.elapsed().total_seconds()
+                        / BLOCK_DURATION.total_seconds())
+            sess.pack_start(m, False, False, 0)
+            sess.pack_start(lbl(f"{fmt(block.total_tokens)} tokens · "
+                                f"{fmt_cost(block.cost_usd)} at API prices · "
+                                f"{block.messages:,} messages", 'stat-sub'),
+                            False, False, 0)
+        else:
+            top.pack_end(lbl('idle', 'stat-sub'), False, False, 0)
+            sess.pack_start(top, False, False, 0)
+        core.pack_start(sess, False, False, 0)
+
+        if hs is not None and len(hs.profiles) > 1:
+            try:
+                pick = claudehop.most_room(self.hop_readings(hs),
+                                           [p.name for p in hs.profiles],
+                                           hs.active, now)
+            except Exception:
+                pick = None
+            if pick is not None and pick.name:
+                nxt = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=9)
+                nxt.get_style_context().add_class('callout')
+                arrow = ui.NavIcon('arrow', 15)
+                arrow.get_style_context().add_class('nav-icon')
+                nxt.pack_start(arrow, False, False, 0)
+                l = lbl('', ellipsize=True)
+                l.set_markup(f"Most room: <b>{html.escape(pick.name)}</b>  "
+                             f"<span foreground=\"{COLORS['muted']}\">"
+                             f"{html.escape(pick.why.split(';')[0])}</span>")
+                nxt.pack_start(l, True, True, 0)
+                core.pack_start(nxt, False, False, 0)
+
+        foot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        when = st.last_read_at.astimezone().strftime('%H:%M') if st.last_read_at else '—'
+        foot.pack_start(lbl(f"Updated {when}" if not bad else state.replace('_', ' '),
+                            'stat-sub'), True, True, 0)
+        rb = Gtk.Button()
+        rb.add(ui.NavIcon('refresh', 15))
+        rb.get_style_context().add_class('btn-icon')
+        rb.set_tooltip_text("Ask for fresh figures now")
 
         def _do_refresh(_b):
             self._close_usage_popup()
             self._refresh_cloud()
         rb.connect('clicked', _do_refresh)
-        bottom.pack_end(rb, False, False, 0)
-        outer.pack_start(bottom, False, False, 0)
+        foot.pack_end(rb, False, False, 0)
+        ob = Gtk.Button(label='Open dashboard')
+        ob.get_style_context().add_class('btn-primary')
+
+        def _do_open(_b):
+            self._close_usage_popup()
+            self._show_view('dashboard')
+        ob.connect('clicked', _do_open)
+        foot.pack_end(ob, False, False, 0)
+        core.pack_start(foot, False, False, 0)
 
         def _on_button_press(_w, event):
             # Grabbed pointer delivers every button-press to us; a click
@@ -3137,12 +3094,32 @@ class App:
         win.connect('key-press-event', lambda w, e:
                     self._close_usage_popup() if e.keyval == 65307 else None)
         win.show_all()
+        self._place_popup(win)
         win.present()
         self._usage_popup = win
 
         seat = Gdk.Display.get_default().get_default_seat()
         seat.grab(win.get_window(), Gdk.SeatCapabilities.ALL, True,
                   None, None, None, None)
+
+    @staticmethod
+    def _place_popup(win: Gtk.Window):
+        """Open under the pointer (the tray icon, when opened from the tray),
+        kept inside the monitor's work area."""
+        try:
+            display = Gdk.Display.get_default()
+            pointer = display.get_default_seat().get_pointer()
+            _scr, px, py = pointer.get_position()
+            mon = display.get_monitor_at_point(px, py)
+            area = mon.get_workarea()
+            w, h = win.get_size()
+            x = min(max(area.x + 8, px - w // 2), area.x + area.width - w - 8)
+            y = py + 14
+            if y + h > area.y + area.height - 8:
+                y = max(area.y + 8, py - h - 14)
+            win.move(x, max(area.y + 8, y))
+        except Exception:
+            pass
 
     @staticmethod
     def _emoji_bar(frac: Optional[float], width: int = 8) -> str:
@@ -3305,8 +3282,11 @@ class App:
                      if len(pieces) == 1 else ' '.join(pieces))
             self._indicator.set_label(label, "100%")
 
-        # ── LIMITS section (primary account drives this) ──────────────────
+        # ── Tray icon: a ring for the primary account's 5-hour window ─────
         primary = self._primary_state()
+        self._update_tray_icon(primary)
+
+        # ── LIMITS section (primary account drives this) ──────────────────
         self._update_tray_limits(primary)
         try:
             self._update_tray_hop(primary)
@@ -3320,6 +3300,28 @@ class App:
                 continue
             st = self._account_states[acc.label]
             it.set_label(self._tray_account_line(st))
+
+    def _update_tray_icon(self, st: AccountState):
+        """Draw the indicator icon as a ring filled to the 5-hour use, in the
+        state colour; a broken ring when the connection has failed."""
+        if st.cloud_state in ('auth_error', 'network_error', 'rate_limited',
+                              'no_token'):
+            state, pct = 'error', None
+        elif st.awaiting_new_window or st.last_pct5 is None:
+            state, pct = 'none', None
+        else:
+            pct = float(st.last_pct5)
+            state = ui.level(pct)
+        path = ui.tray_icon_png(CACHE_DIR, pct, state)
+        if path is None or str(path) == getattr(self, '_tray_icon_path', None):
+            return
+        self._tray_icon_path = str(path)
+        desc = (f"5-hour window {int(pct)}% used" if pct is not None
+                else "No current reading")
+        try:
+            self._indicator.set_icon_full(str(path), desc)
+        except Exception as e:
+            print(f"[{APP_ID}] tray icon: {e}", file=sys.stderr)
 
     @staticmethod
     def _tray_tag(st: AccountState) -> str:
@@ -3851,6 +3853,7 @@ class App:
         Called by the dashboard's Settings tab when the user clicks Save."""
         save_settings(settings)
         self._settings = settings
+        ui.THRESHOLDS.update(settings.thresholds)
         self._refresh_cloud()
 
     def reload_accounts(self, accounts: List[Account]):

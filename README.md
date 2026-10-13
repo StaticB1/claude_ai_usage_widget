@@ -39,14 +39,19 @@ the live polling and it's a pure local analytics tool; ignore the dashboard and
 the tray gauge behaves like the original widget.
 
 <p align="center">
-  <img src="assets/widget.png" alt="System-tray widget menu: live 5h/7d limits, current 5-hour block, and quick actions" width="300">
+  <img src="assets/widget.png" alt="The usage panel: rings for the 5-hour and 7-day windows, the current session, and the account with the most room" width="340">
 </p>
-<p align="center"><sub><b>1 · The usage widget</b> — live 5h / 7d plan limits, current-block burn &amp; spend, and quick actions, straight from the system tray.</sub></p>
+<p align="center"><sub><b>1 · The usage widget</b> — the tray icon is a ring that fills with your 5-hour window; click for this panel with both plan windows, the current session and, with claudehop, the account with the most room.</sub></p>
 
 <p align="center">
-  <img src="screenshot.png" alt="Claude Usage Widget & Token Tracker dashboard" width="820">
+  <img src="screenshot.png" alt="The dashboard: plan rings, the current session, totals for the period and a 30-day usage chart" width="820">
 </p>
-<p align="center"><sub><b>2 · The token tracker</b> — local history: per-project / per-model spend, budgets, and 5-hour block forecasts (project names blurred).</sub></p>
+<p align="center"><sub><b>2 · The token tracker</b> — plan rings, the current session, totals, a 30-day chart, account tiles and top projects and models. Demo data.</sub></p>
+
+<p align="center">
+  <img src="assets/dashboard-dark.png" alt="The same dashboard in the dark theme" width="820">
+</p>
+<p align="center"><sub>The dark theme, which can follow your desktop's setting.</sub></p>
 
 ## Features
 
@@ -170,8 +175,14 @@ claude-token-tracker     # launch the GTK dashboard + tray widget (Linux)
 
 Launch `claude-token-tracker` and a gauge appears in your system tray:
 
-- The ring/percentage is your **live 5-hour plan utilization** (0–100% of your
-  Pro/Max/Team limit). Green → amber → red as you approach the cap.
+- The ring and percentage are your **live 5-hour plan utilization** (0–100% of
+  your Pro/Max/Team limit). Teal while there is room, amber past your warning
+  threshold and red past the critical one (60% and 85% unless you change them
+  in Settings). A broken ring means the connection failed; a dot means no
+  reading yet.
+- Click **Usage panel…** (or the gauge at the foot of the dashboard's sidebar)
+  for a small panel with both plan rings, the current session and the account
+  with the most room.
 - Right-click the tray icon for the full readout: the **LIMITS** section (5h and
   7d windows + any per-model weekly caps, each with resets), per-**ACCOUNT**
   utilization, and your **CURRENT 5H BLOCK** burn (this part is local and works
@@ -242,19 +253,27 @@ COST=$(ctt summary --period today --json | jq '.totals.cost_usd')
 
 `claude-token-tracker` (or `ctt gui`) opens a window with:
 
-- **Dashboard** — live limits (5h / 7d + per-model weekly caps), current block,
-  headline totals.
-- **Projects** — per-project spend and recent sessions.
-- **Breakdowns** — per-model and per-tool attribution.
-- **Budgets** — create/track budgets with progress bars.
+- **Dashboard** — rings for the 5-hour and 7-day windows (and any separate
+  weekly cap for one model), the current session with time left, burn rate and
+  when you would hit the limit at this pace, totals for the period, a 30-day
+  usage chart you can point at, a tile per claudehop account, and the top
+  projects and models.
+- **Projects** — per-project spend and recent sessions, searchable and sortable.
+- **Breakdowns** — each model's share of the cost and each tool's share of the
+  calls, with the full table below.
+- **Budgets** — your budgets with a meter each, and a form to add one.
 - **Settings** — accounts, polling, notification thresholds, OAuth token,
   **Appearance** (System / Light / Dark theme, switches live).
 
-The tray menu itself also shows the 5h/7d limits and the current block as
-inline progress bars rather than plain numbers, and a **Usage panel…** entry
-opens a small standalone card with the same bars plus cloud connection status
-— handy on desktops (or window managers) where the AppIndicator dropdown
-itself can't be restyled.
+Usage is coloured by state only: teal, amber, red. Those three were checked for
+colour-blind separation and contrast in both themes, and every one appears next
+to its number, so colour never carries the meaning alone. The interface ships
+its own fonts (Geist, Geist Mono and Instrument Serif, all under the SIL Open
+Font License), so it looks the same on any distribution.
+
+The tray menu also shows the 5h/7d limits and the current block as inline bars,
+and its **Usage panel…** entry opens the small panel described above — handy on
+desktops where the AppIndicator dropdown itself can't be restyled.
 
 ## Configuration
 
@@ -444,3 +463,8 @@ MIT.
   escalation notifications, and plan-utilization view are the foundation of this
   project's widget half. Thanks to StaticB1 for the original work and for taking
   this upgrade upstream.
+- Fonts in `assets/fonts/`: [Geist and Geist Mono](https://github.com/vercel/geist-font)
+  (The Geist Project Authors) and
+  [Instrument Serif](https://github.com/Instrument/instrument-serif) (The
+  Instrument Serif Project Authors), each under the SIL Open Font License 1.1,
+  with the licence files beside them.

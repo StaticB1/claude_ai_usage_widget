@@ -104,3 +104,11 @@ def test_missing_percent_defaults_to_zero():
     assert out[0]["fraction"] == 0.0
     assert out[0]["pct"] == 0
     assert out[0]["is_active"] is False
+
+
+def test_a_team_seat_with_a_max_rate_tier_is_a_team_plan():
+    from cct.cloud import subscription_summary
+    assert subscription_summary({'type': 'Team', 'tier': 'default_claude_max_5x'}) == (
+        'Team plan', True)
+    assert subscription_summary({'type': 'Max', 'tier': 'default_claude_max_20x'}) == (
+        'Max 20x plan', True)

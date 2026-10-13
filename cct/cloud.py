@@ -94,6 +94,10 @@ def subscription_summary(info: Optional[dict]) -> Tuple[str, bool]:
         return ("Pay-as-you-go API", False)
     sub_type = (info.get('type') or '').strip()
     rate_tier = (info.get('tier') or '').lower()
+    # A Team or Enterprise seat can carry a Max rate tier
+    # ('default_claude_max_5x'); the seat type is what the person has.
+    if sub_type.lower() in ('team', 'enterprise'):
+        return (f"{sub_type.title()} plan", True)
     if 'max_20x' in rate_tier:
         return ("Max 20x plan", True)
     if 'max_5x' in rate_tier or 'max' in rate_tier:
