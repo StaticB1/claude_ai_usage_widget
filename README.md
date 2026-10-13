@@ -58,10 +58,14 @@ the tray gauge behaves like the original widget.
 - **Per-model weekly limits** — when your plan meters a model separately (e.g. a
   dedicated **Opus** weekly cap on Max), each model's limit gets its own row/bar
   with percentage and reset, marked `●` when it's the one currently gating you.
+  Team and Enterprise seats have no all-model weekly window, so their weekly
+  figure is the fullest weekly meter, named after the model it covers.
 - **ETA-to-limit** — projects when you'll hit your cap at the current burn rate.
 - **Escalation notifications** — desktop alerts at 75% / 90% / 100% of a window.
 - **Multi-account** — track several Claude logins at once, each with its own
-  tray readout; hide any account from the tray or disable its polling.
+  tray readout; hide any account from the tray or disable its polling. If you
+  switch logins with [claudehop](https://github.com/psychofict/claudehop), see
+  [Several accounts with claudehop](#several-accounts-with-claudehop).
 
 **Token Tracker (local analytics)**
 - **SQLite history** at `~/.config/claude-token-tracker/history.db` that
@@ -192,7 +196,7 @@ per-account **"disable polling"** switch in Settings.
 | `ctt summary [--period P] [--limit N] [--account A] [--json]` | Per-project token & cost totals. |
 | `ctt models [--period P] [--account A] [--json]` | Per-model breakdown. |
 | `ctt tools [--period P] [--account A] [--json]` | Per-tool attribution (`Bash`, `Read`, `Edit`, `Agent`, …). |
-| `ctt accounts [--period P] [--json]` | List configured accounts and their totals. |
+| `ctt accounts [--period P] [--json]` | List configured accounts and their totals; with claudehop, also each claudehop account's tokens, plan usage and the login with the most room. |
 | `ctt block [--account A] [--no-cloud] [--json]` | Current 5-hour session, burn rate, and ETA. `--no-cloud` skips the live reset time and infers the window from logs. |
 | `ctt cloud [--account A]` | Live cloud usage from claude.ai (raw JSON). |
 | `ctt prompt [--no-cloud] [--account A]` | One-line status for shell prompts / status bars. |
@@ -275,6 +279,40 @@ The installer can set these up interactively, or edit `config.json`:
   ]
 }
 ```
+
+### Several accounts with claudehop
+
+The widget works on its own and nothing in this section is needed to use it.
+[claudehop](https://github.com/psychofict/claudehop) is a separate tool that
+keeps several Claude logins in one `~/.claude` and switches between them. When
+it has saved accounts in `~/.claude/accounts`, the widget shows them; without
+it, none of this appears.
+
+- **Which account is live.** The dashboard header and the tray name it, or the
+  provider (such as Bedrock) that new sessions run through.
+- **Every account's usage.** The Accounts card and the tray list each account's
+  newest 5-hour and weekly reading. The live login's comes from the widget's own
+  polling. The others come from claudehop's cache or from the last time the
+  widget saw them live, with the reading's age.
+- **Read all accounts.** This button runs `hop usage` once, so claudehop reads
+  every account and renews an idle account's token first. Each read spends a
+  little of the usage endpoint's allowance, so it never runs on its own. If
+  another claudehop command holds its lock (an open `hop` picker does until you
+  choose), the card says so instead of waiting.
+- **Where to go next.** The login with the most 5-hour room, chosen the way
+  `hop next` chooses: from its `next` list when you have one, never a full
+  login, and the soonest reset first among close calls.
+- **`hop run` terminals.** Accounts open in a `hop run` session show how many.
+- **Tokens per account.** From the first scan after this version, each turn is
+  filed under the account that made it: the live login at the time of the turn,
+  taken from claudehop's `active` pointer, or the account of the `hop run`
+  session the conversation ran in. Filter with the dashboard's account selector
+  or `--account hop:NAME` on the CLI. Earlier history, and any stretch when
+  neither the dashboard nor `ctt` was running to see a hop, stays unattributed.
+
+Readings of other accounts need claudehop 1.6.0 or later, and `hop run`
+sessions need 1.7.0. The widget never writes claudehop's files and keeps no
+token.
 
 ### Rate-card override
 

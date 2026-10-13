@@ -145,15 +145,68 @@ def normalize_utilization(raw) -> float:
     return (utilization_pct(raw) or 0.0) / 100.0
 
 
+def _scope_name(scope) -> Optional[str]:
+    """The model or surface a scoped limit covers, such as ``Fable``."""
+    if not isinstance(scope, dict):
+        return None
+    for part in (scope.get('model'), scope.get('surface')):
+        if isinstance(part, dict) and part.get('display_name'):
+            return str(part['display_name'])
+    return None
+
+
+def weekly_window(data: Optional[dict]) -> Optional[dict]:
+    """The weekly figure to show, as ``{utilization, resets_at, scope}``.
+
+    Most plans report an all-model ``seven_day`` window. Team and Enterprise
+    seats report ``seven_day`` as null and put their weekly caps in the
+    ``limits`` list instead, often scoped to one model (measured by claudehop
+    on 13 Oct 2026). Reading only ``seven_day`` showed those seats a weekly
+    figure of 0% whatever they had used. So: the all-model window when there
+    is one, else an all-model ``weekly_all`` row, else the fullest weekly
+    meter, with ``scope`` naming the model it covers. None when the reply has
+    no weekly figure at all.
+    """
+    if not isinstance(data, dict):
+        return None
+    sd = data.get('seven_day')
+    if isinstance(sd, dict) and utilization_pct(sd.get('utilization')) is not None:
+        return {'utilization': sd.get('utilization'),
+                'resets_at': sd.get('resets_at'), 'scope': None}
+    best = None
+    for lim in data.get('limits') or []:
+        if not isinstance(lim, dict):
+            continue
+        kind = str(lim.get('kind') or '')
+        if not (kind.startswith('weekly') or lim.get('group') == 'weekly'):
+            continue
+        pct = utilization_pct(lim.get('percent'))
+        if pct is None:
+            continue
+        scope = None if kind == 'weekly_all' else _scope_name(lim.get('scope'))
+        cand = {'utilization': pct, 'resets_at': lim.get('resets_at'),
+                'scope': scope}
+        if best is None:
+            best = cand
+        elif (cand['scope'] is None) != (best['scope'] is None):
+            # An all-model row is the real weekly cap; it beats a scoped one.
+            if cand['scope'] is None:
+                best = cand
+        elif pct > best['utilization']:
+            best = cand
+    return best
+
+
 def extract_model_limits(data: Optional[dict]) -> list:
     """Pull per-model weekly limits out of the usage API's ``limits`` array.
 
     The API returns a flat ``limits`` list that mixes account-wide windows
     (``kind`` == ``session`` / ``weekly_all``) with per-model caps
     (``kind`` == ``weekly_scoped``, carrying ``scope.model.display_name`` —
-    e.g. a separate weekly Opus limit on Max plans). We surface only the
-    model-scoped ones here; the account-wide 5h/7d windows already come from
-    the legacy ``five_hour`` / ``seven_day`` fields.
+    e.g. a separate weekly Opus limit on Max plans — or a surface's
+    ``scope.surface.display_name``). We surface only the scoped ones here;
+    the account-wide 5h/7d windows come from ``five_hour`` and
+    ``weekly_window``.
 
     Returns a list of dicts, highest-utilization first::
 
@@ -168,10 +221,7 @@ def extract_model_limits(data: Optional[dict]) -> list:
     for lim in data.get('limits') or []:
         if not isinstance(lim, dict) or lim.get('kind') != 'weekly_scoped':
             continue
-        scope = lim.get('scope')
-        model = (scope or {}).get('model') if isinstance(scope, dict) else None
-        name = (model or {}).get('display_name') if isinstance(model, dict) \
-            else None
+        name = _scope_name(lim.get('scope'))
         if not name:
             continue
         frac = normalize_utilization(lim.get('percent'))

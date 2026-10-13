@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
 from .blocks import BLOCK_DURATION, parse_resets_at
-from .cloud import utilization_pct
+from .cloud import utilization_pct, weekly_window
 from .periods import (local_day_start, local_month_end, local_month_start,
                      local_week_start)
 from .store import Store
@@ -99,8 +99,8 @@ def _utilization_pct(usage_data: Optional[dict],
     """Read 0..100 utilization for '5h' or '7d' from a cloud-API payload."""
     if not usage_data:
         return None
-    key = 'five_hour' if window == '5h' else 'seven_day'
-    bucket = usage_data.get(key)
+    bucket = (usage_data.get('five_hour') if window == '5h'
+              else weekly_window(usage_data))
     if not isinstance(bucket, dict):
         return None
     return utilization_pct(bucket.get('utilization'))
@@ -109,8 +109,8 @@ def _utilization_pct(usage_data: Optional[dict],
 def _resets_at(usage_data: Optional[dict], window: str) -> Optional[str]:
     if not usage_data:
         return None
-    key = 'five_hour' if window == '5h' else 'seven_day'
-    bucket = usage_data.get(key)
+    bucket = (usage_data.get('five_hour') if window == '5h'
+              else weekly_window(usage_data))
     return (bucket or {}).get('resets_at') if isinstance(bucket, dict) else None
 
 

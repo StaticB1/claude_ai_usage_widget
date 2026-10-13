@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
-from .cloud import utilization_pct as _pct
+from .cloud import utilization_pct as _pct, weekly_window
 from .config import (BURN_RATE_GRACE_HOURS, DEFAULT_BURN_RATE,
                      DEFAULT_THRESHOLDS, NOTIFICATION_STATE_FILE,
                      write_private_file)
@@ -58,7 +58,7 @@ class WindowSnapshot:
         if not data:
             return cls()
         fh = data.get('five_hour') or {}
-        sd = data.get('seven_day') or {}
+        sd = weekly_window(data) or {}   # Team seats have no seven_day
         return cls(
             five_hour_pct=_pct(fh.get('utilization')),
             five_hour_resets_at=fh.get('resets_at'),

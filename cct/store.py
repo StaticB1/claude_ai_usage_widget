@@ -2,10 +2,11 @@ from __future__ import annotations
 import json as _json
 import sqlite3
 import threading
+from bisect import bisect_right
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional
+from typing import Callable, Dict, Iterable, Iterator, List, Optional
 
 from .config import BEDROCK_ACCOUNT_LABEL, DB_FILE, DEFAULT_ACCOUNT_LABEL
 from .parser import Turn
@@ -72,6 +73,40 @@ CREATE INDEX IF NOT EXISTS idx_messages_model ON messages(model);
 """
 
 VALID_PERIODS = ('day', 'week', 'month', '5h', '7d')
+
+# An account filter of the form ``hop:<name>`` selects the turns made with that
+# claudehop account (the ``hop_account`` column) instead of a configured
+# account's logs.
+HOP_PREFIX = 'hop:'
+
+# claudehop attribution. The hop timeline is only trusted while something was
+# watching it: a silence longer than this between two checks may hide hops, so
+# that stretch is filed as unknown.
+HOP_WATCH_GAP = timedelta(minutes=3)
+# A `hop run` session's file disappears when its process ends, between two
+# checks; turns logged this soon after the last sighting still belong to it.
+HOP_RUN_GRACE = timedelta(seconds=60)
+
+
+class _TurnAt:
+    """The two things ``hop_resolver`` reads from a turn, for a stored row."""
+    __slots__ = ('timestamp', 'session_id')
+
+    def __init__(self, timestamp: datetime, session_id: Optional[str]):
+        self.timestamp = timestamp
+        self.session_id = session_id
+
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat(timespec='microseconds')
+
+
+def _from_iso(raw) -> Optional[datetime]:
+    try:
+        dt = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 # Every aggregate query sums the same five token columns; spelling that out
 # once keeps the SQL statements below honest with each other.
@@ -142,6 +177,23 @@ class Store:
             c.execute("""CREATE TABLE IF NOT EXISTS hop_usage (
                 name TEXT PRIMARY KEY, pct5 INTEGER, pct7 INTEGER,
                 resets_5h TEXT, resets_7d TEXT, seen_at TEXT NOT NULL)""")
+            hcols = {r['name'] for r in c.execute(
+                "PRAGMA table_info(hop_usage)").fetchall()}
+            if 'week_scope' not in hcols:
+                c.execute("ALTER TABLE hop_usage ADD COLUMN week_scope TEXT")
+                # Readings taken before weekly_window existed stored 0 for a
+                # Team seat, whose reply has no seven_day window and so no
+                # weekly reset time. That 0 was never measured.
+                c.execute("UPDATE hop_usage SET pct7=NULL WHERE resets_7d IS NULL")
+            # When each claudehop account became the live login (account NULL:
+            # a stretch nobody was watching), and which conversations ran in
+            # `hop run` sessions on an account of their own.
+            c.execute("""CREATE TABLE IF NOT EXISTS hop_timeline (
+                at TEXT PRIMARY KEY, account TEXT)""")
+            c.execute("""CREATE TABLE IF NOT EXISTS hop_run_sessions (
+                session_id TEXT NOT NULL, account TEXT NOT NULL,
+                since TEXT NOT NULL, last_seen TEXT NOT NULL,
+                PRIMARY KEY (session_id, since))""")
             bcols = {r['name'] for r in c.execute(
                 "PRAGMA table_info(budgets)").fetchall()}
             if 'limit_pct' not in bcols:
@@ -153,7 +205,13 @@ class Store:
                     "ALTER TABLE messages ADD COLUMN account TEXT "
                     "NOT NULL DEFAULT 'default'"
                 )
+            if 'hop_account' not in mcols:
+                # NULL for every row already stored: nothing recorded which
+                # account was live before this version, so they stay unattributed.
+                c.execute("ALTER TABLE messages ADD COLUMN hop_account TEXT")
             c.executescript(SCHEMA_INDEXES)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_messages_hop_ts "
+                      "ON messages(hop_account, timestamp)")
             # Bedrock turns live under their own account (see Turn.is_bedrock).
             # Idempotent, so it also repairs rows imported before this existed.
             c.execute("UPDATE messages SET account=? "
@@ -188,12 +246,15 @@ class Store:
     # ── Ingest ──────────────────────────────────────────────────────────────
 
     def upsert_turns(self, turns: Iterable[Turn], rate_card: RateCard,
-                     account: str = DEFAULT_ACCOUNT_LABEL) -> int:
+                     account: str = DEFAULT_ACCOUNT_LABEL,
+                     hop_of: Optional[Callable[[Turn], Optional[str]]] = None
+                     ) -> int:
         """Insert or refresh rows for ``turns``. Returns the number written.
 
         This updates on conflict rather than ignoring, so re-reading a log
         after a parser or pricing fix corrects the stored row instead of
-        leaving the first (wrong) version in place forever.
+        leaving the first (wrong) version in place forever. ``hop_of`` names
+        the claudehop account each turn was made with (see ``hop_resolver``).
         """
         rows = []
         for t in turns:
@@ -216,6 +277,7 @@ class Store:
                 cost,
                 int(t.is_sidechain),
                 _json.dumps(t.tool_uses) if t.tool_uses else None,
+                hop_of(t) if hop_of is not None and not t.is_bedrock else None,
             ))
         if not rows:
             return 0
@@ -225,8 +287,8 @@ class Store:
                     msg_key, timestamp, account, project, session_id, model,
                     input_tokens, cache_creation_5m, cache_creation_1h,
                     cache_read, output_tokens, cost_usd, is_sidechain,
-                    tool_uses_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    tool_uses_json, hop_account
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(msg_key) DO UPDATE SET
                     timestamp=excluded.timestamp,
                     account=excluded.account,
@@ -240,7 +302,8 @@ class Store:
                     output_tokens=excluded.output_tokens,
                     cost_usd=excluded.cost_usd,
                     is_sidechain=excluded.is_sidechain,
-                    tool_uses_json=excluded.tool_uses_json""",
+                    tool_uses_json=excluded.tool_uses_json,
+                    hop_account=excluded.hop_account""",
                 rows,
             )
             return len(rows)
@@ -248,22 +311,192 @@ class Store:
     # ── Incremental-scan bookkeeping ─────────────────────────────────────────
 
     def save_hop_usage(self, name: str, pct5: Optional[int], pct7: Optional[int],
-                       resets_5h: Optional[str], resets_7d: Optional[str]) -> None:
+                       resets_5h: Optional[str], resets_7d: Optional[str],
+                       week_scope: Optional[str] = None) -> None:
         """Remember the plan usage last seen while claudehop account ``name`` was
-        live, so it can still be shown after you hop to another account."""
+        live, so it can still be shown after you hop to another account.
+        ``week_scope`` names the model a Team seat's weekly figure covers."""
         with self._conn() as c:
             c.execute(
-                "INSERT INTO hop_usage(name, pct5, pct7, resets_5h, resets_7d, seen_at) "
-                "VALUES(?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
-                "pct5=excluded.pct5, pct7=excluded.pct7, resets_5h=excluded.resets_5h, "
-                "resets_7d=excluded.resets_7d, seen_at=excluded.seen_at",
-                (name, pct5, pct7, resets_5h, resets_7d,
+                "INSERT INTO hop_usage(name, pct5, pct7, resets_5h, resets_7d, "
+                "week_scope, seen_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(name) DO "
+                "UPDATE SET pct5=excluded.pct5, pct7=excluded.pct7, "
+                "resets_5h=excluded.resets_5h, resets_7d=excluded.resets_7d, "
+                "week_scope=excluded.week_scope, seen_at=excluded.seen_at",
+                (name, pct5, pct7, resets_5h, resets_7d, week_scope,
                  datetime.now(timezone.utc).isoformat()))
 
     def hop_usage(self) -> Dict[str, dict]:
         with self._conn() as c:
             return {r['name']: dict(r)
                     for r in c.execute("SELECT * FROM hop_usage").fetchall()}
+
+    # ── Which claudehop account made each turn ──────────────────────────────
+
+    def track_hop(self, active: Optional[str], changed_at: Optional[datetime],
+                  now: Optional[datetime] = None) -> Optional[datetime]:
+        """Record which claudehop account is live, for attributing turns.
+
+        Call this on every scan, before importing. ``changed_at`` is when
+        claudehop last wrote its ``active`` pointer, which it does on every hop,
+        so a hop is dated to the second even when it is noticed later. Hops
+        made while nothing was checking (a silence over ``HOP_WATCH_GAP``) can't
+        be ordered, so that stretch is recorded as unknown. A first check
+        dates the live account from its hop: it has been live since then.
+
+        Returns the earliest time the timeline changed from, so turns already
+        stored since then can be filed again (``reattribute``), or None.
+        """
+        now = now or datetime.now(timezone.utc)
+        changed: List[datetime] = []
+        with self._conn() as c:
+            rows = [(_from_iso(r['at']), r['account']) for r in
+                    c.execute("SELECT at, account FROM hop_timeline").fetchall()]
+            rows = sorted((r for r in rows if r[0] is not None),
+                          key=lambda r: r[0])
+            hb_row = c.execute("SELECT value FROM meta WHERE key='hop_watch_last'"
+                               ).fetchone()
+            hb = _from_iso(hb_row['value']) if hb_row else None
+
+            def put(at: datetime, acc: Optional[str]):
+                c.execute("INSERT INTO hop_timeline(at, account) VALUES(?,?) "
+                          "ON CONFLICT(at) DO UPDATE SET account=excluded.account",
+                          (_iso(at), acc))
+                changed.append(at)
+
+            if not rows:
+                if active:
+                    start = changed_at if changed_at and changed_at <= now else now
+                    put(start, active)
+            else:
+                last_at, last_acc = rows[-1]
+                gap = hb is None or now - hb > HOP_WATCH_GAP
+                hopped = changed_at is not None and (hb is None or changed_at > hb)
+                if active != last_acc or (gap and hopped):
+                    floor = last_at
+                    if gap and hb is not None and hb > last_at:
+                        put(hb, None)
+                        floor = hb
+                    at = changed_at if hopped and changed_at <= now else now
+                    if at <= floor:
+                        at = now
+                    put(at, active)
+            c.execute("INSERT INTO meta(key, value) VALUES('hop_watch_last', ?) "
+                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                      (_iso(now),))
+        return min(changed) if changed else None
+
+    def note_run_sessions(self, sessions: Iterable, now: Optional[datetime] = None
+                          ) -> Optional[datetime]:
+        """Remember the conversations open in ``hop run`` sessions (objects with
+        ``session_id``, ``account`` and ``since``), and that they are still open.
+        Returns the earliest start of a session not seen before, or None."""
+        now = now or datetime.now(timezone.utc)
+        rows = [(s.session_id, s.account, _iso(s.since), _iso(now))
+                for s in sessions]
+        if not rows:
+            return None
+        with self._conn() as c:
+            known = {(r['session_id'], r['since']) for r in c.execute(
+                "SELECT session_id, since FROM hop_run_sessions").fetchall()}
+            new = [_from_iso(r[2]) for r in rows if (r[0], r[2]) not in known]
+            c.executemany(
+                "INSERT INTO hop_run_sessions(session_id, account, since, last_seen) "
+                "VALUES(?,?,?,?) ON CONFLICT(session_id, since) DO UPDATE SET "
+                "account=excluded.account, last_seen=excluded.last_seen", rows)
+        new = [t for t in new if t]
+        return min(new) if new else None
+
+    def reattribute(self, account: str, since: datetime) -> int:
+        """File the stored turns of ``account`` from ``since`` on again, under the
+        claudehop account each was made with. Needed when the timeline learns
+        something about turns already stored: a hop noticed a few seconds late,
+        a `hop run` session seen for the first time, or rows an earlier version
+        stored without attribution. Returns the number of rows changed."""
+        resolve = self.hop_resolver()
+        start = _iso(since - timedelta(seconds=1))
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT msg_key, timestamp, session_id, hop_account FROM messages "
+                "WHERE account=? AND timestamp >= ?", (account, start)).fetchall()
+            updates = []
+            for r in rows:
+                ts = _from_iso(r['timestamp'])
+                if ts is None:
+                    continue
+                who = resolve(_TurnAt(ts, r['session_id']))
+                if who != r['hop_account']:
+                    updates.append((who, r['msg_key']))
+            c.executemany("UPDATE messages SET hop_account=? WHERE msg_key=?",
+                          updates)
+        return len(updates)
+
+    def meta_get(self, key: str) -> Optional[str]:
+        with self._conn() as c:
+            row = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row['value'] if row else None
+
+    def meta_set(self, key: str, value: str) -> None:
+        with self._conn() as c:
+            c.execute("INSERT INTO meta(key, value) VALUES(?, ?) "
+                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                      (key, value))
+
+    def hop_resolver(self) -> Callable[[Turn], Optional[str]]:
+        """A function naming the claudehop account a turn was made with.
+
+        A conversation open in a ``hop run`` session used that session's account
+        between its start and its last sighting; anything else used whichever
+        account was live at the turn's time. None before tracking began and in
+        stretches nobody was watching.
+        """
+        with self._conn() as c:
+            tl = [(_from_iso(r['at']), r['account']) for r in
+                  c.execute("SELECT at, account FROM hop_timeline").fetchall()]
+            runs: Dict[str, List[tuple]] = {}
+            for r in c.execute("SELECT * FROM hop_run_sessions").fetchall():
+                since, seen = _from_iso(r['since']), _from_iso(r['last_seen'])
+                if since and seen:
+                    runs.setdefault(r['session_id'], []).append(
+                        (since, seen + HOP_RUN_GRACE, r['account']))
+        tl = sorted((r for r in tl if r[0] is not None), key=lambda r: r[0])
+        times = [t for t, _ in tl]
+
+        def resolve(turn: Turn) -> Optional[str]:
+            t = turn.timestamp
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            for since, until, acc in runs.get(turn.session_id or '', ()):
+                if since <= t <= until:
+                    return acc
+            i = bisect_right(times, t) - 1
+            return tl[i][1] if i >= 0 else None
+        return resolve
+
+    def hop_tracking_since(self) -> Optional[datetime]:
+        """When attribution to claudehop accounts began, or None if it never has."""
+        with self._conn() as c:
+            rows = c.execute("SELECT at FROM hop_timeline").fetchall()
+        times = [t for t in (_from_iso(r['at']) for r in rows) if t]
+        return min(times) if times else None
+
+    def hop_accounts_with_rows(self) -> List[str]:
+        with self._conn() as c:
+            return [r[0] for r in c.execute(
+                "SELECT DISTINCT hop_account FROM messages "
+                "WHERE hop_account IS NOT NULL ORDER BY hop_account").fetchall()]
+
+    def hop_account_summary(self, since: Optional[datetime] = None,
+                            until: Optional[datetime] = None) -> List[Dict]:
+        """Totals per claudehop account; ``hop_account`` None is unattributed."""
+        where, args = self._filters(since=since, until=until)
+        sql = (f"SELECT hop_account, COUNT(DISTINCT project) AS projects, "
+               f"MAX(timestamp) AS last_used, {_TOKEN_SUMS} "
+               "FROM messages WHERE account <> ?" + where +
+               " GROUP BY hop_account ORDER BY total_tokens DESC")
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                sql, [BEDROCK_ACCOUNT_LABEL, *args]).fetchall()]
 
     def has_account_rows(self, account: str) -> bool:
         with self._conn() as c:
@@ -348,7 +581,10 @@ class Store:
         if model:
             sql += " AND model = ?"
             args.append(model)
-        if account:
+        if account and account.startswith(HOP_PREFIX):
+            sql += " AND hop_account = ?"
+            args.append(account[len(HOP_PREFIX):])
+        elif account:
             sql += " AND account = ?"
             args.append(account)
         if not include_sidechain:
@@ -524,11 +760,8 @@ class Store:
             return float(c.execute(sql, args).fetchone()[0])
 
     def message_count(self, account: Optional[str] = None) -> int:
-        sql = "SELECT COUNT(*) FROM messages"
-        args: List = []
-        if account:
-            sql += " WHERE account = ?"
-            args.append(account)
+        where, args = self._filters(account=account)
+        sql = "SELECT COUNT(*) FROM messages WHERE 1=1" + where
         with self._conn() as c:
             return int(c.execute(sql, args).fetchone()[0])
 

@@ -2,9 +2,59 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.2.0] - 2026-10-13
+
+Brings the widget up to date with claudehop 1.6 to 1.9, and fixes the weekly
+figure for Team and Enterprise seats.
+
+### Fixed
+- **Team and Enterprise seats showed a weekly figure of 0%.** Their usage reply
+  has no `seven_day` window; the weekly caps come as rows in its `limits` list,
+  often one per model. Reading only `seven_day`, the 7-day bar, the tray line,
+  the weekly alerts and plan-percentage budgets all read 0% for these seats
+  whatever had been used (on one account, 0% against a real 9%). The weekly
+  figure is now the all-model window when there is one, else an all-model
+  weekly row, else the fullest weekly meter, labelled with the model it covers
+  (`7-Day Window · Fable`). That meter is not shown a second time as a model
+  bar. Stored readings from earlier versions that had no weekly reset time had
+  recorded that 0, and are cleared to unknown on start.
+- Limits scoped to a surface rather than a model are named too.
+- **The Projects tab raised OverflowError for a project over 2.1 billion tokens.**
+  The numeric sort columns were 32-bit; they are now 64-bit.
 
 ### Added
+- **Every claudehop account's usage, not only the live one's.** claudehop 1.6.0
+  and later keep the last reading of each account in `accounts/.usage-cache`.
+  The Accounts card, the tray and `ctt accounts` now show each account's newest
+  reading, from the widget's own polling or from that cache, with its age, where
+  it came from, and any server throttle claudehop has noted. A window whose
+  reset time has passed reads `reset, was 84%` instead of its old figure.
+- **Read all accounts.** A button on the Accounts card, and an item in the tray,
+  runs `hop usage` once so claudehop reads every account. It never runs on its
+  own, because each read spends a little of the usage endpoint's allowance. If
+  another claudehop command holds claudehop's lock (an open `hop` picker holds
+  it until you choose), the card says so instead of waiting. claudehop is never
+  killed: a read that takes longer than two minutes is left to finish and its
+  figures appear when it does.
+- **The login with the most room.** The card, the tray and `ctt accounts` name
+  the account `hop next` would choose: from claudehop's `next` list when there
+  is one, never a login whose 5-hour window is at 95% or whose all-model weekly
+  limit is used up, and the soonest reset first among close calls.
+- **Tokens per claudehop account.** Each turn is now filed under the claudehop
+  account that made it, in a new `hop_account` column. A conversation open in a
+  `hop run` session belongs to that session's account (Claude Code names it in
+  the session's own `sessions/` folder); anything else belongs to the account
+  that was live at the time of the turn, dated from claudehop's `active`
+  pointer, which it rewrites on every hop. The dashboard's account selector
+  offers each claudehop account once it has turns, `--account hop:NAME` works on
+  the command-line reports, and `ctt export` includes the column. History from
+  before this version, and any stretch when neither the dashboard nor `ctt` ran
+  to see a hop, stays unattributed rather than guessed.
+- **`hop run` terminals.** Accounts open in a `hop run` session (claudehop 1.7.0
+  and later) show how many on the card and in the tray.
+- Filtering the dashboard to a claudehop account that is not live shows its last
+  reading in the plan-limits section, and anchors the 5-hour block on its reset
+  time.
 - **Bedrock usage is tracked as its own account.** Claude Code on Amazon Bedrock
   logs the same model names as an Anthropic account, so the only tell is the
   response id, which Bedrock prefixes `msg_bdrk_`. Those turns are filed under the
@@ -19,10 +69,6 @@ All notable changes to this project will be documented in this file.
   and lists them, and `cct accounts` prints the same view. An account you have hopped
   away from is not polled, because that would mean renewing its token; it shows the
   last reading taken while it was active, with its age.
-
-### Fixed
-- **The Projects tab raised OverflowError for a project over 2.1 billion tokens.**
-  The numeric sort columns were 32-bit; they are now 64-bit.
 
 ## [2.1.0] - 2026-08-20
 

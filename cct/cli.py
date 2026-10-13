@@ -12,12 +12,12 @@ from .cloud import (AuthError, CloudApiError, RateLimitError,
                     fetch_cloud_usage, load_token, normalize_utilization)
 from .config import (APP_NAME, APP_VERSION, Account,
                      find_account, load_accounts, BEDROCK_ACCOUNT_LABEL)
-from .hop import load_state as load_hop_state, usage_text as hop_usage_text
+from . import hop as claudehop
 from .format import fmt, fmt_cost, fmt_duration
 from .parser import iter_project_dirs, parse_jsonl
 from .periods import UnknownPeriod, cutoff, range_text
 from .pricing import RateCard, load_rate_card
-from .store import Store
+from .store import HOP_PREFIX, Store
 
 
 def _safe_cloud_data(account: Optional[Account] = None) -> Optional[dict]:
@@ -37,6 +37,14 @@ def _safe_cloud_data(account: Optional[Account] = None) -> Optional[dict]:
 def _resolve_account(label: Optional[str]) -> Optional[Account]:
     if not label:
         return None
+    if label.startswith(HOP_PREFIX):
+        hs = claudehop.load_state()
+        names = [p.name for p in hs.profiles] if hs else []
+        if label[len(HOP_PREFIX):] not in names:
+            raise SystemExit(
+                f"Unknown claudehop account '{label[len(HOP_PREFIX):]}'. Known: "
+                f"{', '.join(names) or 'none (claudehop is not in use)'}")
+        return None  # no credentials of its own here; see _hop_reading
     accounts = load_accounts()
     acc = find_account(label, accounts)
     if not acc:
@@ -53,6 +61,21 @@ def _cutoff(period: str) -> Optional[datetime]:
         return cutoff(period)
     except UnknownPeriod as e:
         raise SystemExit(str(e))
+
+
+def _hop_reading(label: Optional[str]) -> Optional['claudehop.Reading']:
+    """For a ``hop:<name>`` filter, that account's newest plan reading: live
+    when it is the live login, else the last one claudehop or the widget took."""
+    if not label or not label.startswith(HOP_PREFIX):
+        return None
+    name = label[len(HOP_PREFIX):]
+    if claudehop.active_name(load_token()) == name:
+        data = _safe_cloud_data()
+        if data:
+            return claudehop.reading_from_cloud(data, datetime.now(timezone.utc))
+    return claudehop.newest(
+        claudehop.reading_from_seen(Store().hop_usage().get(name)),
+        claudehop.load_usage_cache().get(name))
 
 
 def _resets_at_5h(account: Optional[Account]) -> Optional[str]:
@@ -86,8 +109,11 @@ def scan_into_store(store: Store, rate_card: RateCard,
     If ``claude_dir`` is set, scans that single directory under the synthetic
     label ``default`` (back-compat with --claude-dir). Otherwise iterates
     every configured account; ``only`` (label) restricts to one account.
+
+    When claudehop is in use, turns from the config dir it manages are also
+    filed under the claudehop account that made them (see ``track_hop``).
     """
-    def _scan_dir(projects_root: Path, label: str) -> int:
+    def _scan_dir(projects_root: Path, label: str, hop_of=None) -> int:
         # Skip files whose (size, mtime) are unchanged since the last scan, so
         # a repeated scan only re-parses the active session log instead of the
         # whole history. Claude Code session JSONL is append-only, so a change
@@ -106,7 +132,8 @@ def scan_into_store(store: Store, rate_card: RateCard,
                 if prev.get(key) == sig:
                     continue
                 _, turns = parse_jsonl(jsonl)
-                n += store.upsert_turns(turns, rate_card, account=label)
+                n += store.upsert_turns(turns, rate_card, account=label,
+                                        hop_of=hop_of)
                 updates.append((key, st.st_size, st.st_mtime))
         store.mark_files_scanned(label, updates)
         return n
@@ -116,12 +143,48 @@ def scan_into_store(store: Store, rate_card: RateCard,
 
     if accounts is None:
         accounts = load_accounts()
+    hop_label = track_hop(store, accounts)
+    hop_of = store.hop_resolver() if hop_label else None
+    if only and only.startswith(HOP_PREFIX):
+        only = hop_label or only
     counts: dict = {}
     for acc in accounts:
         if only and acc.label != only:
             continue
-        counts[acc.label] = _scan_dir(acc.projects_dir, acc.label)
+        counts[acc.label] = _scan_dir(
+            acc.projects_dir, acc.label,
+            hop_of if acc.label == hop_label else None)
     return counts
+
+
+def track_hop(store: Store, accounts: List[Account]) -> Optional[str]:
+    """Note which claudehop account is live and which conversations are open in
+    ``hop run`` sessions. Returns the label of the configured account whose
+    logs claudehop manages, or None when claudehop is not in use."""
+    try:
+        home = claudehop.claude_home().resolve()
+        acc = next((a for a in accounts
+                    if Path(a.claude_dir).resolve() == home), None)
+        if acc is None:
+            return None
+        hs = claudehop.load_state(load_token(acc.credentials_file))
+        if hs is None or not hs.profiles:
+            return None
+        changed = [t for t in (
+            store.track_hop(hs.active, claudehop.active_changed_at()),
+            store.note_run_sessions(claudehop.run_sessions())) if t]
+        if not store.meta_get('hop_backfilled'):
+            # Once: rows an earlier version stored since tracking began.
+            first = store.hop_tracking_since()
+            if first:
+                changed.append(first)
+                store.meta_set('hop_backfilled', '1')
+        if changed:
+            store.reattribute(acc.label, min(changed))
+        return acc.label
+    except Exception as e:  # attribution is extra; never let it stop a scan
+        print(f"tracker: claudehop tracking skipped: {e}", file=sys.stderr)
+        return None
 
 
 # ── Subcommand handlers ────────────────────────────────────────────────────
@@ -273,7 +336,10 @@ def cmd_accounts(args):
             'cost_usd': s.get('cost_usd', 0.0),
             'last_used': s.get('last_used'),
         })
+    hop = _hop_report(store, cutoff)
     if args.json:
+        if hop:
+            out.extend(hop['rows'])
         print(json.dumps(out, indent=2, default=str))
         return
     print(_period_line(args.period, None))
@@ -284,19 +350,83 @@ def cmd_accounts(args):
         print(f"{a['label'][:16]:<16} {a['claude_dir'][:32]:<32} "
               f"{a['messages']:>6} {fmt(a['tokens'] or 0):>10} "
               f"{fmt_cost(a['cost_usd'] or 0):>10}")
-    hs = load_hop_state(load_token())
-    if hs:
-        seen = store.hop_usage()
-        now = datetime.now(timezone.utc)
-        print()
-        print(f"Hop: live login is {hs.active or 'unknown'}"
-              + (f"; new sessions run through {hs.provider}" if hs.provider else ""))
-        for p in sorted(hs.profiles, key=lambda q: (q.name != hs.active, q.name)):
-            usage, tag = hop_usage_text(p.name, hs, None, None, False,
-                                        seen.get(p.name), now)
-            mark = '*' if p.name == hs.active and not hs.provider else ' '
-            print(f" {mark} {p.name:<12} {(p.email or ''):<26} {(p.plan or ''):<6} "
-                  f"{usage}" + (f" · {tag}" if tag else ""))
+    if not hop:
+        return
+    hs = hop['state']
+    print()
+    print(f"claudehop: live login is {hs.active or 'unknown'}"
+          + (f"; new sessions run through {hs.provider}" if hs.provider else ""))
+    since = hop['tracking_since']
+    print("Tokens are those made with each account "
+          + (f"since tracking began on {since.astimezone():%Y-%m-%d %H:%M}."
+             if since else "(tracking starts with the next scan)."))
+    w = max(len(r['name']) for r in hop['rows'])
+    print(f"   {'Account':<{w}} {'Msgs':>6} {'Tokens':>8}  Plan usage")
+    for r in hop['rows']:
+        mark = '*' if r['live'] else ' '
+        extra = [x for x in (r['freshness'],
+                             f"open in {r['run_terminals']} hop run terminal"
+                             + ('s' if r['run_terminals'] != 1 else '')
+                             if r['run_terminals'] else '') if x]
+        print(f" {mark} {r['name']:<{w}} {r['messages']:>6} "
+              f"{fmt(r['tokens'] or 0):>8}  {r['usage']}"
+              + (f" ({'; '.join(extra)})" if extra else ''))
+    if hop['unattributed']:
+        print(f"   {'(unattributed)':<{w}} {hop['unattributed']['messages']:>6} "
+              f"{fmt(hop['unattributed']['total_tokens'] or 0):>8}  "
+              "before tracking began, or while nothing was watching")
+    pick = hop['next']
+    if pick is not None:
+        who = 'hop next would pick' if pick.listed else 'most 5-hour room'
+        print(f"Next: {pick.name} ({who}; {pick.why})" if pick.name
+              else f"Next: {pick.why}")
+
+
+def _hop_report(store: Store, cutoff: Optional[datetime]) -> Optional[dict]:
+    """Everything ``accounts`` says about claudehop accounts, or None."""
+    hs = claudehop.load_state(load_token())
+    if hs is None or not hs.profiles:
+        return None
+    now = datetime.now(timezone.utc)
+    names = [p.name for p in hs.profiles]
+    readings = claudehop.all_readings(names, store.hop_usage())
+    runs = claudehop.run_terminals()
+    totals = {r['hop_account']: r for r in store.hop_account_summary(cutoff)}
+    rows = []
+    for p in sorted(hs.profiles, key=lambda q: (q.name != hs.active, q.name)):
+        r = readings.get(p.name)
+        usage, fresh = claudehop.usage_text(r, now)
+        t = totals.get(p.name) or {}
+        rows.append({
+            'label': f'{HOP_PREFIX}{p.name}',
+            'name': p.name,
+            'claude_dir': 'claudehop account',
+            'email': p.email,
+            'plan': p.plan,
+            'live': p.name == hs.active and not hs.provider,
+            'disable_polling': True,
+            'hide_from_tray': True,
+            'messages': t.get('messages', 0),
+            'projects': t.get('projects', 0),
+            'tokens': t.get('total_tokens', 0),
+            'cost_usd': t.get('cost_usd', 0.0),
+            'last_used': t.get('last_used'),
+            'usage': usage,
+            'freshness': fresh,
+            'reading': ({'pct5': r.pct5, 'resets_5h': r.resets_5h,
+                         'pct7': r.pct7, 'resets_7d': r.resets_7d,
+                         'week_scope': r.week_scope, 'source': r.source,
+                         'read_at': r.at.isoformat() if r.at else None}
+                        if r is not None and r.has_figures else None),
+            'run_terminals': runs.get(p.name, 0),
+        })
+    return {
+        'state': hs,
+        'rows': rows,
+        'unattributed': totals.get(None),
+        'tracking_since': store.hop_tracking_since(),
+        'next': claudehop.most_room(readings, names, hs.active, now),
+    }
 
 
 def cmd_block(args):
@@ -304,8 +434,11 @@ def cmd_block(args):
     store = Store()
     account = getattr(args, 'account', None)
     resets_at = None
+    hr = None
     if not args.no_cloud:
-        resets_at = _resets_at_5h(_resolve_account(account))
+        acc = _resolve_account(account)
+        hr = _hop_reading(account)
+        resets_at = hr.resets_5h if hr is not None else _resets_at_5h(acc)
     block = active_session(_session_rows(store, account), resets_at)
     if block is None:
         print(json.dumps({'active': False, 'anchored': bool(resets_at)},
@@ -334,7 +467,9 @@ def cmd_block(args):
     if args.json:
         print(json.dumps(payload, indent=2))
     else:
-        source = 'live reset time' if block.anchored else 'estimated from logs'
+        source = ('estimated from logs' if not block.anchored
+                  else 'reset time from its last reading' if hr is not None
+                  else 'live reset time')
         print(f"Session: {block.start.astimezone():%Y-%m-%d %H:%M}"
               f" \u2192 {block.end.astimezone():%H:%M}  ({source})")
         print(f"  Messages: {block.messages}  "
@@ -374,7 +509,13 @@ def cmd_prompt(args):
     account = getattr(args, 'account', None)
     data = None
     if not args.no_cloud:
-        data = _safe_cloud_data(_resolve_account(account))
+        acc = _resolve_account(account)
+        hr = _hop_reading(account)
+        if hr is not None and hr.pct5 is not None:
+            data = {'five_hour': {'utilization': hr.pct5,
+                                  'resets_at': hr.resets_5h}}
+        elif hr is None:
+            data = _safe_cloud_data(acc)
     five = data.get('five_hour') if isinstance(data, dict) else None
     five = five if isinstance(five, dict) else {}
 
@@ -404,7 +545,8 @@ def cmd_export(args):
         )
     else:
         import csv
-        cols = ['timestamp', 'account', 'project', 'session_id', 'model',
+        cols = ['timestamp', 'account', 'hop_account', 'project',
+                'session_id', 'model',
                 'input_tokens', 'cache_creation_5m', 'cache_creation_1h',
                 'cache_read', 'output_tokens', 'cost_usd', 'is_sidechain']
         w = csv.writer(sys.stdout)
@@ -513,31 +655,36 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument('--period', default='30d',
                     help='today | 5h | 7d | 30d | NNd | NNh | all')
     sp.add_argument('--limit', type=int, default=20)
-    sp.add_argument('--account', help='filter to one account')
+    sp.add_argument('--account', help='filter to one account '
+                                        '(hop:NAME for a claudehop account)')
     sp.add_argument('--no-scan', dest='scan', action='store_false', default=True)
     sp.add_argument('--json', action='store_true')
     sp.set_defaults(func=cmd_summary)
 
     sp = sub.add_parser('models', help='Per-model breakdown')
     sp.add_argument('--period', default='30d')
-    sp.add_argument('--account', help='filter to one account')
+    sp.add_argument('--account', help='filter to one account '
+                                        '(hop:NAME for a claudehop account)')
     sp.add_argument('--json', action='store_true')
     sp.set_defaults(func=cmd_models)
 
     sp = sub.add_parser('tools', help='Per-tool attribution (Bash, Read, Edit, Agent, ...)')
     sp.add_argument('--period', default='30d')
-    sp.add_argument('--account', help='filter to one account')
+    sp.add_argument('--account', help='filter to one account '
+                                        '(hop:NAME for a claudehop account)')
     sp.add_argument('--json', action='store_true')
     sp.set_defaults(func=cmd_tools)
 
-    sp = sub.add_parser('accounts', help='List configured accounts and their totals')
+    sp = sub.add_parser('accounts', help='List accounts, claudehop accounts '
+                                         'included, and their totals')
     sp.add_argument('--period', default='30d')
     sp.add_argument('--json', action='store_true')
     sp.set_defaults(func=cmd_accounts)
 
     sp = sub.add_parser(
         'block', help="Current 5-hour session window + burn rate")
-    sp.add_argument('--account', help='filter to one account')
+    sp.add_argument('--account', help='filter to one account '
+                                        '(hop:NAME for a claudehop account)')
     sp.add_argument('--no-cloud', action='store_true',
                     help='skip the live reset-time lookup and infer the '
                          'window from local logs (less accurate)')
@@ -551,14 +698,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser('prompt', help='One-line status for shell/status bars')
     sp.add_argument('--no-cloud', action='store_true',
                     help='skip live cloud API call')
-    sp.add_argument('--account', help='filter to one account')
+    sp.add_argument('--account', help='filter to one account '
+                                        '(hop:NAME for a claudehop account)')
     sp.set_defaults(func=cmd_prompt)
 
     sp = sub.add_parser('export', help='Dump rows to JSON or CSV')
     sp.add_argument('--period', default='all')
     sp.add_argument('--project')
     sp.add_argument('--model')
-    sp.add_argument('--account')
+    sp.add_argument('--account', help='filter to one account '
+                                        '(hop:NAME for a claudehop account)')
     sp.add_argument('--format', choices=['json', 'csv'], default='json')
     sp.set_defaults(func=cmd_export)
 
