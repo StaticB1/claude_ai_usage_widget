@@ -316,8 +316,9 @@ it, none of this appears.
 - **Read all accounts.** This button runs `hop usage` once, so claudehop reads
   every account and renews an idle account's token first. Each read spends a
   little of the usage endpoint's allowance, so it never runs on its own. If
-  another claudehop command holds its lock (an open `hop` picker does until you
-  choose), the card says so instead of waiting.
+  another claudehop command holds its lock, the card says which one instead of
+  waiting (claudehop 2.0.0 and later record it; before 2.0.0, an open `hop`
+  menu held the lock until you chose).
 - **Where to go next.** The login with the most 5-hour room, chosen the way
   `hop next` chooses: from its `next` list when you have one, never a full
   login, and the soonest reset first among close calls.

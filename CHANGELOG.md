@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- When claudehop's lock is taken, "Read all accounts" names the command holding
+  it, as claudehop 2.0.0 and later record it in the lock file. The message no
+  longer blames an open `hop` menu, which stopped holding the lock in claudehop
+  2.0.0.
+
 ## [2.3.0] - 2026-10-13
 
 A redesign of the dashboard, the tray icon and the usage panel.

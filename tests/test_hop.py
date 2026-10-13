@@ -233,6 +233,14 @@ def test_read_all_does_not_start_while_the_lock_is_held(tmp_path, monkeypatch):
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
     assert got.status == 'busy' and not marker.exists()
+    assert 'before claudehop 2.0.0' in got.message       # an older claudehop left no record
+
+
+def test_busy_names_the_holder_when_claudehop_records_it(tmp_path, monkeypatch):
+    d = _setup(tmp_path, monkeypatch)
+    (d / '.lock').write_text('4242 1791873550 claudehop usage --json')
+    msg = hop.busy_message('Press again.')
+    assert msg.startswith('claudehop is busy with `claudehop usage --json` (pid 4242, since ')
 
 
 def test_a_queued_or_slow_read_is_left_running(tmp_path, monkeypatch):

@@ -546,8 +546,9 @@ def lock_busy() -> bool:
     """True while another claudehop command holds claudehop's lock.
 
     Every claudehop command that changes anything, ``hop usage`` included,
-    takes ``accounts/.lock`` first, and the bare ``hop`` picker holds it until
-    you choose an account. A read started then waits behind it.
+    takes ``accounts/.lock`` first, so a read started then waits behind it.
+    Before claudehop 2.0.0 the bare ``hop`` menu held it until you chose an
+    account.
     """
     try:
         import fcntl
@@ -568,6 +569,25 @@ def lock_busy() -> bool:
         os.close(fd)
 
 
+def lock_holder() -> str:
+    """Who holds claudehop's lock, from what claudehop 2.0.0 and later write
+    into the lock file (pid, start time, command); '' when unknown."""
+    try:
+        pid, started, cmd = (accounts_dir() / '.lock').read_text().split(" ", 2)
+        since = datetime.fromtimestamp(float(started)).strftime('%H:%M')
+        return f"`{cmd.strip()}` (pid {int(pid)}, since {since})"
+    except (OSError, ValueError):
+        return ""
+
+
+def busy_message(then: str) -> str:
+    holder = lock_holder()
+    if holder:
+        return f"claudehop is busy with {holder}. {then}"
+    return ("Another claudehop command holds its lock (before claudehop 2.0.0, an "
+            f"open hop menu did until you chose). {then}")
+
+
 @dataclass
 class ReadAll:
     status: str                    # 'done', 'busy', 'slow' or 'error'
@@ -575,8 +595,6 @@ class ReadAll:
     notes: Dict[str, str] = field(default_factory=dict)   # account -> why its reading is old
 
 
-BUSY = ("Another claudehop command holds its lock (an open hop picker does "
-        "until you choose).")
 _running: Optional[subprocess.Popen] = None
 
 
@@ -602,7 +620,7 @@ def read_all(wait: float = READ_ALL_WAIT_S) -> ReadAll:
     if not exe:
         return ReadAll('error', "claudehop is not installed or not on PATH.")
     if lock_busy():
-        return ReadAll('busy', BUSY + " Press again once it is closed.")
+        return ReadAll('busy', busy_message("Press again once it finishes."))
     try:
         proc = subprocess.Popen([exe, 'usage', '--json'], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -628,7 +646,7 @@ def read_all(wait: float = READ_ALL_WAIT_S) -> ReadAll:
     deadline = time.monotonic() + wait
     while proc.poll() is None:
         if queued.is_set():
-            return ReadAll('busy', BUSY + " This read runs as soon as it is closed.")
+            return ReadAll('busy', busy_message("This read runs as soon as it finishes."))
         if time.monotonic() > deadline:
             return ReadAll('slow', "claudehop is still reading; the figures "
                                    "appear when it finishes.")
