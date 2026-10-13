@@ -289,9 +289,14 @@ button.side-gauge-btn:hover .side-gauge {{ background-color: {C['overlay']}; }}
 }}
 .tile:hover {{ background-color: {C['overlay']}; }}
 .tile.live {{
-    background-color: {C['surface']}; border-color: alpha({C['accent']}, 0.55);
-    box-shadow: 0 0 0 3px {C['accent-soft']};
+    background-color: {C['surface']}; border-color: alpha({C['ok']}, 0.45);
+    box-shadow: 0 0 0 3px alpha({C['ok']}, 0.10);
 }}
+.tile.selected {{
+    border-color: {C['accent']}; box-shadow: 0 0 0 3px {C['accent-soft']};
+}}
+flowboxchild {{ padding: 0; background: transparent; border-radius: 16px; }}
+flowboxchild:focus {{ -gtk-outline-radius: 16px; }}
 .tile-name {{ font-size: 13.5px; font-weight: 600; color: {C['text']}; }}
 .tile-sub {{ font-size: 11.5px; color: {C['muted']}; }}
 .tile-num {{ font-size: 12px; font-weight: 600; color: {C['subtext']}; font-feature-settings: "tnum"; }}
@@ -500,6 +505,11 @@ class TrackerWindow(Gtk.Window):
         self._breakdowns_period = '7d'
         self._breakdowns_kind = 'models'   # or 'tools'
         self._account_filter: Optional[str] = None  # None = all accounts
+        self._async_seq: Dict[str, int] = {}
+        self._dash_cache = None       # (key, data) of the last dashboard query
+        self._dash_pending = None
+        self._projects_cache = None   # (key, rows, sessions)
+        self._bar_sigs: Dict[str, tuple] = {}
 
         self._build_ui()
         self._install_shortcuts()
@@ -724,30 +734,45 @@ class TrackerWindow(Gtk.Window):
         self._hop_badge_box.set_tooltip_text(tip)
         self._hop_badge_box.set_visible(True)
 
+    def _combo_entries(self) -> list:
+        """(id, label) for the account selector, after 'All accounts'.
+
+        Every saved claudehop account is offered, the live one first, whether
+        or not tokens have been filed under it yet; then Bedrock once it has
+        turns; then the configured accounts, but only when there is more than
+        one (a single one holds the same turns as 'All accounts')."""
+        out = []
+        try:
+            hs = claudehop.load_state(self.app._primary_state().token)
+        except Exception:
+            hs = None
+        if hs is not None:
+            for p in sorted(hs.profiles, key=lambda q: (q.name != hs.active, q.name)):
+                live = p.name == hs.active and not hs.provider
+                out.append((f'{HOP_PREFIX}{p.name}', p.name + ('  · live' if live else '')))
+        if self.app.store.has_account_rows(BEDROCK_ACCOUNT_LABEL):
+            out.append((BEDROCK_ACCOUNT_LABEL, 'Bedrock'))
+        if len(self.app._accounts) > 1:
+            for acc in self.app._accounts:
+                out.append((acc.label, f'{acc.label}  · logs in {acc.claude_dir}'))
+        return out
+
     def _populate_account_combo(self):
-        """(Re)build the account-filter combobox items from current accounts.
+        """(Re)build the account selector.
 
         Mutating the model fires ``changed``, which would otherwise re-enter
         the filter callback on every ``append``; block the handler around
-        the rebuild and emit one final change at the end."""
+        the rebuild."""
         try:
             self._account_combo.handler_block_by_func(
                 self._on_account_filter_changed)
         except TypeError:
             pass  # not yet connected
+        self._combo_items = self._combo_entries()
         self._account_combo.remove_all()
         self._account_combo.append('__all__', 'All accounts')
-        for a in self.app._accounts:
-            self._account_combo.append(a.label, a.label)
-        # Bedrock is not a configured account, so it is offered only once the
-        # store holds Bedrock turns.
-        self._has_bedrock = self.app.store.has_account_rows(BEDROCK_ACCOUNT_LABEL)
-        if self._has_bedrock:
-            self._account_combo.append(BEDROCK_ACCOUNT_LABEL, 'Bedrock')
-        # claudehop accounts, once turns have been filed under them.
-        self._hop_combo_names = self.app.store.hop_accounts_with_rows()
-        for n in self._hop_combo_names:
-            self._account_combo.append(f'{HOP_PREFIX}{n}', f'{n} · claudehop')
+        for cid, label in self._combo_items:
+            self._account_combo.append(cid, label)
         active = self._account_filter or '__all__'
         if not self._account_combo.set_active_id(active):
             self._account_combo.set_active_id('__all__')
@@ -757,26 +782,53 @@ class TrackerWindow(Gtk.Window):
                 self._on_account_filter_changed)
         except TypeError:
             pass
-        # Show/hide based on current account count.
         self._account_combo.set_visible(self._combo_wanted())
 
     def _combo_wanted(self) -> bool:
-        return (len(self.app._accounts) > 1 or self._has_bedrock
-                or bool(self._hop_combo_names))
+        return bool(getattr(self, '_combo_items', []))
 
     def _combo_stale(self) -> bool:
-        """True when Bedrock or a claudehop account gained its first turns."""
-        store = self.app.store
-        return (store.has_account_rows(BEDROCK_ACCOUNT_LABEL)
-                != getattr(self, '_has_bedrock', False)
-                or store.hop_accounts_with_rows()
-                != getattr(self, '_hop_combo_names', []))
+        """True when the accounts on offer changed: a hop, an account saved or
+        removed, Bedrock's first turns."""
+        return self._combo_entries() != getattr(self, '_combo_items', None)
 
     def _on_account_filter_changed(self, combo: Gtk.ComboBoxText):
         sel = combo.get_active_id()
         self._account_filter = None if (not sel or sel == '__all__') else sel
-        # Re-render whatever view is currently up.
-        self.refresh_data()
+        # Re-render whatever view is up; the data is already in the store, so
+        # this must not rescan the logs (that used to freeze the window).
+        self.refresh_view(True)
+
+    def show_account(self, account_id: Optional[str]):
+        """Filter the dashboard to one account (None: all of them)."""
+        if not self._account_combo.set_active_id(account_id or '__all__'):
+            self._account_filter = account_id
+            self.refresh_view(True)
+
+    # ── Background work ────────────────────────────────────────────────────
+    def _async(self, tag: str, compute, apply):
+        """Run ``compute()`` off the interface thread and ``apply(result)`` on
+        it, but only for the newest request with this tag: an older result
+        that arrives late is dropped."""
+        seq = self._async_seq.get(tag, 0) + 1
+        self._async_seq[tag] = seq
+
+        def finish(result):
+            if self._async_seq.get(tag) == seq:
+                try:
+                    apply(result)
+                except Exception as e:
+                    print(f"[{APP_ID}] {tag}: {e}", file=sys.stderr)
+            return False
+
+        def work():
+            try:
+                result = compute()
+            except Exception as e:
+                print(f"[{APP_ID}] {tag}: {e}", file=sys.stderr)
+                return
+            GLib.idle_add(finish, result)
+        threading.Thread(target=work, daemon=True).start()
 
     def _build_status_bar(self) -> Gtk.Widget:
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
@@ -1158,14 +1210,9 @@ class TrackerWindow(Gtk.Window):
             self._update_chart()
 
     def _update_chart(self):
-        acc = self._account_filter
-        rows = {r['day']: r for r in self.app.store.daily_series(days=30, account=acc)}
-        today = datetime.now().date()
-        series = []
-        for i in range(29, -1, -1):
-            d = (today - timedelta(days=i)).isoformat()
-            series.append(rows.get(d) or {'day': d, 'total_tokens': 0,
-                                          'cost_usd': 0.0, 'messages': 0})
+        series = getattr(self, '_chart_rows', None)
+        if series is None:
+            return
         self._chart.set_rows(series, self._chart_key)
         total = sum(float(r.get(self._chart_key) or 0) for r in series)
         busiest = max(series, key=lambda r: float(r.get(self._chart_key) or 0))
@@ -1211,6 +1258,8 @@ class TrackerWindow(Gtk.Window):
         self._hop_tiles.set_max_children_per_line(4)
         self._hop_tiles.set_column_spacing(10)
         self._hop_tiles.set_row_spacing(10)
+        self._hop_tiles.set_activate_on_single_click(True)
+        self._hop_tiles.connect('child-activated', self._on_tile_activated)
         box.pack_start(self._hop_tiles, False, False, 0)
         self._hop_tile_widgets: Dict[str, dict] = {}
         self._hop_tile_names: tuple = ()
@@ -1218,6 +1267,19 @@ class TrackerWindow(Gtk.Window):
         self._hop_status = self._label('', 'stat-sub', wrap=True)
         box.pack_start(self._hop_status, False, False, 0)
         return self._bezel(box)
+
+    def _on_tile_activated(self, _flowbox, child):
+        """A click on an account tile filters the dashboard to that account;
+        a second click on the same tile shows every account again."""
+        key = next((k for k, w in self._hop_tile_widgets.items()
+                    if w['child'] is child), None)
+        if key is None:
+            return
+        if key.startswith('provider:'):
+            target = BEDROCK_ACCOUNT_LABEL if key == f'provider:{BEDROCK_ACCOUNT_LABEL}' else None
+        else:
+            target = f'{HOP_PREFIX}{key}'
+        self.show_account(None if target == self._account_filter else target)
 
     def _make_hop_tile(self, name: str) -> dict:
         tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
@@ -1286,7 +1348,7 @@ class TrackerWindow(Gtk.Window):
         w['meters']['week'][2].set_tooltip_text(f"Weekly meter for {scope}" if scope else "7-day window")
         line = fresh + (f" · {note}" if note else "")
         w['fresh'].set_text(line)
-        w['tile'].set_tooltip_text(f"{usage}\n{line}".strip())
+        w['tile'].set_tooltip_text(f"{usage}\n{line}\nClick to show only this account.".strip())
 
     def _update_hop_card(self):
         """The Accounts panel: one tile per claudehop account with its newest
@@ -1328,6 +1390,11 @@ class TrackerWindow(Gtk.Window):
                 self._hop_tiles.add(w['child'])
             self._hop_tile_names = keys
 
+        for k, w in self._hop_tile_widgets.items():
+            target = (BEDROCK_ACCOUNT_LABEL if k == f'provider:{BEDROCK_ACCOUNT_LABEL}'
+                      else f'{HOP_PREFIX}{k}')
+            ctx = w['tile'].get_style_context()
+            (ctx.add_class if self._account_filter == target else ctx.remove_class)('selected')
         for p in order:
             w = self._hop_tile_widgets[p.name]
             r = readings.get(p.name)
@@ -1392,18 +1459,79 @@ class TrackerWindow(Gtk.Window):
                     m.get_parent().hide()
 
     # The update ------------------------------------------------------------
-    def _update_dashboard(self):
+    def _dashboard_anchor(self, acc: Optional[str]) -> tuple:
+        """(5-hour reset time, 5-hour use as 0..1) to anchor the session on:
+        the filtered claudehop account's last reading when it is not live,
+        nothing for Bedrock, else the account's live figures."""
+        hop_name = self._hop_filter()
+        if hop_name:
+            r = self._hop_idle_reading(hop_name)
+            if r is not None:
+                p5, _, _ = claudehop.window_now(r.pct5, r.resets_5h,
+                                                datetime.now(timezone.utc))
+                return r.resets_5h, (p5 / 100.0 if p5 is not None else None)
+        if acc == BEDROCK_ACCOUNT_LABEL:
+            return None, None
+        cv = self.app.account_state(acc)
+        cloud = None
+        if cv.usage_data:
+            cloud = normalize_utilization(
+                (cv.usage_data.get('five_hour') or {}).get('utilization', 0))
+        return cv.last_resets_5h, cloud
+
+    def _dashboard_data(self, period: str, acc: Optional[str],
+                        resets_5h: Optional[str]) -> dict:
+        """Every figure the dashboard reads from the store. Runs off the
+        interface thread: together these queries take about half a second on
+        a large history, which froze the window on every refresh."""
         store = self.app.store
-        period = self._dashboard_period
         cutoff = self._cutoff(period)
-        acc = self._account_filter
+        rows = store.query(since=datetime.now(timezone.utc) - SESSION_LOOKBACK,
+                           account=acc)
+        daily = {r['day']: r for r in store.daily_series(days=30, account=acc)}
+        today = datetime.now().date()
+        series = []
+        for i in range(29, -1, -1):
+            d = (today - timedelta(days=i)).isoformat()
+            series.append(daily.get(d) or {'day': d, 'total_tokens': 0,
+                                           'cost_usd': 0.0, 'messages': 0})
+        return {
+            'agg': store.totals(since=cutoff, account=acc),
+            'block': active_session(rows, resets_5h),
+            'daily': series,
+            'projects': store.project_summary(since=cutoff, account=acc),
+            'models': store.model_summary(since=cutoff, account=acc),
+        }
+
+    def _update_dashboard(self):
+        """Redraw the dashboard. The live parts (plan rings, accounts, the
+        sidebar gauge) are cheap and drawn now; the figures from the store are
+        reused while nothing new has been imported, and recomputed in the
+        background when something has (or once a minute, for the session)."""
         self._update_cloud_section()
         self._update_side_gauge()
+        period, acc = self._dashboard_period, self._account_filter
+        resets_5h, cloud_5h = self._dashboard_anchor(acc)
+        key = (period, acc, self.app.data_version, int(time.time() // 60), resets_5h)
+        cache = self._dash_cache
+        if cache is not None and cache[0][:2] == (period, acc):
+            self._apply_dashboard(cache[1], cloud_5h)
+            if cache[0] == key:
+                return
+        if self._dash_pending == key:
+            return
+        self._dash_pending = key
 
-        # Summed in SQL. This method runs on the interface thread every few
-        # seconds; reading 160k rows into Python to add up five columns froze
-        # the window for about half a second on every tick.
-        agg = store.totals(since=cutoff, account=acc)
+        def done(data):
+            self._dash_pending = None
+            self._dash_cache = (key, data)
+            if (self._dashboard_period, self._account_filter) == (period, acc):
+                self._apply_dashboard(data, cloud_5h)
+        self._async('dashboard', lambda: self._dashboard_data(period, acc, resets_5h), done)
+
+    def _apply_dashboard(self, data: dict, cloud_5h: Optional[float]):
+        period = self._dashboard_period
+        agg = data['agg']
         total = int(agg.get('messages') or 0)
         total_tokens = int(agg.get('total_tokens') or 0)
         total_input = int(agg.get('input_tokens') or 0)
@@ -1415,10 +1543,19 @@ class TrackerWindow(Gtk.Window):
 
         label = PERIOD_LABELS.get(period, 'All Time')
         rng = range_text(period)
-        self._dashboard_scope_label.set_text(
-            (f"{rng} · " if rng else "")
-            + f"{projects} project{'s' if projects != 1 else ''} · "
-            f"{total:,} message{'s' if total != 1 else ''}")
+        scope = ((f"{rng} · " if rng else "")
+                 + f"{projects} project{'s' if projects != 1 else ''} · "
+                 f"{total:,} message{'s' if total != 1 else ''}")
+        hop_name = self._hop_filter()
+        if hop_name and total == 0:
+            since = self.app.store.hop_tracking_since()
+            scope = (f"Nothing filed under {hop_name} in this period"
+                     + (f"; tokens are split by account since "
+                        f"{since.astimezone():%-d %b %H:%M}" if since else "")
+                     + ".")
+        elif hop_name:
+            scope += f" · made with {hop_name}"
+        self._dashboard_scope_label.set_text(scope)
 
         def put(key, value, sub):
             v, s = self._summary_cards[key]
@@ -1438,24 +1575,9 @@ class TrackerWindow(Gtk.Window):
         # given us one, because the window covers usage from every surface —
         # the browser, the desktop and mobile apps, other machines — and none
         # of that reaches these logs.
-        cv = self.app.account_state(acc)
-        cloud_5h = None
-        resets_5h = cv.last_resets_5h
-        hop_name = self._hop_filter()
-        hop_r = self._hop_idle_reading(hop_name) if hop_name else None
-        if hop_r is not None:
-            p5, _, _ = claudehop.window_now(hop_r.pct5, hop_r.resets_5h,
-                                            datetime.now(timezone.utc))
-            cloud_5h = p5 / 100.0 if p5 is not None else None
-            resets_5h = hop_r.resets_5h
-        elif acc == BEDROCK_ACCOUNT_LABEL:
-            resets_5h = None        # Bedrock has no plan window to anchor on
-        elif cv.usage_data:
-            cloud_5h = normalize_utilization(
-                (cv.usage_data.get('five_hour') or {}).get('utilization', 0))
-        session_rows = store.query(
-            since=datetime.now(timezone.utc) - SESSION_LOOKBACK, account=acc)
-        block = active_session(session_rows, resets_5h)
+        block = data['block']
+        if block is not None and block.remaining().total_seconds() <= 0:
+            block = None
         fc = forecast(block, cloud_5h_pct=cloud_5h)
         if block is not None:
             source = "" if block.anchored else " · estimated from local logs"
@@ -1484,19 +1606,24 @@ class TrackerWindow(Gtk.Window):
             for v in self._sess_stats.values():
                 v.set_text("—")
 
+        self._chart_rows = data['daily']
         self._update_chart()
 
-        # Top projects / models (period)
-        def bars(container, sub_lbl, rows, name_key, value_key, fmt_fn, unit):
+        # Top projects / models: rebuilt only when the figures changed.
+        def bars(key, container, sub_lbl, rows, name_key, value_key, fmt_fn, unit):
+            sub_lbl.set_text(f"{rng or label} · by {unit}")
+            top_rows = rows[:6]
+            sig = tuple((r[name_key], r[value_key]) for r in top_rows)
+            if self._bar_sigs.get(key) == sig:
+                return
+            self._bar_sigs[key] = sig
             for child in container.get_children():
                 container.remove(child)
-            sub_lbl.set_text(f"{rng or label} · by {unit}")
             if not rows:
                 container.pack_start(self._label("Nothing recorded in this period.",
                                                  'subtitle'), False, False, 0)
                 container.show_all()
                 return
-            top_rows = rows[:6]
             vmax = max(float(r[value_key] or 0) for r in top_rows) or 1
             for r in top_rows:
                 row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -1512,11 +1639,11 @@ class TrackerWindow(Gtk.Window):
                 container.pack_start(row, False, False, 0)
             container.show_all()
 
-        bars(self._dashboard_projects_content, self._dashboard_projects_subtitle,
-             store.project_summary(since=cutoff, account=acc), 'project',
+        bars('projects', self._dashboard_projects_content,
+             self._dashboard_projects_subtitle, data['projects'], 'project',
              'total_tokens', lambda v: fmt(int(v)), 'tokens')
-        bars(self._dashboard_models_content, self._dashboard_models_subtitle,
-             store.model_summary(since=cutoff, account=acc), 'model',
+        bars('models', self._dashboard_models_content,
+             self._dashboard_models_subtitle, data['models'], 'model',
              'cost_usd', fmt_cost, 'API-equivalent cost')
 
     # ── Tables ─────────────────────────────────────────────────────────────
@@ -1599,6 +1726,7 @@ class TrackerWindow(Gtk.Window):
         )
         treeview = Gtk.TreeView(model=self._projects_store)
         treeview.set_headers_visible(True)
+        self._projects_tree = treeview
         self._add_columns(treeview, [
             ('Project / session', 0, 170, 'grow'),
             ('Last used', 1, 92, 'text'),
@@ -1625,10 +1753,29 @@ class TrackerWindow(Gtk.Window):
         return c
 
     def _update_projects_view(self):
+        """Query in the background (all-time sessions take half a second on a
+        large history), then fill the table. Typing in the search box filters
+        the last result without asking the store again."""
+        period, acc = self._projects_period, self._account_filter
+        key = (period, acc, self.app.data_version)
+        cache = self._projects_cache
+        if cache is not None and cache[0] == key:
+            self._fill_projects(cache[1], cache[2])
+            return
+        store, cutoff = self.app.store, self._cutoff(period)
+
+        def compute():
+            return (store.project_summary(since=cutoff, account=acc),
+                    store.session_summary(since=cutoff, account=acc))
+
+        def done(res):
+            self._projects_cache = (key, res[0], res[1])
+            if (self._projects_period, self._account_filter) == (period, acc):
+                self._fill_projects(*res)
+        self._async('projects', compute, done)
+
+    def _fill_projects(self, rows: list, session_rows: list):
         period = self._projects_period
-        cutoff = self._cutoff(period)
-        acc = self._account_filter
-        rows = self.app.store.project_summary(since=cutoff, account=acc)
         search = self._projects_search.get_text().lower()
 
         rng = range_text(period) or PERIOD_LABELS.get(period, '')
@@ -1644,10 +1791,12 @@ class TrackerWindow(Gtk.Window):
         # first. Grouping the raw messages here meant reading every row for
         # the period on the interface thread each refresh.
         sessions_by_project: Dict[str, list] = {}
-        for srow in self.app.store.session_summary(since=cutoff, account=acc):
+        for srow in session_rows:
             sessions_by_project.setdefault(
                 srow['project'] or 'Unknown', []).append(srow)
 
+        # Detached while it fills: a TreeView redraws on every append otherwise.
+        self._projects_tree.set_model(None)
         self._projects_store.clear()
         for r in rows:
             name = r['project']
@@ -1706,6 +1855,7 @@ class TrackerWindow(Gtk.Window):
                     int(cost * 1000),
                     cost,
                 ])
+        self._projects_tree.set_model(self._projects_store)
 
     # ── Breakdowns view ────────────────────────────────────────────────────
     def _build_breakdowns_view(self) -> Gtk.Widget:
@@ -1771,11 +1921,21 @@ class TrackerWindow(Gtk.Window):
         self._update_breakdowns_totals()
 
     def _update_breakdowns_view(self):
-        cutoff = self._cutoff(self._breakdowns_period)
-        acc = self._account_filter
-        store = self.app.store
+        """Query in the background (the tool breakdown parses every turn's
+        tool list), then fill the tables."""
+        period, acc = self._breakdowns_period, self._account_filter
+        store, cutoff = self.app.store, self._cutoff(period)
 
-        models = store.model_summary(since=cutoff, account=acc)
+        def compute():
+            return (store.model_summary(since=cutoff, account=acc),
+                    store.tool_summary(since=cutoff, account=acc))
+
+        def done(res):
+            if (self._breakdowns_period, self._account_filter) == (period, acc):
+                self._fill_breakdowns(*res)
+        self._async('breakdowns', compute, done)
+
+    def _fill_breakdowns(self, models: list, tools: list):
         self._models_store.clear()
         for r in models:
             self._models_store.append([
@@ -1789,7 +1949,6 @@ class TrackerWindow(Gtk.Window):
                 fmt_cost(r['cost_usd'] or 0),
             ])
 
-        tools = store.tool_summary(since=cutoff, account=acc)
         self._tools_store.clear()
         for r in tools:
             self._tools_store.append([
@@ -1921,9 +2080,13 @@ class TrackerWindow(Gtk.Window):
         return c
 
     def _update_budgets_view(self):
+        store, usage = self.app.store, self.app.usage_data
+        self._async('budgets', lambda: evaluate_budgets(store, usage_data=usage),
+                    self._fill_budgets)
+
+    def _fill_budgets(self, states: list):
         for child in self._budgets_list.get_children():
             self._budgets_list.remove(child)
-        states = evaluate_budgets(self.app.store, usage_data=self.app.usage_data)
         if not states:
             empty = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             empty.get_style_context().add_class('notice')
@@ -2177,7 +2340,7 @@ class TrackerWindow(Gtk.Window):
         # Drawn widgets read the palette when they draw; markup-coloured
         # labels are rebuilt by the refresh.
         self.queue_draw()
-        self.refresh_data()
+        self.refresh_view(True)
         self.app._rebuild_tray()
 
     def _on_system_scheme_changed(self, *_args):
@@ -2626,7 +2789,7 @@ class TrackerWindow(Gtk.Window):
         position and selection survive idle ticks."""
         self._last_update_label.set_text(
             f"Updated {datetime.now().strftime('%H:%M:%S')}")
-        if data_changed and self._combo_stale():
+        if self._combo_stale():
             self._populate_account_combo()
         v = self._current_view
         if v == 'dashboard':
@@ -2638,23 +2801,25 @@ class TrackerWindow(Gtk.Window):
         return False
 
     def refresh_data(self):
-        self._status_label.set_text("Scanning…")
-        rc = load_rate_card()
-        counts = scan_into_store(self.app.store, rc,
-                                 accounts=self.app._accounts)
-        new = sum(counts.values())
-        if self._combo_stale():
-            self._populate_account_combo()
-        self._update_hop_badge()
-        self._last_update_label.set_text(
-            f"Updated {datetime.now().strftime('%H:%M:%S')}"
-            + (f" · {new} new" if new else ""))
-        self._status_label.set_text(
-            f"{self.app.store.message_count():,} messages indexed")
-        if self._current_view == 'dashboard':    self._update_dashboard()
-        elif self._current_view == 'projects':   self._update_projects_view()
-        elif self._current_view == 'breakdowns': self._update_breakdowns_view()
-        elif self._current_view == 'budgets':    self._update_budgets_view()
+        """Rescan the logs (the refresh button, Ctrl+R), off the interface
+        thread, then redraw."""
+        self._status_label.set_text("Scanning the logs…")
+        app = self.app
+
+        def scan():
+            counts = scan_into_store(app.store, load_rate_card(), accounts=app._accounts)
+            app.data_version += 1
+            return sum(counts.values()), app.store.message_count()
+
+        def done(result):
+            new, total = result
+            self._update_hop_badge()
+            self._last_update_label.set_text(
+                f"Updated {datetime.now().strftime('%H:%M:%S')}"
+                + (f" · {new} new" if new else ""))
+            self._status_label.set_text(f"{total:,} messages indexed")
+            self.refresh_view(True)
+        self._async('scan', scan, done)
         return False
 
     def _install_shortcuts(self):
@@ -2761,6 +2926,10 @@ class App:
 
         self._api_wake = threading.Event()
         self._window_visible = True
+        # Bumped whenever new turns land, so views know their cached figures
+        # are stale; and the tray's session, worked out in the scan thread.
+        self.data_version = 0
+        self._tray_block = None
         # "Read all accounts": whether we are waiting on `hop usage`, and its
         # last result as (when, hop.ReadAll).
         self._hop_reading_all = False
@@ -3470,22 +3639,17 @@ class App:
             self.window._switch_view(view_id)
 
     def _update_tray_block(self):
-        """Refresh the tray's Block / Tokens / Cost lines from local store.
+        """Refresh the tray's Block / Tokens / Cost lines from the session the
+        scan thread last worked out.
 
         Independent of cloud state so the tray stays informative even when
         the cloud token is missing or rate-limited."""
         if not self._indicator:
             return False
         try:
-            # Filtered to the account whose reset time anchors the window —
-            # otherwise a second account's messages were counted inside the
-            # primary account's session.
-            acc = self._primary_account().label
-            rows = self.store.query(
-                since=datetime.now(timezone.utc) - SESSION_LOOKBACK,
-                account=acc)
-            block = active_session(rows,
-                                   self._account_states[acc].last_resets_5h)
+            block = self._tray_block
+            if block is not None and block.remaining().total_seconds() <= 0:
+                block = None
             if block is not None:
                 elapsed_frac = (block.elapsed().total_seconds()
                                 / BLOCK_DURATION.total_seconds())
@@ -3536,6 +3700,16 @@ class App:
                 counts = scan_into_store(self.store, rc,
                                          accounts=self._accounts)
                 imported = sum(counts.values())
+                if imported:
+                    self.data_version += 1
+                # The tray's session line, worked out here rather than on
+                # the interface thread (it reads every turn of the last hours).
+                acc = self._primary_account().label
+                st = self._account_states.get(acc)
+                rows = self.store.query(
+                    since=datetime.now(timezone.utc) - SESSION_LOOKBACK, account=acc)
+                self._tray_block = active_session(
+                    rows, st.last_resets_5h if st else None)
                 # Re-render every tick (not only when new turns landed) so the
                 # dashboard's live values — 5h block countdown, burn rate, ETA,
                 # limits — stay current without a manual Refresh. Only while the
@@ -3775,9 +3949,24 @@ class App:
             n.show()
 
     def _check_budgets(self):
+        """Evaluate budgets off the interface thread; notify on it."""
         if not HAS_NOTIFY:
-            return
-        for s in evaluate_budgets(self.store, usage_data=self.usage_data):
+            return False
+        usage = self.usage_data
+
+        def work():
+            try:
+                states = evaluate_budgets(self.store, usage_data=usage)
+            except Exception as e:
+                print(f"[{APP_ID}] budgets: {e}", file=sys.stderr)
+                return
+            if any(s.should_notify() for s in states):
+                GLib.idle_add(self._notify_budgets, states)
+        threading.Thread(target=work, daemon=True).start()
+        return False
+
+    def _notify_budgets(self, states):
+        for s in states:
             if s.should_notify():
                 pct = int(s.pct * 100)
                 if s.is_pct_based:
@@ -3797,6 +3986,7 @@ class App:
                 n.show()
                 self.store.update_budget_notification(
                     s.id, pct, s.period_key)
+        return False
 
     # ── Window management ──────────────────────────────────────────────────
     def _on_set_token(self):

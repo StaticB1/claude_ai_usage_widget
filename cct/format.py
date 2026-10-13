@@ -29,6 +29,8 @@ def fmt_duration(seconds: float) -> str:
 
 
 def fmt_cost(cost: float) -> str:
+    if not cost:
+        return "$0"
     if cost >= 100:
         return f"${cost:,.0f}"
     if cost >= 0.01:

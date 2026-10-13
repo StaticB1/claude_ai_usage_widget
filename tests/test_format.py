@@ -60,3 +60,10 @@ def test_absolute_midnight(monkeypatch):
         __import__('time').tzset()
     out = fmt_reset_absolute('2026-05-01T00:15:00+00:00')
     assert out == '12:15A'
+
+
+def test_zero_cost_reads_as_zero():
+    from cct.format import fmt_cost
+    assert fmt_cost(0) == '$0'
+    assert fmt_cost(0.0042) == '$0.004'
+    assert fmt_cost(12.5) == '$12.50'

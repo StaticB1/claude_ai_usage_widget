@@ -322,6 +322,10 @@ it, none of this appears.
   `hop next` chooses: from its `next` list when you have one, never a full
   login, and the soonest reset first among close calls.
 - **`hop run` terminals.** Accounts open in a `hop run` session show how many.
+- **Pick an account.** The account selector in the header lists every saved
+  claudehop account, the live one first; clicking an account's tile does the
+  same. The whole dashboard (plan rings, session, totals, chart, top lists)
+  then shows that account alone.
 - **Tokens per account.** From the first scan after this version, each turn is
   filed under the account that made it: the live login at the time of the turn,
   taken from claudehop's `active` pointer, or the account of the `hop run`

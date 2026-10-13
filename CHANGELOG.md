@@ -40,9 +40,31 @@ A redesign of the dashboard, the tray icon and the usage panel.
   opens the usage panel.
 - Keyboard focus is drawn as an outline only when the keyboard moved it.
 
+- **The account selector lists every claudehop account**, the live one first,
+  whether or not tokens have been filed under it yet; then Bedrock, then the
+  configured accounts when there is more than one. A single configured account
+  is no longer listed beside "All accounts", since it held the same turns.
+  Clicking an account tile filters the dashboard to that account, and clicking
+  it again shows them all. An account with nothing filed under it says so and
+  when the split by account began.
+
 ### Fixed
+- **The window froze for half a second to a second at a time.** The dashboard
+  queried the store on the interface thread every ten seconds (about 0.5 s on a
+  large history), and opening Projects or Breakdowns took 0.6 to 0.8 s, long
+  enough for the page fade to stall half-drawn over the previous page. Those
+  queries now run in the background and are reused until new turns arrive (or
+  a minute passes, for the session), so a refresh or a page switch takes a few
+  milliseconds on the interface thread. The search box filters the last
+  result instead of querying again.
+- **Changing the account filter, the theme or pressing refresh rescanned every
+  log on the interface thread.** The filter and theme now only redraw, and the
+  refresh button scans in the background.
+- The tray's session line and the budget check also read the store on the
+  interface thread every ten seconds; both now work in the background.
 - **A Team seat on a Max rate tier was labelled "Max 5x plan".** The seat type
   is now checked first, so it reads "Team plan".
+- A cost of nothing reads `$0`, not `$0.000`.
 
 ## [2.2.0] - 2026-10-13
 
