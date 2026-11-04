@@ -454,6 +454,14 @@ Use the live feature only if you understand and accept that risk.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
+## Using OpenAI Codex too?
+
+[codexwatch](https://github.com/psychofict/codexwatch) does for OpenAI Codex what this
+tracker does for Claude Code: token and cost history per project, model and session, the
+plan's 5-hour and weekly limits read from Codex's own logs, a tray icon, a web dashboard
+and a status-bar line. It works with [codexhop](https://github.com/psychofict/codexhop)
+the way this widget works with claudehop.
+
 ## License
 
 MIT.
