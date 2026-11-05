@@ -12,8 +12,10 @@ from .budgets import evaluate_budgets
 from .cloud import (AuthError, CloudApiError, RateLimitError,
                     fetch_cloud_usage, load_token, normalize_utilization)
 from .config import (APP_NAME, APP_VERSION, Account,
-                     find_account, load_accounts, BEDROCK_ACCOUNT_LABEL)
+                     find_account, load_accounts, load_settings,
+                     BEDROCK_ACCOUNT_LABEL)
 from . import hop as claudehop
+from . import statusline
 from .format import fmt, fmt_cost, fmt_duration
 from .parser import iter_project_dirs, scan_jsonl
 
@@ -26,9 +28,20 @@ from .store import HOP_PREFIX, Store
 
 
 def _safe_cloud_data(account: Optional[Account] = None) -> Optional[dict]:
-    """Best-effort cloud usage fetch — silent on any failure (token missing,
-    rate-limited, network down). Used by budget evaluation so utilization
-    budgets can show a value when a token is configured."""
+    """The account's plan windows in the usage API's shape, or None.
+
+    Claude Code's status line comes first (``ctt statusline`` keeps what it
+    reports). Claude.ai is asked with the login token only when polling is
+    turned on in Settings, and then silently: a missing token, a rate limit
+    or no network give None."""
+    claude_dir = account.claude_dir if account else statusline.default_claude_dir()
+    saved = statusline.for_dir(claude_dir)
+    # A reading taken before a claudehop hop belongs to the login that was
+    # live then, not to this one.
+    if saved is not None and saved.get('hop_name') in (None, statusline.hop_name_for(claude_dir)):
+        return statusline.as_cloud(saved)
+    if not load_settings().token_polling:
+        return None
     creds = account.credentials_file if account else None
     token = load_token(creds)
     if not token:
@@ -74,11 +87,17 @@ def _hop_reading(label: Optional[str]) -> Optional['claudehop.Reading']:
     if not label or not label.startswith(HOP_PREFIX):
         return None
     name = label[len(HOP_PREFIX):]
-    if claudehop.active_name(load_token()) == name:
+    saved = statusline.by_hop_name().get(name)
+    from_line = (claudehop.reading_from_cloud(statusline.as_cloud(saved),
+                                              statusline.read_at(saved), 'statusline')
+                 if saved else None)
+    if (from_line is None and load_settings().token_polling
+            and claudehop.active_name(load_token()) == name):
         data = _safe_cloud_data()
         if data:
             return claudehop.reading_from_cloud(data, datetime.now(timezone.utc))
     return claudehop.newest(
+        from_line,
         claudehop.reading_from_seen(Store().hop_usage().get(name)),
         claudehop.load_usage_cache().get(name))
 
@@ -608,6 +627,14 @@ def cmd_prompt(args):
     print(' '.join(pieces) if pieces else '\u2014')
 
 
+def cmd_statusline(args):
+    """Claude Code's status-line command: keep the plan windows it reports."""
+    command = list(args.command or [])
+    if command[:1] == ['--']:
+        command = command[1:]
+    sys.exit(statusline.run(command))
+
+
 def cmd_export(args):
     store = Store()
     cutoff = _cutoff(args.period)
@@ -819,6 +846,19 @@ def build_parser() -> argparse.ArgumentParser:
     bsr = bsub.add_parser('remove')
     bsr.add_argument('id', type=int)
     bp.set_defaults(func=cmd_budget)
+
+    sp = sub.add_parser(
+        'statusline',
+        help="Claude Code's status line: keep the 5-hour and weekly figures it "
+             "reports, then show your own status line",
+        description="Set as Claude Code's statusLine command. It saves the plan "
+                    "windows Claude Code reports (Pro, Max and Ultra), so the "
+                    "widget needs no login token, then runs COMMAND with the "
+                    "same input and prints its output. Without COMMAND it "
+                    "prints the model and both windows.")
+    sp.add_argument('command', nargs=argparse.REMAINDER,
+                    help='your existing status-line command, after --')
+    sp.set_defaults(func=cmd_statusline)
 
     sp = sub.add_parser('gui', help='Launch the GTK dashboard (Linux only)')
     sp.set_defaults(func=cmd_gui)

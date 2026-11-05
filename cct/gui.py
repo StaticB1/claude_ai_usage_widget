@@ -50,6 +50,7 @@ from .config import (APP_ID, APP_NAME, APP_VERSION, LOCAL_SCAN_INTERVAL,
                      save_settings, Settings)
 from .notifications import NotificationManager, WindowSnapshot
 from . import hop as claudehop
+from . import statusline
 from . import ui
 from .format import (fmt, fmt_cost, fmt_duration, fmt_full,
                      fmt_reset_absolute, fmt_reset_countdown, rel_time)
@@ -1029,6 +1030,8 @@ class TrackerWindow(Gtk.Window):
             self.app._on_set_token()
         elif self._plan_action == 'read':
             self.app.read_all_hop()
+        elif self._plan_action == 'settings':
+            self._switch_view('settings')
         else:
             self.app._refresh_cloud()
 
@@ -2200,8 +2203,7 @@ class TrackerWindow(Gtk.Window):
         is filtered to. Cloud usage is per-account and can't be aggregated, so
         for 'All accounts' we fall back to the primary account's view."""
         st = self.app.account_state(self._account_filter)
-        state = st.cloud_state if st.token else 'no_token'
-        return st, state
+        return st, self.app.cloud_state_of(st)
 
     def _hop_filter(self) -> Optional[str]:
         """The claudehop account the dashboard is filtered to, if any."""
@@ -2235,7 +2237,8 @@ class TrackerWindow(Gtk.Window):
                             p7, r.resets_7d if was7 is None else None,
                             r.week_scope, was5=was5, was7=was7)
             who = {'probe': "claudehop, through claude", 'claudehop': "claudehop",
-                   'widget': "this widget while it was live"}.get(r.source, r.source)
+                   'widget': "this widget while it was live",
+                   'statusline': "Claude Code's status line"}.get(r.source, r.source)
             self._set_tag(f"Read {claudehop.ago(r.at, now)}", 'muted')
             self._set_notice(
                 f"Only the live login is polled. This reading was taken by {who}. "
@@ -2301,7 +2304,8 @@ class TrackerWindow(Gtk.Window):
         self._set_rings(p5, r5, p7, r7, scope, dimmed=dimmed, models=models)
         stored = cv.last_source != 'live' and cv.last_read_at is not None
         who = {'probe': "claudehop, through claude", 'claudehop': "claudehop",
-               'widget': "this widget"}.get(cv.last_source, cv.last_source)
+               'widget': "this widget",
+               'statusline': "Claude Code's status line"}.get(cv.last_source, cv.last_source)
         when = (cv.last_read_at.astimezone().strftime('%H:%M')
                 if cv.last_read_at else '—')
 
@@ -2333,6 +2337,15 @@ class TrackerWindow(Gtk.Window):
             self._set_tag("Offline", 'danger')
             self._set_notice(f"Couldn't reach Claude.ai: {cv.cloud_error or 'network error'}.",
                              'danger', action='retry', label='Retry')
+            self._plan_foot.set_text('')
+        elif (state in ('loading', 'idle') and not data and p5 is None
+                and not self.app._settings.token_polling):
+            self._set_tag("No reading yet", 'muted')
+            self._set_notice(
+                "The plan windows come from Claude Code's status line: set its "
+                "command to `ctt statusline` (Pro, Max and Ultra plans report "
+                "them there). Or turn on polling with your login token in "
+                "Settings.", action='settings', label='Settings')
             self._plan_foot.set_text('')
         elif state in ('loading', 'idle') and not data and p5 is None:
             self._set_tag("Connecting", 'muted')
@@ -2518,11 +2531,12 @@ class TrackerWindow(Gtk.Window):
         box.pack_start(t, False, False, 0)
 
         d = Gtk.Label(label=(
-            "Add one row per Claude account you want to track. Each "
-            "config dir must contain a .credentials.json (run "
-            "`claude login` against it). “No poll” disables background "
-            "API calls for that account; “Hide from tray” keeps it in "
-            "the dashboard but skips it in the menu-bar label."))
+            "Add one row per Claude account you want to track: its Claude "
+            "Code config dir. With polling on (Notifications, below), the "
+            "dir needs a .credentials.json (run `claude login` against it), "
+            "and “No poll” skips polling for that account. “Hide from "
+            "tray” keeps it in the dashboard but skips it in the menu-bar "
+            "label."))
         d.get_style_context().add_class('subtitle')
         d.set_halign(Gtk.Align.START); d.set_line_wrap(True); d.set_xalign(0)
         box.pack_start(d, False, False, 8)
@@ -2713,34 +2727,50 @@ class TrackerWindow(Gtk.Window):
             l.set_halign(Gtk.Align.START)
             return l
 
+        self._token_poll_switch = Gtk.Switch()
+        self._token_poll_switch.set_active(bool(s.token_polling))
+        self._token_poll_switch.set_halign(Gtk.Align.START)
+        grid.attach(label("Poll Claude.ai with my login token"), 0, 0, 1, 1)
+        grid.attach(self._token_poll_switch, 1, 0, 1, 1)
+
         self._poll_spin = Gtk.SpinButton.new_with_range(60, 3600, 30)
         self._poll_spin.set_value(s.poll_interval_seconds)
-        grid.attach(label("Poll interval (seconds)"), 0, 0, 1, 1)
-        grid.attach(self._poll_spin, 1, 0, 1, 1)
+        grid.attach(label("Poll interval (seconds)"), 0, 1, 1, 1)
+        grid.attach(self._poll_spin, 1, 1, 1, 1)
 
         self._warn_spin = Gtk.SpinButton.new_with_range(1, 99, 1)
         self._warn_spin.set_value(s.thresholds.get('warn', 60))
-        grid.attach(label("Warn threshold (%)"), 0, 1, 1, 1)
-        grid.attach(self._warn_spin, 1, 1, 1, 1)
+        grid.attach(label("Warn threshold (%)"), 0, 2, 1, 1)
+        grid.attach(self._warn_spin, 1, 2, 1, 1)
 
         self._crit_spin = Gtk.SpinButton.new_with_range(1, 100, 1)
         self._crit_spin.set_value(s.thresholds.get('critical', 85))
-        grid.attach(label("Critical threshold (%)"), 0, 2, 1, 1)
-        grid.attach(self._crit_spin, 1, 2, 1, 1)
+        grid.attach(label("Critical threshold (%)"), 0, 3, 1, 1)
+        grid.attach(self._crit_spin, 1, 3, 1, 1)
 
         self._burn_switch = Gtk.Switch()
         self._burn_switch.set_active(bool(s.burn_rate.get('enabled', False)))
         self._burn_switch.set_halign(Gtk.Align.START)
-        grid.attach(label("Burn-rate alerts (7d)"), 0, 3, 1, 1)
-        grid.attach(self._burn_switch, 1, 3, 1, 1)
+        grid.attach(label("Burn-rate alerts (7d)"), 0, 4, 1, 1)
+        grid.attach(self._burn_switch, 1, 4, 1, 1)
 
         self._mult_spin = Gtk.SpinButton.new_with_range(1.0, 10.0, 0.1)
         self._mult_spin.set_digits(1)
         self._mult_spin.set_value(float(s.burn_rate.get('multiplier', 1.5)))
-        grid.attach(label("Burn-rate multiplier"), 0, 4, 1, 1)
-        grid.attach(self._mult_spin, 1, 4, 1, 1)
+        grid.attach(label("Burn-rate multiplier"), 0, 5, 1, 1)
+        grid.attach(self._mult_spin, 1, 5, 1, 1)
 
         box.pack_start(grid, False, False, 0)
+
+        note = Gtk.Label(label=(
+            "Polling is off unless you turn it on. Anthropic's terms keep "
+            "subscription login tokens for Claude Code and claude.ai, so by "
+            "default the plan windows come from Claude Code's status line "
+            "(set its command to `ctt statusline`) or from claudehop."))
+        note.get_style_context().add_class('subtitle')
+        note.set_halign(Gtk.Align.START); note.set_line_wrap(True); note.set_xalign(0)
+        note.set_margin_top(10)
+        box.pack_start(note, False, False, 0)
 
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         row.set_margin_top(14)
@@ -2767,6 +2797,7 @@ class TrackerWindow(Gtk.Window):
                 'multiplier': float(self._mult_spin.get_value()),
             },
             theme=load_settings().theme,
+            token_polling=bool(self._token_poll_switch.get_active()),
         )
         self.app.apply_settings(new_settings)
         self._flash_saved(self._notif_saved_label,
@@ -2940,7 +2971,8 @@ class AccountState:
     # Which claudehop account the last reading is of (None: not known, such
     # as when a hop landed during the fetch), and who took it: 'live' for this
     # widget's own poll, else 'claudehop', 'probe' or 'widget' for a stored
-    # reading adopted after a hop or while this token is throttled.
+    # reading adopted after a hop or while this token is throttled, or
+    # 'statusline' for one Claude Code's status line reported.
     last_hop_name: Optional[str] = None
     last_source: str = 'live'
     awaiting_new_window: bool = False  # window rolled over, no fresh data yet
@@ -2954,6 +2986,9 @@ class App:
         self.store = Store()
         self.window: Optional[TrackerWindow] = None
         self._running = True
+        # Read before the account states: whether polling is on decides how
+        # a missing token is shown.
+        self._settings = load_settings()
 
         self._accounts: List[Account] = load_accounts()
         self._account_states: Dict[str, AccountState] = {}
@@ -2977,7 +3012,6 @@ class App:
         self._hop_read_result: Optional[tuple] = None
 
         self._notif_mgr = NotificationManager()
-        self._settings = load_settings()
         ui.THRESHOLDS.update(self._settings.thresholds)  # gauge colours follow Settings
         self._startup_notified = False
         if HAS_NOTIFY:
@@ -3027,7 +3061,16 @@ class App:
         vis = [a for a in self._accounts if not a.hide_from_tray]
         return vis or self._accounts
 
+    def cloud_state_of(self, st: 'AccountState') -> str:
+        """The account's connection state as shown. A missing token matters
+        only while polling is on; otherwise nothing needs one."""
+        if not st.token and self._settings.token_polling:
+            return 'no_token'
+        return st.cloud_state
+
     def _polling_accounts(self) -> List[Account]:
+        if not self._settings.token_polling:
+            return []
         return [a for a in self._accounts if not a.disable_polling]
 
     # ── claudehop ───────────────────────────────────────────────────────────
@@ -3072,8 +3115,16 @@ class App:
     def _take_hop_snapshot(self):
         """Read claudehop and the store figures shown beside it. Scan thread."""
         now = datetime.now(timezone.utc)
+        self._statusline_entries = statusline.load_all()
+        from_line = {}
+        for name, e in statusline.by_hop_name(self._statusline_entries).items():
+            r = claudehop.reading_from_cloud(statusline.as_cloud(e),
+                                             statusline.read_at(e), 'statusline')
+            if r is not None:
+                from_line[name] = r
         snap = claudehop.take_snapshot(self._primary_state().token,
-                                       self.store.hop_usage())
+                                       self.store.hop_usage(), from_line)
+        self._snap_has_hop = snap is not None
         self._hop_since = self.store.hop_tracking_since() if snap else None
         self._bedrock_rows = self.store.has_account_rows(BEDROCK_ACCOUNT_LABEL)
         self._bedrock_week = (self.store.totals(since=now - timedelta(days=7),
@@ -3125,7 +3176,8 @@ class App:
         if st.last_hop_name != active and (st.last_read_at is not None
                                            or st.last_hop_name is not None or has):
             # A new login: the old one's throttle or error says nothing about it.
-            st.cloud_state = 'loading' if st.token else 'no_token'
+            st.cloud_state = (('loading' if st.token else 'no_token')
+                              if self._settings.token_polling else 'idle')
             st.cloud_error = ""
             st.cloud_retry_at = None
             if has:
@@ -3144,6 +3196,51 @@ class App:
             self._apply_usage(st, self._reading_as_cloud(snap, active, r),
                               r.at, active, r.source)
             self._sync_primary()
+
+    def _statusline_for_accounts(self) -> list:
+        """``(label, reading)`` for each configured account whose newest
+        status-line reading is its own. The primary account is left to the
+        claudehop snapshot when claudehop manages it. Scan thread."""
+        entries = getattr(self, '_statusline_entries', None) or []
+        primary = self._primary_account().label
+        out = []
+        for acc in self._accounts:
+            if (acc.label == primary and getattr(self, '_snap_has_hop', False)
+                    and self._primary_is_hop_home()):
+                continue
+            e = statusline.for_dir(acc.claude_dir, entries)
+            if e is not None and e.get('hop_name') in (None, statusline.hop_name_for(acc.claude_dir)):
+                out.append((acc.label, e))
+        return out
+
+    def _adopt_statusline(self, label: str, entry: dict):
+        """Show a reading Claude Code's status line reported, when it is newer
+        than the account's last one. Interface thread."""
+        st = self._account_states.get(label)
+        at = statusline.read_at(entry)
+        if st is None or at is None or (st.last_read_at is not None
+                                         and at <= st.last_read_at):
+            return False
+        data = statusline.as_cloud(entry)
+        pct5, pct7, _u5, _u7 = self._apply_usage(st, data, at, entry.get('hop_name'),
+                                                 'statusline')
+        self._sync_primary()
+        self._rebuild_tray()
+        self._update_tray_block()
+        if self.window:
+            self.window._update_hop_badge()
+            if self.window._current_view == 'dashboard':
+                self.window._update_dashboard()
+        if HAS_NOTIFY:
+            # From the figures as they stand now: a window that has reset
+            # since the reading counts as empty. Last, and guarded, so a
+            # desktop without a notification service still gets the figures.
+            try:
+                self._notify_thresholds(pct5, pct7 or 0, max(pct5, pct7 or 0) / 100,
+                                        usage_data=data, account=label)
+            except GLib.Error as e:
+                print(f"[{APP_ID}] notification: {e}", file=sys.stderr)
+        return False
 
     @staticmethod
     def _reading_as_cloud(snap, name: str, r) -> dict:
@@ -3210,7 +3307,7 @@ class App:
         self.token = st.token
         self.usage_data = st.usage_data
         self.subscription_info = st.subscription_info
-        self.cloud_state = st.cloud_state if st.token else 'no_token'
+        self.cloud_state = self.cloud_state_of(st)
         self.cloud_error = st.cloud_error
         self.cloud_retry_at = st.cloud_retry_at
 
@@ -3308,7 +3405,7 @@ class App:
         texts.pack_start(lbl(hs.active if hs and hs.active else "Plan limits",
                              'popup-title', ellipsize=True), False, False, 0)
         head.pack_start(texts, True, True, 0)
-        state = st.cloud_state if st.token else 'no_token'
+        state = self.cloud_state_of(st)
         tag_text, tag_kind = {
             'ok': ('Live', 'ok'), 'rate_limited': ('Rate limited', 'warn'),
             'auth_error': ('Token rejected', 'danger'),
@@ -3884,6 +3981,8 @@ class App:
                     self.data_version += 1
                 self._first_scan_done = True
                 GLib.idle_add(self._apply_hop_snapshot, self._take_hop_snapshot())
+                for label, entry in self._statusline_for_accounts():
+                    GLib.idle_add(self._adopt_statusline, label, entry)
                 # The tray's session line, worked out here rather than on
                 # the interface thread (it reads every turn of the last hours).
                 acc = self._primary_account().label
@@ -3918,7 +4017,7 @@ class App:
             poll = self._polling_accounts()
             primary_label = self._primary_account().label
 
-            if not poll:
+            if not poll and self._settings.token_polling:
                 # Everything has polling disabled — still touch the primary
                 # so the tray reflects token state.
                 state = self._primary_state()
@@ -4262,6 +4361,13 @@ class App:
         save_settings(settings)
         self._settings = settings
         ui.THRESHOLDS.update(settings.thresholds)
+        if not settings.token_polling:
+            # Nothing polls now, so a throttle or error from the last poll no
+            # longer describes anything.
+            for st in self._account_states.values():
+                st.cloud_state, st.cloud_error, st.cloud_retry_at = 'idle', "", None
+            self._sync_primary()
+            self._rebuild_tray()
         self._refresh_cloud()
 
     def reload_accounts(self, accounts: List[Account]):

@@ -153,7 +153,7 @@ class Reading:
     resets_7d: Optional[str]
     week_scope: Optional[str]          # the model the weekly figure covers; None = all models
     at: Optional[datetime]             # when it was read
-    source: str                        # 'live', 'widget', 'claudehop' or 'probe'
+    source: str                        # 'live', 'widget', 'claudehop', 'probe' or 'statusline'
     throttled_until: Optional[datetime] = None
 
     @property
@@ -302,9 +302,11 @@ class Snapshot:
 
 
 def take_snapshot(live_token: Optional[str],
-                  seen_rows: Dict[str, dict]) -> Optional[Snapshot]:
+                  seen_rows: Dict[str, dict],
+                  extra: Optional[Dict[str, Reading]] = None) -> Optional[Snapshot]:
     """claudehop's state, readings and ``hop run`` terminals, or None when
-    claudehop is not in use. ``seen_rows`` is ``Store.hop_usage()``."""
+    claudehop is not in use. ``seen_rows`` is ``Store.hop_usage()``; ``extra``
+    holds other readings by account name (Claude Code's status line)."""
     hs = load_state(live_token)
     if hs is None:
         return None
@@ -318,7 +320,9 @@ def take_snapshot(live_token: Optional[str],
         shaped = cloud_from_cache(entry)
         if shaped is not None:
             cloud[str(name)] = shaped
-    cached = {p.name: newest(reading_from_seen(seen_rows.get(p.name)), cache.get(p.name))
+    extra = extra or {}
+    cached = {p.name: newest(reading_from_seen(seen_rows.get(p.name)), cache.get(p.name),
+                             extra.get(p.name))
               for p in hs.profiles}
     return Snapshot(hs, cached, cloud, run_terminals(), datetime.now(timezone.utc))
 

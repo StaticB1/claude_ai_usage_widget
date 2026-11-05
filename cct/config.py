@@ -7,7 +7,7 @@ from typing import List, Optional
 
 APP_ID = 'claude-token-tracker'
 APP_NAME = 'Claude Usage Widget & Token Tracker'
-APP_VERSION = '2.4.0'
+APP_VERSION = '2.5.0'
 
 CLAUDE_DIR = Path.home() / '.claude' / 'projects'
 CREDENTIALS_FILE = Path.home() / '.claude' / '.credentials.json'
@@ -158,6 +158,11 @@ class Settings:
     thresholds: dict = field(default_factory=lambda: dict(DEFAULT_THRESHOLDS))
     burn_rate: dict = field(default_factory=lambda: dict(DEFAULT_BURN_RATE))
     theme: str = 'system'  # 'system' | 'light' | 'dark'
+    # Ask Claude.ai for the plan windows with Claude Code's login token. Off
+    # unless turned on: Anthropic's terms keep subscription tokens for Claude
+    # Code and claude.ai, so the windows come from Claude Code's status line
+    # (``ctt statusline``) or claudehop instead.
+    token_polling: bool = False
 
 
 def load_settings() -> Settings:
@@ -178,6 +183,7 @@ def load_settings() -> Settings:
         },
         theme=(t if (t := str(cfg.get('theme') or 'system'))
               in ('system', 'light', 'dark') else 'system'),
+        token_polling=bool(cfg.get('token_polling', False)),
     )
 
 
@@ -187,4 +193,5 @@ def save_settings(s: Settings) -> None:
     cfg['thresholds'] = dict(s.thresholds)
     cfg['burn_rate'] = dict(s.burn_rate)
     cfg['theme'] = s.theme
+    cfg['token_polling'] = bool(s.token_polling)
     save_config(cfg)

@@ -19,7 +19,7 @@
 > "Claude", "Claude Code", and "Anthropic" are trademarks of Anthropic, PBC,
 > used here only to describe what the tool works with. Please read
 > [Disclaimer & trademarks](#disclaimer--trademarks) — especially the note on
-> the live usage feature, which uses your Claude OAuth token.
+> the optional polling, which uses your Claude login token.
 
 ---
 
@@ -28,15 +28,15 @@
 | | 🟢 **Usage Widget** (live) | 📊 **Token Tracker** (local) |
 |---|---|---|
 | **Question it answers** | "How close am I to my plan limit *right now*?" | "Where did my tokens and money go?" |
-| **Data source** | Your Claude plan's live 5h / 7d utilization (claude.ai usage API) | Your on-disk Claude Code logs (`~/.claude/projects`) |
+| **Data source** | Your Claude plan's 5h / 7d utilization, from Claude Code's status line or claudehop (or the claude.ai usage API, if you turn polling on) | Your on-disk Claude Code logs (`~/.claude/projects`) |
 | **Surface** | System-tray gauge + escalation notifications | CLI (`ctt`) + GTK dashboard + SQLite history |
-| **Needs network/token?** | Yes — reads the `claude` CLI OAuth token (see the risk note) | No — 100% offline, never touches your token |
+| **Needs network/token?** | No. Polling with the `claude` CLI OAuth token is opt-in (see the risk note) | No — 100% offline, never touches your token |
 | **Platforms** | Linux tray (GTK) | CLI on Linux/macOS/Windows; dashboard on Linux |
 
 The widget is the spiritual successor to **claude_ai_usage_widget**; the tracker
-is the new half built on top of it. You can use either half on its own — disable
-the live polling and it's a pure local analytics tool; ignore the dashboard and
-the tray gauge behaves like the original widget.
+is the new half built on top of it. You can use either half on its own: without
+a plan reading it's a pure local analytics tool; ignore the dashboard and the
+tray gauge behaves like the original widget.
 
 <p align="center">
   <img src="assets/widget.png" alt="The usage panel: rings for the 5-hour and 7-day windows, the current session, and the account with the most room" width="340">
@@ -80,17 +80,18 @@ the tray gauge behaves like the original widget.
   model, and which tool calls (`Bash`, `Read`, `Edit`, `Agent`, …) drive spend.
 - **Cost estimates** — priced from a built-in rate card you can override.
 - **5-hour session + forecast** — the window your account is actually billed
-  against, anchored on the reset time the usage API reports, with burn rate and
-  time-to-reset. Without a token it falls back to inferring the window from
+  against, anchored on the plan's reset time (from the status line, claudehop
+  or polling), with burn rate and time-to-reset. Without one it falls back to
+  inferring the window from
   your logs and says so, because usage from claude.ai, the apps and your other
   machines counts toward the same window and never appears in local logs.
 - **Budgets** — daily / weekly / monthly **USD or token** caps, scoped globally,
   per-project, or per-model; plus optional **plan-utilization %** budgets that
-  ride the live 5h/7d windows. Desktop notification when crossed.
+  ride the 5h/7d plan windows. Desktop notification when crossed.
 - **Cross-platform CLI (`ctt`)** — table or `--json` output for shell prompts,
   status bars, and CI checks.
 - **GTK dashboard (Linux)** — Dashboard, Projects, Breakdowns, Budgets, and
-  Settings views, with a System / Light / Dark theme switch; backs off live
+  Settings views, with a System / Light / Dark theme switch; backs off
   polling when hidden.
 
 ## Install
@@ -146,9 +147,11 @@ git pull        # or: bash upgrade.sh, which pulls + reinstalls + relaunches for
 bash install.sh
 ```
 
-Either way your data carries over automatically: the live widget re-reads the
-OAuth token from `~/.claude/.credentials.json`, and the new local history DB
-backfills from `~/.claude/projects` on the first `ctt scan`. The old config dir
+Either way your data carries over automatically: the new local history DB
+backfills from `~/.claude/projects` on the first `ctt scan`. From 2.5.0 the
+widget no longer polls Claude.ai with your login token unless you turn polling
+on in Settings; set up the status line to keep the plan rings (see
+[Where the plan figures come from](#where-the-plan-figures-come-from)). The old config dir
 `~/.config/claude-usage-widget` is left in place in case it holds a manually
 pasted token — once v2 is confirmed working you can `rm -rf` it.
 
@@ -167,7 +170,7 @@ ctt --help
 ctt scan                 # import new logs into the local store (fast, incremental)
 ctt summary --period 7d  # where did my tokens & $ go this week?
 ctt block                # how much of my current 5-hour block have I burned?
-ctt cloud                # live plan utilization from claude.ai (needs token)
+ctt cloud                # ask claude.ai for plan utilization now (uses your login token)
 claude-token-tracker     # launch the GTK dashboard + tray widget (Linux)
 ```
 
@@ -175,7 +178,7 @@ claude-token-tracker     # launch the GTK dashboard + tray widget (Linux)
 
 Launch `claude-token-tracker` and a gauge appears in your system tray:
 
-- The ring and percentage are your **live 5-hour plan utilization** (0–100% of
+- The ring and percentage are your **5-hour plan utilization** (0–100% of
   your Pro/Max/Team limit). Teal while there is room, amber past your warning
   threshold and red past the critical one (60% and 85% unless you change them
   in Settings). A broken ring means the connection failed; a dot means no
@@ -186,16 +189,44 @@ Launch `claude-token-tracker` and a gauge appears in your system tray:
 - Right-click the tray icon for the full readout: the **LIMITS** section (5h and
   7d windows + any per-model weekly caps, each with resets), per-**ACCOUNT**
   utilization, and your **CURRENT 5H BLOCK** burn (this part is local and works
-  even without a token).
-- **Open Dashboard** for the full tracker UI; **Refresh now** forces a poll.
+  even without a plan reading).
+- **Open Dashboard** for the full tracker UI; **Refresh now** reads again.
 - Notifications fire as you cross **75% / 90% / 100%** of a window.
 
-Polling backs off automatically while the dashboard is hidden, and honors a
-per-account **"disable polling"** switch in Settings.
+### Where the plan figures come from
 
-> The live widget needs the OAuth token that the `claude` CLI stores in
-> `~/.claude/.credentials.json`. See the [risk note](#about-the-live-usage-feature)
-> before relying on it. Everything in the Token Tracker works without it.
+The widget never needs your login token. It takes the 5-hour and weekly
+figures from, in order:
+
+1. **Claude Code's status line.** Claude Code hands its status-line command
+   the plan windows for Pro, Max and Ultra plans, after a session's first
+   reply. Make `ctt statusline` that command and the widget reads what it
+   saves. In `~/.claude/settings.json`:
+
+   ```json
+   {
+     "statusLine": {
+       "type": "command",
+       "command": "ctt statusline"
+     }
+   }
+   ```
+
+   It prints the model and both windows. If you already have a status line,
+   put your command after `--`, as in
+   `"command": "ctt statusline -- ~/.claude/statusline.sh"`; it gets the same
+   input and its output is shown unchanged. Team and Enterprise seats get no
+   plan windows in the status line, so for them this source stays empty.
+2. **claudehop**, when it is installed: its reading of each account (see
+   [Several accounts with claudehop](#several-accounts-with-claudehop)).
+3. **Polling Claude.ai with your login token**, only if you turn it on under
+   Settings → Notifications. It reads the OAuth token the `claude` CLI stores
+   in `~/.claude/.credentials.json`. See the
+   [risk note](#about-the-live-usage-feature) first. Each account has a
+   **"No poll"** switch, and `ctt cloud` asks Claude.ai once when you run it.
+
+The tag on the plan panel says how old the reading is and who took it.
+Everything in the Token Tracker works without any of these.
 
 ## The Token Tracker (local)
 
@@ -208,8 +239,9 @@ per-account **"disable polling"** switch in Settings.
 | `ctt models [--period P] [--account A] [--json]` | Per-model breakdown. |
 | `ctt tools [--period P] [--account A] [--json]` | Per-tool attribution (`Bash`, `Read`, `Edit`, `Agent`, …). |
 | `ctt accounts [--period P] [--json]` | List configured accounts and their totals; with claudehop, also each claudehop account's tokens, plan usage and the login with the most room. |
-| `ctt block [--account A] [--no-cloud] [--json]` | Current 5-hour session, burn rate, and ETA. `--no-cloud` skips the live reset time and infers the window from logs. |
-| `ctt cloud [--account A]` | Live cloud usage from claude.ai (raw JSON). |
+| `ctt block [--account A] [--no-cloud] [--json]` | Current 5-hour session, burn rate, and ETA. `--no-cloud` skips the plan's reset time and infers the window from logs. |
+| `ctt cloud [--account A]` | Live cloud usage from claude.ai (raw JSON), read with your login token when you run it. |
+| `ctt statusline [-- COMMAND]` | Claude Code's status-line command: keeps the plan windows Claude Code reports, then shows COMMAND's status line (or the model and both windows). |
 | `ctt prompt [--no-cloud] [--account A]` | One-line status for shell prompts / status bars. |
 | `ctt export [--period P] [--project …] [--model …] [--account A] [--format json\|csv]` | Dump rows. |
 | `ctt reprice [--rescan]` | Recompute stored costs after editing the rate card. `--rescan` also re-reads every log on disk. |
@@ -226,7 +258,7 @@ ctt budget add --name "Monthly cap"   --usd 100   --period month
 ctt budget add --name "Opus tokens"   --tokens 50000000 --period week --scope model:claude-opus-4-8
 ctt budget add --name "Proj X daily"  --usd 10    --period day  --scope project:my-app
 
-# Plan-utilization budget (rides the live 5h/7d window — needs an OAuth token):
+# Plan-utilization budget (rides the 5h/7d plan window; needs a status-line reading or polling):
 ctt budget add --name "5h headroom"   --pct 90    --period 5h
 
 ctt budget list
@@ -280,7 +312,8 @@ desktops where the AppIndicator dropdown itself can't be restyled.
 | Path | What it is |
 |---|---|
 | `~/.claude/projects/` | **Read** — Claude Code's session JSONL (source of truth for the tracker). |
-| `~/.claude/.credentials.json` | **Read** — OAuth token managed by the `claude` CLI (used by the live widget). |
+| `~/.claude/.credentials.json` | **Read** — OAuth token managed by the `claude` CLI. Sent to Claude.ai only when polling is on or you run `ctt cloud`. |
+| `~/.config/claude-token-tracker/statusline/` | Plan windows saved by `ctt statusline`, one file per Claude config folder. |
 | `~/.config/claude-token-tracker/history.db` | SQLite — long-term token/cost history. |
 | `~/.config/claude-token-tracker/config.json` | Accounts, settings, and an optional fallback OAuth token. |
 | `~/.config/claude-token-tracker/rate_card.json` | Optional pricing override. |
@@ -310,12 +343,12 @@ it, none of this appears.
 - **Which account is live.** The dashboard header and the tray name it, or the
   provider (such as Bedrock) that new sessions run through.
 - **Every account's usage.** The Accounts card and the tray list each account's
-  newest 5-hour and weekly reading. The live login's comes from the widget's own
-  polling, or from claudehop when claudehop read it more recently; while that
-  reading is younger than the poll interval the widget doesn't poll at all, so
-  the two don't spend the token's allowance on the same figures. The others
-  come from claudehop's cache or from the last time the widget saw them live,
-  with the reading's age.
+  newest 5-hour and weekly reading, with its age: whichever is newest of the
+  status line (including `hop run` sessions), claudehop's cache, the last time
+  the widget saw the account live, and the widget's own polling when it is on.
+  With polling on, the widget skips a poll while claudehop's reading of the live
+  login is younger than the poll interval, so the two don't spend the token's
+  allowance on the same figures.
 - **Read all accounts.** This button runs `hop usage` once, so claudehop reads
   every account and renews an idle account's token first. Each read spends a
   little of the usage endpoint's allowance, so it never runs on its own. If
@@ -441,23 +474,23 @@ provided "as is", without warranty of any kind (see [LICENSE](LICENSE)).
 
 ### About the live usage feature
 
-⚠️ The usage widget (the `ctt cloud` command and the live 5h/7d gauge in the GUI)
-reads the OAuth token that the official `claude` CLI stores in
+⚠️ Polling (the switch under Settings → Notifications, and the `ctt cloud`
+command) reads the OAuth token that the official `claude` CLI stores in
 `~/.claude/.credentials.json` and calls Anthropic's usage endpoint to report your
 plan-utilization %.
 
 - Anthropic's Consumer Terms restrict these subscription OAuth tokens to use with
   **Claude Code and claude.ai only**. Using them from a third-party tool may
   violate those terms and **could put your Claude account at risk**.
-- In the GUI this polling is **enabled by default whenever a token is present**.
-  Turn it off per account with the **"disable polling"** switch in the Settings
-  tab. The CLI never calls the cloud unless you run `ctt cloud`, and other
-  commands accept `--no-cloud`.
+- Since 2.5.0 polling is **off unless you turn it on**. The widget, `ctt block`,
+  `ctt prompt` and budgets read the plan windows from Claude Code's status line
+  (`ctt statusline`) or claudehop instead, and use the token only when polling
+  is on. `ctt cloud` uses it whenever you run it.
 - **The entire Token Tracker half** — local history, per-project / per-model /
   per-tool spend, cost estimates, budgets, and the local 5-hour block forecast —
   works entirely from your own on-disk logs and never uses your token.
 
-Use the live feature only if you understand and accept that risk.
+Turn polling on only if you understand and accept that risk.
 
 ## Related tools
 

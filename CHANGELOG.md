@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-11-05
+
+The plan figures now come from Claude Code itself, and the widget no longer
+uses your login token unless you ask it to.
+
+### Added
+- **`ctt statusline`.** Claude Code passes its status-line command the 5-hour
+  and weekly windows for Pro, Max and Ultra plans. Set `ctt statusline` as that
+  command and it saves those figures, one file per Claude config folder, then
+  prints a short line of its own, or your existing status line's output when
+  you put that command after `--`. The widget, `ctt block`, `ctt prompt` and
+  plan budgets read these files first. A reading taken in a `hop run` session
+  is filed under that claudehop account, and one taken before a hop is not
+  shown as the new login's.
+- **A "Poll Claude.ai with my login token" switch** under Settings →
+  Notifications, with a note on what it does.
+
+### Changed
+- **Polling with the login token is off by default**, for new and upgraded
+  installs alike. Anthropic's terms keep subscription tokens for Claude Code
+  and claude.ai, so the widget no longer sends the token anywhere unless you
+  turn polling on. Without a status-line reading or claudehop, the plan panel
+  says "No reading yet", with a Settings button, instead of "Not connected".
+  `ctt cloud` still asks Claude.ai when you run it.
+- README and SECURITY.md describe the three sources (status line, claudehop,
+  opt-in polling) and what each reads and sends.
+
+### Fixed
+- SECURITY.md said no token is ever written to the tracker's config; a token
+  you paste into Settings yourself is, in a file only your user can read.
+
 ## [2.4.0] - 2026-11-05
 
 Faster, steadier, and right about which claudehop account it is showing.
