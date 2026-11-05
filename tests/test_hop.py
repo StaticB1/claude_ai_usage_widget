@@ -264,3 +264,58 @@ def test_a_queued_or_slow_read_is_left_running(tmp_path, monkeypatch):
             break
         time.sleep(0.1)
     assert hop.read_all(wait=0.2).status == 'slow'
+
+
+# ── Snapshot: one background read for the window and tray ──────────────────
+
+def _cache(d, entries):
+    (d / '.usage-cache').write_text(json.dumps(entries))
+
+
+def _entry(pct5, pct7, at, scope=None):
+    return {'windows': {'five_hour': {'pct': pct5, 'resetsAt': None},
+                        'seven_day': {'pct': pct7, 'resetsAt': None}},
+            'fetchedAt': at.timestamp(), 'source': 'usage',
+            'limits': ([{'kind': 'weekly_scoped', 'group': 'weekly', 'pct': 29.0,
+                         'resetsAt': None, 'scope': scope}] if scope else [])}
+
+
+def test_snapshot_reads_every_account_and_keeps_the_api_shape(tmp_path, monkeypatch):
+    d = _setup(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    _cache(d, {'alpha': _entry(40, 60, now, scope='Fable'),
+               'beta': _entry(10, 20, now - timedelta(minutes=5))})
+    snap = hop.take_snapshot('tok-B', {})
+    assert snap.state.active == 'beta'
+    assert snap.cached['alpha'].pct5 == 40 and snap.cached['beta'].pct7 == 20
+    # The live-reply shape, so per-model rows survive into the tray.
+    from cct.cloud import extract_model_limits, weekly_window
+    assert weekly_window(snap.cloud['alpha'])['utilization'] == 60
+    assert [m['model'] for m in extract_model_limits(snap.cloud['alpha'])] == ['Fable']
+
+
+def test_snapshot_prefers_the_widgets_own_reading_when_it_is_newer(tmp_path, monkeypatch):
+    d = _setup(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    _cache(d, {'beta': _entry(10, 20, now - timedelta(hours=1))})
+    seen = {'beta': {'pct5': 55, 'pct7': 70, 'resets_5h': None, 'resets_7d': None,
+                     'week_scope': None, 'seen_at': now.isoformat()}}
+    snap = hop.take_snapshot('tok-A', seen)
+    assert (snap.cached['beta'].pct5, snap.cached['beta'].source) == (55, 'widget')
+
+
+def test_live_reading_replaces_the_stored_one_only_when_newer(tmp_path, monkeypatch):
+    d = _setup(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    _cache(d, {'alpha': _entry(40, 60, now - timedelta(minutes=1))})
+    snap = hop.take_snapshot('tok-A', {})
+    old = hop.Reading(90, None, 95, None, None, now - timedelta(minutes=10), 'live')
+    assert hop.with_live(snap, old)['alpha'].pct5 == 40        # claudehop read it since
+    new = hop.Reading(42, None, 61, None, None, now, 'live')
+    assert hop.with_live(snap, new)['alpha'].source == 'live'
+    assert hop.with_live(snap, None)['beta'] is None           # never read: no figures
+
+
+def test_no_snapshot_without_claudehop(tmp_path, monkeypatch):
+    monkeypatch.setenv('CLAUDE_ACCOUNTS_DIR', str(tmp_path / 'none'))
+    assert hop.take_snapshot(None, {}) is None

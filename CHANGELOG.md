@@ -4,7 +4,48 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-11-05
+
+Faster, steadier, and right about which claudehop account it is showing.
+
+### Fixed
+- **The widget could close itself while starting.** Opening it again sends the
+  running copy a signal to raise its window. The handler for that signal was
+  installed only after the first scan, which can take minutes, so a second
+  click during start-up ended the starting widget. The handler is now in place
+  before anything else runs.
+- **It fell behind and used a lot of memory.** Every 10 seconds it read each
+  changed log again from the start, so a busy session log of 1.8 GB was parsed
+  in full on every tick, and long-running copies peaked at 2.2 to 2.7 GB. Logs
+  are now read from where the last read stopped, with the position and the
+  newest turns saved in the store, and lines that carry no usage are skipped
+  before they are decoded. A large log is read in 64 MB parts. A tick with
+  nothing new takes under a second and the widget stays under 200 MB.
+- **The window froze while a scan ran.** One lock covered every store query,
+  so the dashboard waited for the scanner. Each thread now has its own SQLite
+  connection (the store runs in WAL mode, so readers don't wait for the
+  writer). claudehop's files are read on the scan thread and the window only
+  draws what that thread prepared. With the window open the dashboard
+  refreshes every 30 seconds and the daily chart every 5 minutes, instead of
+  every tick.
+- **After a hop, the previous account's figures appeared under the new one**
+  until the next poll. The widget now shows the new account's newest stored
+  reading, or none, until its own first poll.
+- **"!" and "Rate limited" showed when claudehop had a fresh reading.** When
+  Claude.ai throttles the widget, the rings now show claudehop's reading of the
+  same login with its age ("Read 8m ago", "Read by claudehop at 17:08"), and
+  the notice says whose reading is on screen. While claudehop's reading of the
+  live login is younger than the poll interval, the widget skips its own poll,
+  which leaves more of the token's allowance for Claude Code.
+- **Session folders reached through symbolic links were not read.** claudehop's
+  run homes link back to the projects folder, and the old walk did not follow
+  links. The walk now follows them, reads each real file once however many
+  links lead to it, and survives link loops. Records of logs that no longer
+  exist are dropped from the store.
+
 ### Changed
+- Idle accounts' tiles, tray lines and the tray's Limits header say how old
+  their reading is.
 - When claudehop's lock is taken, "Read all accounts" names the command holding
   it, as claudehop 2.0.0 and later record it in the lock file. The message no
   longer blames an open `hop` menu, which stopped holding the lock in claudehop

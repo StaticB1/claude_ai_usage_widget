@@ -198,27 +198,23 @@ def reading_from_cloud(data: Optional[dict], at: datetime,
                    week.get('scope'), at, source)
 
 
-def reading_from_cache(entry: dict) -> Optional[Reading]:
-    """A reading from one entry of claudehop's ``.usage-cache``.
+def cloud_from_cache(entry) -> Optional[dict]:
+    """One entry of claudehop's ``.usage-cache`` in the usage API's shape.
 
     claudehop stores windows as ``{"pct", "resetsAt"}`` and its ``limits`` rows
     as ``{"kind", "group", "pct", "resetsAt", "scope"}``. They are put back in
-    the API's shape so the weekly figure is chosen exactly as for a live reply.
+    the API's shape so the weekly figure and the per-model rows are chosen
+    exactly as for a live reply. None when the entry holds no windows.
     """
-    if not isinstance(entry, dict):
+    if not isinstance(entry, dict) or not isinstance(entry.get('windows'), dict):
         return None
-    windows = entry.get('windows') if isinstance(entry.get('windows'), dict) else None
+    windows = entry['windows']
 
     def win(w):
         return ({'utilization': w.get('pct'), 'resets_at': w.get('resetsAt')}
                 if isinstance(w, dict) else None)
 
-    throttled = _epoch(entry.get('throttledUntil'))
-    if windows is None:
-        if throttled is None:
-            return None
-        return Reading(None, None, None, None, None, None, 'claudehop', throttled)
-    shaped = {
+    return {
         'five_hour': win(windows.get('five_hour')),
         'seven_day': win(windows.get('seven_day')),
         'limits': [{'kind': r.get('kind'), 'group': r.get('group'),
@@ -227,6 +223,18 @@ def reading_from_cache(entry: dict) -> Optional[Reading]:
                               if r.get('scope') else None)}
                    for r in entry.get('limits') or [] if isinstance(r, dict)],
     }
+
+
+def reading_from_cache(entry: dict) -> Optional[Reading]:
+    """A reading from one entry of claudehop's ``.usage-cache``."""
+    if not isinstance(entry, dict):
+        return None
+    throttled = _epoch(entry.get('throttledUntil'))
+    shaped = cloud_from_cache(entry)
+    if shaped is None:
+        if throttled is None:
+            return None
+        return Reading(None, None, None, None, None, None, 'claudehop', throttled)
     source = 'probe' if entry.get('source') == 'probe' else 'claudehop'
     r = reading_from_cloud(shaped, _epoch(entry.get('fetchedAt')), source)
     if r is not None:
@@ -276,6 +284,53 @@ def newest(*readings: Optional[Reading]) -> Optional[Reading]:
             best = replace(best, pct7=donor.pct7, resets_7d=donor.resets_7d,
                            week_scope=donor.week_scope)
     return best
+
+
+@dataclass
+class Snapshot:
+    """Everything the window and tray show about claudehop, read in one go off
+    the interface thread so drawing never waits on a file or the database.
+
+    ``cached`` is each account's newest stored reading (claudehop's cache or
+    the widget's own); ``cloud`` holds claudehop's cache entries in the usage
+    API's shape, so a reading of the live login can stand in for a poll."""
+    state: HopState
+    cached: Dict[str, Optional[Reading]]
+    cloud: Dict[str, dict]
+    runs: Dict[str, int]
+    taken_at: datetime
+
+
+def take_snapshot(live_token: Optional[str],
+                  seen_rows: Dict[str, dict]) -> Optional[Snapshot]:
+    """claudehop's state, readings and ``hop run`` terminals, or None when
+    claudehop is not in use. ``seen_rows`` is ``Store.hop_usage()``."""
+    hs = load_state(live_token)
+    if hs is None:
+        return None
+    raw = _read_json(accounts_dir() / '.usage-cache')
+    cache: Dict[str, Reading] = {}
+    cloud: Dict[str, dict] = {}
+    for name, entry in raw.items():
+        r = reading_from_cache(entry)
+        if r is not None:
+            cache[str(name)] = r
+        shaped = cloud_from_cache(entry)
+        if shaped is not None:
+            cloud[str(name)] = shaped
+    cached = {p.name: newest(reading_from_seen(seen_rows.get(p.name)), cache.get(p.name))
+              for p in hs.profiles}
+    return Snapshot(hs, cached, cloud, run_terminals(), datetime.now(timezone.utc))
+
+
+def with_live(snap: Snapshot, live: Optional[Reading]) -> Dict[str, Optional[Reading]]:
+    """The snapshot's readings, with the widget's own reading of the live login
+    in place of the stored one when it is the newer of the two."""
+    out = dict(snap.cached)
+    active = snap.state.active
+    if active and live is not None and live.has_figures:
+        out[active] = newest(live, out.get(active))
+    return out
 
 
 def all_readings(names: List[str], seen_rows: Dict[str, dict],

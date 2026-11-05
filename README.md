@@ -203,7 +203,7 @@ per-account **"disable polling"** switch in Settings.
 
 | Command | What it does |
 |---|---|
-| `ctt scan` | Import new turns from `~/.claude` into the store (incremental — only re-parses changed session logs). |
+| `ctt scan` | Import new turns from `~/.claude` into the store (incremental: reads only what was added to each log since the last scan). |
 | `ctt summary [--period P] [--limit N] [--account A] [--json]` | Per-project token & cost totals. |
 | `ctt models [--period P] [--account A] [--json]` | Per-model breakdown. |
 | `ctt tools [--period P] [--account A] [--json]` | Per-tool attribution (`Bash`, `Read`, `Edit`, `Agent`, …). |
@@ -311,8 +311,11 @@ it, none of this appears.
   provider (such as Bedrock) that new sessions run through.
 - **Every account's usage.** The Accounts card and the tray list each account's
   newest 5-hour and weekly reading. The live login's comes from the widget's own
-  polling. The others come from claudehop's cache or from the last time the
-  widget saw them live, with the reading's age.
+  polling, or from claudehop when claudehop read it more recently; while that
+  reading is younger than the poll interval the widget doesn't poll at all, so
+  the two don't spend the token's allowance on the same figures. The others
+  come from claudehop's cache or from the last time the widget saw them live,
+  with the reading's age.
 - **Read all accounts.** This button runs `hop usage` once, so claudehop reads
   every account and renews an idle account's token first. Each read spends a
   little of the usage endpoint's allowance, so it never runs on its own. If
@@ -370,10 +373,16 @@ cct/
 ```
 
 Scanning is **incremental**: each pass skips session logs whose size/mtime are
-unchanged, so the every-10-seconds refresh only re-parses the active session
-instead of your whole history. Rows are written as upserts, so when a parsing
-or pricing fix ships, a rescan repairs the history already in the database
-rather than leaving the old numbers in place.
+unchanged, and reads a log that grew from where the last pass stopped. The
+store keeps each log's read position and its newest turns, so a response
+written across two passes is still counted once. Lines without usage are
+skipped before they are decoded, and a large log is read in 64 MB parts, so
+the every-10-seconds refresh stays cheap even when one session log runs to
+gigabytes. The walk follows symbolic links (claudehop's `hop run` homes link
+back to `~/.claude/projects`) and reads each real file once. The scan runs on
+a background thread; the window only draws what it prepared. Rows are written
+as upserts, so when a parsing or pricing fix ships, a rescan repairs the
+history already in the database rather than leaving the old numbers in place.
 
 Calendar periods — `today`, and the day/week/month budget windows — follow your
 local calendar, so a monthly cap rolls over at local midnight on the 1st.
@@ -449,6 +458,16 @@ plan-utilization %.
   works entirely from your own on-disk logs and never uses your token.
 
 Use the live feature only if you understand and accept that risk.
+
+## Related tools
+
+[claudehop](https://github.com/psychofict/claudehop) keeps several Claude Code
+logins on one machine; the widget shows each one's usage when it is installed.
+Using OpenAI Codex too? [codexwatch](https://github.com/psychofict/codexwatch)
+tracks Codex tokens, cost and plan limits, and
+[codexhop](https://github.com/psychofict/codexhop) does for ChatGPT logins what
+claudehop does for Claude. All three are by
+[Ebenworks](https://ebenworks.co/).
 
 ## Changelog
 

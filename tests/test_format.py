@@ -1,4 +1,3 @@
-import os
 from datetime import datetime, timedelta, timezone
 
 from cct.format import fmt_reset_absolute, fmt_reset_countdown

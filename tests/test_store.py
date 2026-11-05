@@ -59,12 +59,52 @@ def test_scan_into_store_is_incremental(tmp_path, rc):
     # Re-scan with the file unchanged: nothing is re-parsed at all.
     assert scan_into_store(store, rc, claude_dir=tmp_path) == {'default': 0}
 
-    # Appending a turn changes the file size → it's re-read, and both turns
-    # in it are written (the pre-existing one as a no-op refresh).
+    # Appending a turn changes the file size → only the new line is read.
     with open(f, 'a') as fh:
         fh.write(_assistant_line('m2') + "\n")
-    assert scan_into_store(store, rc, claude_dir=tmp_path) == {'default': 2}
+    assert scan_into_store(store, rc, claude_dir=tmp_path) == {'default': 1}
     assert len(store.query()) == 2
+
+
+def test_scan_reads_a_log_again_after_it_shrinks(tmp_path, rc):
+    proj = tmp_path / '-home-u-proj'
+    proj.mkdir()
+    f = proj / 'session.jsonl'
+    f.write_text(_assistant_line('m1') + "\n" + _assistant_line('m2') + "\n")
+    store = Store(tmp_path / 'h.db')
+    assert scan_into_store(store, rc, claude_dir=tmp_path) == {'default': 2}
+    # Rewritten shorter: the saved place is past the end, so read it all.
+    f.write_text(_assistant_line('m3') + "\n")
+    assert scan_into_store(store, rc, claude_dir=tmp_path) == {'default': 1}
+    assert len(store.query()) == 3
+
+
+def test_scan_of_a_large_log_in_parts_counts_the_same(tmp_path, rc, monkeypatch):
+    import cct.cli as cli
+    proj = tmp_path / '-home-u-proj'
+    proj.mkdir()
+    f = proj / 'session.jsonl'
+    f.write_text("".join(_assistant_line(f'm{i}', out=i + 1) + "\n" for i in range(40)))
+    monkeypatch.setattr(cli, 'SCAN_PART_BYTES', 300)
+    store = Store(tmp_path / 'h.db')
+    assert scan_into_store(store, rc, claude_dir=tmp_path) == {'default': 40}
+    assert store.totals()['output_tokens'] == sum(range(1, 41))
+    # Read to the end: nothing left, and the place is the end of the file.
+    assert scan_into_store(store, rc, claude_dir=tmp_path) == {'default': 0}
+    size, _mt, read_to, _st = store.scanned_file_map('default')[str(f)]
+    assert size == read_to == f.stat().st_size
+
+
+def test_store_written_before_offsets_reads_the_log_whole_once(tmp_path, rc):
+    proj = tmp_path / '-home-u-proj'
+    proj.mkdir()
+    f = proj / 'session.jsonl'
+    f.write_text(_assistant_line('m1') + "\n")
+    store = Store(tmp_path / 'h.db')
+    # A signature as an earlier version wrote it: no place, no state.
+    store.mark_files_scanned('default', [(str(f), 1, 1.0)])
+    assert scan_into_store(store, rc, claude_dir=tmp_path) == {'default': 1}
+    assert store.scanned_file_map('default')[str(f)][2] == f.stat().st_size
 
 
 def test_upsert_dedups_on_key(store, rc):
@@ -252,3 +292,34 @@ def test_session_summary_honours_the_period_cutoff(store, rc):
     ], rc)
     rows = store.session_summary(since=base - timedelta(days=1))
     assert [r['session_id'] for r in rows] == ['recent']
+
+
+def test_scan_reads_a_linked_log_once_and_survives_a_link_loop(tmp_path, rc):
+    proj = tmp_path / '-home-u-proj'
+    proj.mkdir()
+    f = proj / 'session.jsonl'
+    f.write_text(_assistant_line('m1') + "\n")
+    other = tmp_path / '-home-u-other'
+    other.mkdir()
+    (other / 'linked.jsonl').symlink_to(f)             # one log, two paths
+    (other / 'loop').symlink_to(other)                 # a folder linking to itself
+    moved = tmp_path.parent / (tmp_path.name + '-moved')
+    moved.mkdir()
+    (moved / 'old.jsonl').write_text(_assistant_line('m2') + "\n")
+    (tmp_path / '-home-u-moved').symlink_to(moved)     # a project moved elsewhere
+    store = Store(tmp_path / 'h.db')
+    assert scan_into_store(store, rc, claude_dir=tmp_path) == {'default': 2}
+    assert len(store.scanned_file_map('default')) == 2
+
+
+def test_scan_forgets_logs_that_are_gone(tmp_path, rc):
+    proj = tmp_path / '-home-u-proj'
+    proj.mkdir()
+    (proj / 'a.jsonl').write_text(_assistant_line('m1') + "\n")
+    (proj / 'b.jsonl').write_text(_assistant_line('m2') + "\n")
+    store = Store(tmp_path / 'h.db')
+    scan_into_store(store, rc, claude_dir=tmp_path)
+    (proj / 'b.jsonl').unlink()
+    scan_into_store(store, rc, claude_dir=tmp_path)
+    assert list(store.scanned_file_map('default')) == [str(proj / 'a.jsonl')]
+    assert len(store.query()) == 2          # its turns stay in the history

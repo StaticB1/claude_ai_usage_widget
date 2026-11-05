@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +15,11 @@ from .config import (APP_NAME, APP_VERSION, Account,
                      find_account, load_accounts, BEDROCK_ACCOUNT_LABEL)
 from . import hop as claudehop
 from .format import fmt, fmt_cost, fmt_duration
-from .parser import iter_project_dirs, parse_jsonl
+from .parser import iter_project_dirs, scan_jsonl
+
+# A scan reads at most this much of one log before saving its place, which
+# keeps memory flat on a first read of a log several gigabytes long.
+SCAN_PART_BYTES = 64 * 1024 * 1024
 from .periods import UnknownPeriod, cutoff, range_text
 from .pricing import RateCard, load_rate_card
 from .store import HOP_PREFIX, Store
@@ -99,6 +104,61 @@ def _session_rows(store: Store, account: Optional[str]):
     )
 
 
+def _state(raw) -> Optional[dict]:
+    """A file's saved parser state, decoded only when the file has changed."""
+    if not raw:
+        return None
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _iter_logs(projects_root: Path):
+    """``(path, stat)`` for every session log under ``projects_root``, each
+    file once. Project folders, session folders and logs are often symlinks
+    (moved to other storage, or one log linked into two projects). Links are
+    followed at every depth, which ``Path.rglob`` did not do below the project
+    folder, so sub-agent logs in a linked session folder were missed; a file
+    reached by a second path is skipped, and a folder seen before is not
+    entered again, so a link loop cannot trap the walk."""
+    seen_files: set = set()
+    seen_dirs: set = set()
+    stack = [str(p) for p in reversed(list(iter_project_dirs(projects_root)))]
+    while stack:
+        folder = stack.pop()
+        try:
+            dst = os.stat(folder)
+        except OSError:
+            continue
+        if (dst.st_dev, dst.st_ino) in seen_dirs:
+            continue
+        seen_dirs.add((dst.st_dev, dst.st_ino))
+        try:
+            with os.scandir(folder) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError:
+            continue
+        subdirs = []
+        for e in entries:
+            try:
+                if e.is_dir():
+                    subdirs.append(e.path)
+                    continue
+                if not e.name.endswith('.jsonl'):
+                    continue
+                st = os.stat(e.path)
+            except OSError:
+                continue
+            ident = (st.st_dev, st.st_ino)
+            if ident in seen_files:
+                continue
+            seen_files.add(ident)
+            yield e.path, st
+        stack.extend(reversed(subdirs))
+
+
 def scan_into_store(store: Store, rate_card: RateCard,
                     claude_dir: Optional[Path] = None,
                     accounts: Optional[List[Account]] = None,
@@ -114,47 +174,63 @@ def scan_into_store(store: Store, rate_card: RateCard,
     filed under the claudehop account that made them (see ``track_hop``).
     """
     def _scan_dir(projects_root: Path, label: str, hop_of=None) -> int:
-        # Skip files whose (size, mtime) are unchanged since the last scan, so
-        # a repeated scan only re-parses the active session log instead of the
-        # whole history. Claude Code session JSONL is append-only, so a change
-        # in size or mtime is a reliable "has new turns" signal.
+        # Skip files whose (size, mtime) are unchanged since the last scan, and
+        # read a changed one from where the last scan stopped. Claude Code
+        # session JSONL is append-only, so only the new lines need reading; a
+        # long-running session's log reaches gigabytes, and reading it whole
+        # every ten seconds kept a CPU core busy.
         prev = store.scanned_file_map(label)
         n = 0
         updates = []
-        for proj in iter_project_dirs(projects_root):
-            for jsonl in proj.rglob('*.jsonl'):
-                try:
-                    st = jsonl.stat()
-                except OSError:
-                    continue
-                key = str(jsonl)
-                sig = (st.st_size, st.st_mtime)
-                if prev.get(key) == sig:
-                    continue
-                _, turns = parse_jsonl(jsonl)
+        walked = set()
+        for key, st in _iter_logs(projects_root):
+            walked.add(key)
+            was = prev.get(key)
+            if was is not None and was[:2] == (st.st_size, st.st_mtime):
+                continue
+            offset, state = 0, None
+            if was is not None and was[2] is not None and st.st_size >= was[2]:
+                offset, state = was[2], _state(was[3])
+            while True:
+                _, turns, end, state = scan_jsonl(Path(key), offset, state,
+                                                  max_bytes=SCAN_PART_BYTES)
                 n += store.upsert_turns(turns, rate_card, account=label,
                                         hop_of=hop_of)
-                updates.append((key, st.st_size, st.st_mtime))
+                if end <= offset or end >= st.st_size:
+                    break
+                # A part of a large log: keep the place, so a restart
+                # carries on from here rather than from the start.
+                offset = end
+                store.mark_files_scanned(label, [(key, -1, 0.0, end, state)])
+            updates.append((key, st.st_size, st.st_mtime, end, state))
+            if len(updates) >= 200:
+                store.mark_files_scanned(label, updates)
+                updates = []
         store.mark_files_scanned(label, updates)
+        if walked:
+            # Logs Claude Code has since deleted, and second paths to a log
+            # already read under another name, no longer need a record.
+            store.forget_files(label, [k for k in prev if k not in walked])
         return n
 
-    if claude_dir is not None:
-        return {'default': _scan_dir(claude_dir, 'default')}
+    with store.scan_lock:
+        if claude_dir is not None:
+            return {'default': _scan_dir(claude_dir, 'default')}
 
-    if accounts is None:
-        accounts = load_accounts()
-    hop_label = track_hop(store, accounts)
-    hop_of = store.hop_resolver() if hop_label else None
-    if only and only.startswith(HOP_PREFIX):
-        only = hop_label or only
-    counts: dict = {}
-    for acc in accounts:
-        if only and acc.label != only:
-            continue
-        counts[acc.label] = _scan_dir(
-            acc.projects_dir, acc.label,
-            hop_of if acc.label == hop_label else None)
-    return counts
+        if accounts is None:
+            accounts = load_accounts()
+        hop_label = track_hop(store, accounts)
+        hop_of = store.hop_resolver() if hop_label else None
+        if only and only.startswith(HOP_PREFIX):
+            only = hop_label or only
+        counts: dict = {}
+        for acc in accounts:
+            if only and acc.label != only:
+                continue
+            counts[acc.label] = _scan_dir(
+                acc.projects_dir, acc.label,
+                hop_of if acc.label == hop_label else None)
+        return counts
 
 
 def track_hop(store: Store, accounts: List[Account]) -> Optional[str]:

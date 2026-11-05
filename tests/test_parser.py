@@ -1,5 +1,4 @@
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -239,3 +238,59 @@ def test_project_backfills_when_cwd_appears_late(tmp_path):
     project, turns = parse_jsonl(p)
     assert project == 'late-proj'
     assert [t.project for t in turns] == ['late-proj', 'late-proj']
+
+
+# ── Resumable reads (scan_jsonl) ────────────────────────────────────────────
+
+def test_a_response_split_across_two_reads_is_merged(tmp_path):
+    """The widget reads a log while Claude Code is still writing a response:
+    its repeat entries land on both sides of the read. The second read must
+    return the merged turn, not a second turn or only the later half."""
+    from cct.parser import scan_jsonl
+    p = tmp_path / 's.jsonl'
+    _write_jsonl(p, [{'type': 'system', 'cwd': str(tmp_path / 'proj')},
+                     _assistant('msg_1', 4, tools=('Bash',))])
+    project, turns, off, st = scan_jsonl(p)
+    assert project == 'proj' and turns[0].output_tokens == 4
+    with open(p, 'a') as f:
+        f.write(json.dumps(_assistant('msg_1', 568, tools=('Read',))) + '\n')
+        f.write(json.dumps(_assistant('msg_2', 9)) + '\n')
+    project, turns, off2, st = scan_jsonl(p, off, st)
+    assert project == 'proj'
+    assert [t.msg_id for t in turns] == ['msg_1', 'msg_2']
+    assert turns[0].output_tokens == 568
+    assert turns[0].tool_uses == {'Bash': 1, 'Read': 1}
+    assert turns[0].project == 'proj'
+    assert off2 == p.stat().st_size
+
+
+def test_a_line_still_being_written_waits_for_the_next_read(tmp_path):
+    from cct.parser import scan_jsonl
+    p = tmp_path / 's.jsonl'
+    whole = json.dumps(_assistant('msg_2', 7))
+    with open(p, 'w') as f:
+        f.write(json.dumps(_assistant('msg_1', 5)) + '\n' + whole[:40])
+    _, turns, off, st = scan_jsonl(p)
+    assert [t.msg_id for t in turns] == ['msg_1']
+    assert off < p.stat().st_size
+    with open(p, 'a') as f:
+        f.write(whole[40:] + '\n')
+    _, turns, off, st = scan_jsonl(p, off, st)
+    assert [t.msg_id for t in turns] == ['msg_2']
+    assert off == p.stat().st_size
+
+
+def test_big_lines_without_usage_are_skipped_undecoded(tmp_path, monkeypatch):
+    """Tool output and file contents make up most of a log's bytes; a line
+    without both "usage" and "assistant" is never handed to json.loads."""
+    import cct.parser as parser
+    p = tmp_path / 's.jsonl'
+    _write_jsonl(p, [{'type': 'system', 'cwd': str(tmp_path / 'proj')},
+                     {'type': 'user', 'message': {'content': 'x' * 100000}},
+                     _assistant('msg_1', 5)])
+    decoded = []
+    real = parser._decode
+    monkeypatch.setattr(parser, '_decode', lambda b: decoded.append(len(b)) or real(b))
+    _, turns, _, _ = parser.scan_jsonl(p)
+    assert len(turns) == 1
+    assert all(n < 1000 for n in decoded)

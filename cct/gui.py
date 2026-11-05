@@ -155,6 +155,28 @@ def get_usage_color(pct: float) -> str:
     return ui.level_color(pct * 100.0)
 
 
+# The dashboard's store figures and the table views rebuild at most this
+# often on the timer, and the 30-day chart at most this often (seconds).
+DASH_REFRESH_S = 30
+DAILY_REFRESH_S = 300
+
+# A poll that failed in one of these ways leaves the account without a current
+# reading of its own.
+BAD_CLOUD_STATES = ('auth_error', 'network_error', 'rate_limited', 'no_token')
+
+# A reading this recent is still shown as the account's figure when a poll
+# fails, instead of an error mark: the usage endpoint throttles a token that
+# claudehop (or autohop) also reads, and its last reading is better than "!".
+STALE_READING = timedelta(minutes=20)
+
+
+def reading_is_recent(st) -> bool:
+    """Whether ``st`` (an AccountState) holds a reading young enough to show."""
+    at = getattr(st, 'last_read_at', None)
+    return (at is not None and st.last_pct5 is not None
+            and datetime.now(timezone.utc) - at < STALE_READING)
+
+
 def _ease_css() -> str:
     return "cubic-bezier(0.32, 0.72, 0, 1)"
 
@@ -508,6 +530,8 @@ class TrackerWindow(Gtk.Window):
         self._async_seq: Dict[str, int] = {}
         self._dash_cache = None       # (key, data) of the last dashboard query
         self._dash_pending = None
+        self._daily_cache: Dict[Optional[str], tuple] = {}   # account -> (stamp, 30-day series)
+        self._tables_at = 0.0         # when the table views last rebuilt on a timer
         self._projects_cache = None   # (key, rows, sessions)
         self._bar_sigs: Dict[str, tuple] = {}
 
@@ -645,11 +669,8 @@ class TrackerWindow(Gtk.Window):
 
     def _update_side_gauge(self):
         st = self.app._primary_state()
-        bad = st.cloud_state in ('auth_error', 'network_error', 'rate_limited', 'no_token')
-        try:
-            hs = claudehop.load_state(st.token)
-        except Exception:
-            hs = None
+        bad = st.cloud_state in BAD_CLOUD_STATES and not reading_is_recent(st)
+        hs = self.app.hop_state()
         who = hs.active if hs and hs.active else "5-hour window"
         self._side_title.set_text(who)
         if bad:
@@ -710,10 +731,7 @@ class TrackerWindow(Gtk.Window):
     def _update_hop_badge(self):
         """Header badge: which claudehop account the widget is showing, or the
         provider new sessions run through. Hidden when claudehop is not in use."""
-        try:
-            hs = claudehop.load_state(self.app._primary_state().token)
-        except Exception:
-            hs = None
+        hs = self.app.hop_state()
         if hs is None or not (hs.active or hs.provider):
             self._hop_badge_box.set_visible(False)
             return
@@ -742,15 +760,12 @@ class TrackerWindow(Gtk.Window):
         turns; then the configured accounts, but only when there is more than
         one (a single one holds the same turns as 'All accounts')."""
         out = []
-        try:
-            hs = claudehop.load_state(self.app._primary_state().token)
-        except Exception:
-            hs = None
+        hs = self.app.hop_state()
         if hs is not None:
             for p in sorted(hs.profiles, key=lambda q: (q.name != hs.active, q.name)):
                 live = p.name == hs.active and not hs.provider
                 out.append((f'{HOP_PREFIX}{p.name}', p.name + ('  · live' if live else '')))
-        if self.app.store.has_account_rows(BEDROCK_ACCOUNT_LABEL):
+        if self.app._bedrock_rows:
             out.append((BEDROCK_ACCOUNT_LABEL, 'Bedrock'))
         if len(self.app._accounts) > 1:
             for acc in self.app._accounts:
@@ -1354,23 +1369,19 @@ class TrackerWindow(Gtk.Window):
         """The Accounts panel: one tile per claudehop account with its newest
         5-hour and weekly reading, any `hop run` terminals on it, and the login
         with the most room. Hidden when claudehop is not in use."""
-        live = self.app._primary_state()
-        try:
-            hs = claudehop.load_state(live.token)
-        except Exception:
-            hs = None
+        hs = self.app.hop_state()
         if hs is None or not (hs.profiles or hs.providers):
             self._hop_card.set_visible(False)
             return
         now = datetime.now(timezone.utc)
         names = [p.name for p in hs.profiles]
-        readings = self.app.hop_readings(hs)
-        runs = claudehop.run_terminals()
+        readings = self.app.hop_readings()
+        runs = self.app.hop_snap.runs
         read_at, result = self.app._hop_read_result or (None, None)
         fresh_notes = read_at is not None and now - read_at < timedelta(minutes=30)
         notes = result.notes if result is not None else {}
 
-        since = self.app.store.hop_tracking_since()
+        since = self.app._hop_since
         sub = ("The live login updates every poll; the others show their newest "
                "reading, from claudehop or from the last time they were live.")
         if since is not None:
@@ -1413,8 +1424,7 @@ class TrackerWindow(Gtk.Window):
             on = prov == hs.provider
             detail = ''
             if prov == BEDROCK_ACCOUNT_LABEL:
-                t = self.app.store.totals(since=now - timedelta(days=7),
-                                          account=BEDROCK_ACCOUNT_LABEL)
+                t = self.app._bedrock_week or {}
                 n = t.get('messages', 0) or 0
                 detail = (f"7 days: {n:,} messages, {fmt_cost(t.get('cost_usd', 0) or 0)}"
                           if n else "no usage in 7 days")
@@ -1488,7 +1498,14 @@ class TrackerWindow(Gtk.Window):
         cutoff = self._cutoff(period)
         rows = store.query(since=datetime.now(timezone.utc) - SESSION_LOOKBACK,
                            account=acc)
-        daily = {r['day']: r for r in store.daily_series(days=30, account=acc)}
+        # The 30-day chart is the dearest query and moves slowest: once per
+        # DAILY_REFRESH_S per account filter.
+        stamp = (acc, int(time.time() // DAILY_REFRESH_S), datetime.now().date())
+        cached = self._daily_cache.get(acc)
+        if cached is None or cached[0] != stamp:
+            cached = (stamp, store.daily_series(days=30, account=acc))
+            self._daily_cache[acc] = cached
+        daily = {r['day']: r for r in cached[1]}
         today = datetime.now().date()
         series = []
         for i in range(29, -1, -1):
@@ -1512,7 +1529,12 @@ class TrackerWindow(Gtk.Window):
         self._update_side_gauge()
         period, acc = self._dashboard_period, self._account_filter
         resets_5h, cloud_5h = self._dashboard_anchor(acc)
-        key = (period, acc, self.app.data_version, int(time.time() // 60), resets_5h)
+        # Not on every import: while sessions run, turns land on every tick,
+        # and these queries cost about 1.5 s of CPU on a large history, which
+        # every ten seconds kept the widget busy whenever its window was open.
+        # The first scan's end counts as a change, so the figures catch up then.
+        key = (period, acc, int(time.time() // DASH_REFRESH_S), resets_5h,
+               self.app._first_scan_done)
         cache = self._dash_cache
         if cache is not None and cache[0][:2] == (period, acc):
             self._apply_dashboard(cache[1], cloud_5h)
@@ -1548,7 +1570,7 @@ class TrackerWindow(Gtk.Window):
                  f"{total:,} message{'s' if total != 1 else ''}")
         hop_name = self._hop_filter()
         if hop_name and total == 0:
-            since = self.app.store.hop_tracking_since()
+            since = self.app._hop_since
             scope = (f"Nothing filed under {hop_name} in this period"
                      + (f"; tokens are split by account since "
                         f"{since.astimezone():%-d %b %H:%M}" if since else "")
@@ -2189,14 +2211,10 @@ class TrackerWindow(Gtk.Window):
     def _hop_idle_reading(self, name: str):
         """The last reading of a claudehop account that is not the live login,
         or None when it is live (the primary account's own polling covers it)."""
-        live = self.app._primary_state()
-        try:
-            hs = claudehop.load_state(live.token)
-        except Exception:
-            hs = None
+        hs = self.app.hop_state()
         if hs is not None and hs.active == name:
             return None
-        return claudehop.all_readings([name], self.app.store.hop_usage()).get(name) \
+        return self.app.hop_readings().get(name) \
             or claudehop.Reading(None, None, None, None, None, None, 'widget')
 
     def _update_hop_cloud(self, name: str) -> bool:
@@ -2252,10 +2270,7 @@ class TrackerWindow(Gtk.Window):
         cv, state = self._cloud_view()
         primary = self.app._primary_state()
         plan_name, _flat = subscription_summary(cv.subscription_info)
-        try:
-            hs = claudehop.load_state(primary.token)
-        except Exception:
-            hs = None
+        hs = self.app.hop_state()
         if hop_name or (cv is primary and hs and hs.active and not hs.provider):
             title = hop_name or hs.active
         elif len(self.app._accounts) > 1:
@@ -2281,8 +2296,14 @@ class TrackerWindow(Gtk.Window):
             p5, r5 = cv.last_pct5, cv.last_resets_5h
             p7, r7, scope = cv.last_pct7, cv.last_resets_7d, cv.last_week_scope
             models = [m for m in cv.last_model_limits if m['model'] != scope]
-        dimmed = state in ('auth_error', 'network_error', 'rate_limited', 'no_token')
+        recent = reading_is_recent(cv)
+        dimmed = state in BAD_CLOUD_STATES and not recent
         self._set_rings(p5, r5, p7, r7, scope, dimmed=dimmed, models=models)
+        stored = cv.last_source != 'live' and cv.last_read_at is not None
+        who = {'probe': "claudehop, through claude", 'claudehop': "claudehop",
+               'widget': "this widget"}.get(cv.last_source, cv.last_source)
+        when = (cv.last_read_at.astimezone().strftime('%H:%M')
+                if cv.last_read_at else '—')
 
         if state == 'no_token':
             self._set_tag("Not connected", 'muted')
@@ -2296,8 +2317,10 @@ class TrackerWindow(Gtk.Window):
                                   .total_seconds()))
                 extra = f" Next try in {fmt_duration(secs)}."
             self._set_tag("Rate limited", 'warn')
+            shown = (f" The rings show {who}'s reading from {when}." if stored
+                     else " The rings show the last reading.")
             self._set_notice((cv.cloud_error or "Claude.ai is rate-limiting this "
-                              "token.") + extra + " The rings show the last reading.",
+                              "token.") + extra + shown,
                              'warn', action='retry', label='Try now')
             self._plan_foot.set_text('')
         elif state == 'auth_error':
@@ -2311,15 +2334,20 @@ class TrackerWindow(Gtk.Window):
             self._set_notice(f"Couldn't reach Claude.ai: {cv.cloud_error or 'network error'}.",
                              'danger', action='retry', label='Retry')
             self._plan_foot.set_text('')
-        elif state == 'loading' and not data and p5 is None:
+        elif state in ('loading', 'idle') and not data and p5 is None:
             self._set_tag("Connecting", 'muted')
             self._set_notice(None)
             self._plan_foot.set_text("Asking api.anthropic.com for the current windows…")
+        elif stored:
+            self._set_tag(f"Read {claudehop.ago(cv.last_read_at, datetime.now(timezone.utc))}",
+                          'ok' if recent else 'muted')
+            self._set_notice(None)
+            self._plan_foot.set_text(
+                f"Read by {who} at {when} · "
+                f"{ui.level_word(p5).capitalize()} in this window")
         else:
             self._set_tag("Live", 'ok')
             self._set_notice(None)
-            when = (cv.last_read_at.astimezone().strftime('%H:%M')
-                    if cv.last_read_at else '—')
             every = max(1, self.app._settings.poll_interval_seconds // 60)
             self._plan_foot.set_text(
                 f"Updated {when} · checked every {every} min · "
@@ -2778,7 +2806,7 @@ class TrackerWindow(Gtk.Window):
         self.refresh_data()
 
     # ── Refresh + shortcuts + export ───────────────────────────────────────
-    def refresh_view(self, data_changed: bool = True):
+    def refresh_view(self, data_changed: bool = True, from_timer: bool = False):
         """Re-render the current view from the store WITHOUT re-scanning.
 
         Driven by the local loop every few seconds so the dashboard's live
@@ -2786,7 +2814,14 @@ class TrackerWindow(Gtk.Window):
         when no new turns were imported, removing the need to hit Refresh. The
         dashboard updates its cards/labels in place (cheap, no flicker); the
         heavier table views only rebuild when ``data_changed`` so scroll
-        position and selection survive idle ticks."""
+        position and selection survive idle ticks. On the timer they rebuild
+        at most every ``DASH_REFRESH_S``, however often turns land."""
+        if from_timer and data_changed:
+            now = time.monotonic()
+            if now - self._tables_at < DASH_REFRESH_S:
+                data_changed = False
+            else:
+                self._tables_at = now
         self._last_update_label.set_text(
             f"Updated {datetime.now().strftime('%H:%M:%S')}")
         if self._combo_stale():
@@ -2902,6 +2937,12 @@ class AccountState:
     # when the last good reading came in.
     last_week_scope: Optional[str] = None
     last_read_at: Optional[datetime] = None
+    # Which claudehop account the last reading is of (None: not known, such
+    # as when a hop landed during the fetch), and who took it: 'live' for this
+    # widget's own poll, else 'claudehop', 'probe' or 'widget' for a stored
+    # reading adopted after a hop or while this token is throttled.
+    last_hop_name: Optional[str] = None
+    last_source: str = 'live'
     awaiting_new_window: bool = False  # window rolled over, no fresh data yet
     # Per-model weekly caps (kind=weekly_scoped), last-known; preserved
     # between fetches like last_pctX so a blip doesn't blank the rows.
@@ -2942,25 +2983,25 @@ class App:
         if HAS_NOTIFY:
             Notify.init(APP_NAME)
 
+        # claudehop, as last read by the scan thread (see _take_hop_snapshot),
+        # and the store figures the window needs beside it. The interface
+        # thread only reads these; it never opens claudehop's files or the
+        # database itself.
+        self.hop_snap: Optional[claudehop.Snapshot] = None
+        self._hop_since: Optional[datetime] = None
+        self._bedrock_rows = False
+        self._bedrock_week: Optional[dict] = None
+        self._first_scan_done = False
+
         self._indicator = None
         self._tray_items: Dict[str, Gtk.MenuItem] = {}
         self._tray_account_items: Dict[str, Gtk.MenuItem] = {}
         if HAS_INDICATOR:
             self._setup_tray()
 
-        # Initial scan, so the store is current before the window opens.
-        rate_card = load_rate_card()
-        migrated = self.store.needs_reprice()
-        scan_into_store(self.store, rate_card, accounts=self._accounts)
-        if migrated:
-            # This database was written by an earlier version, whose costs came
-            # from a stale rate card and whose tool attribution was
-            # incomplete. The scan above re-read and corrected every log still
-            # on disk; reprice covers rows whose log has since been deleted.
-            n = self.store.reprice_all(rate_card)
-            print(f"[{APP_ID}] upgraded store: repriced {n:,} messages",
-                  file=sys.stderr)
-
+        # The first scan runs in the scan thread, not here: after a long
+        # break it reads every new line, and the window and tray should be up
+        # (and able to answer a second launch) while it does.
         threading.Thread(target=self._local_loop, daemon=True).start()
         threading.Thread(target=self._api_loop, daemon=True).start()
 
@@ -2991,20 +3032,147 @@ class App:
 
     # ── claudehop ───────────────────────────────────────────────────────────
 
-    def hop_readings(self, hs) -> dict:
-        """The newest reading of every claudehop account; the live login's
-        comes from this widget's own polling while that is healthy."""
+    def _primary_is_hop_home(self) -> bool:
+        """Whether the primary account's logs and login are the ones claudehop
+        manages; only then are its figures a claudehop account's."""
+        acc = self._primary_account()
+        cached = getattr(self, '_hop_home_check', None)
+        if cached is None or cached[0] != acc.claude_dir:
+            try:
+                same = Path(acc.claude_dir).resolve() == claudehop.claude_home().resolve()
+            except OSError:
+                same = False
+            cached = (acc.claude_dir, same)
+            self._hop_home_check = cached
+        return cached[1]
+
+    def hop_state(self):
+        """claudehop's state as last read, or None when it is not in use."""
+        snap = self.hop_snap
+        return snap.state if snap is not None else None
+
+    def hop_readings(self, hs=None) -> dict:
+        """The newest reading of every claudehop account: the stored ones from
+        the last snapshot, and this widget's own reading of the live login
+        when that is newer. No file or database is read here."""
+        snap = self.hop_snap
+        if snap is None:
+            return {}
         primary = self._primary_state()
         live = None
-        if (primary.cloud_state not in ('auth_error', 'network_error',
-                                        'rate_limited', 'no_token')
-                and primary.last_read_at is not None):
+        if (primary.last_read_at is not None and primary.last_source == 'live'
+                and primary.last_hop_name == snap.state.active):
+            bad = primary.cloud_state in BAD_CLOUD_STATES
             live = claudehop.Reading(
                 primary.last_pct5, primary.last_resets_5h, primary.last_pct7,
                 primary.last_resets_7d, primary.last_week_scope,
-                primary.last_read_at, 'live')
-        return claudehop.all_readings([p.name for p in hs.profiles],
-                                      self.store.hop_usage(), hs.active, live)
+                primary.last_read_at, 'widget' if bad else 'live')
+        return claudehop.with_live(snap, live)
+
+    def _take_hop_snapshot(self):
+        """Read claudehop and the store figures shown beside it. Scan thread."""
+        now = datetime.now(timezone.utc)
+        snap = claudehop.take_snapshot(self._primary_state().token,
+                                       self.store.hop_usage())
+        self._hop_since = self.store.hop_tracking_since() if snap else None
+        self._bedrock_rows = self.store.has_account_rows(BEDROCK_ACCOUNT_LABEL)
+        self._bedrock_week = (self.store.totals(since=now - timedelta(days=7),
+                                                account=BEDROCK_ACCOUNT_LABEL)
+                              if self._bedrock_rows else None)
+        return snap
+
+    def _apply_hop_snapshot(self, snap):
+        """Show a new snapshot. Interface thread."""
+        before = self.hop_state()
+        self.hop_snap = snap
+        self._adopt_hop_reading()
+        after = self.hop_state()
+        hopped = (before is not None and after is not None
+                  and (before.active, before.provider) != (after.active, after.provider))
+        if hopped:
+            self._api_wake.set()          # read the new login now, not in two minutes
+        self._rebuild_tray()
+        if self.window:
+            self.window._update_hop_badge()
+        return False
+
+    def _refresh_hop_snapshot(self):
+        """Take a snapshot now, off the interface thread (after a hop or a read)."""
+        def work():
+            try:
+                GLib.idle_add(self._apply_hop_snapshot, self._take_hop_snapshot())
+            except Exception as e:
+                print(f"[{APP_ID}] claudehop: {e}", file=sys.stderr)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _adopt_hop_reading(self):
+        """Keep the primary account's figures those of the login that is live.
+
+        After a hop the last poll belongs to the previous account, and showing
+        it until the next poll put one login's figures under another's name.
+        claudehop's stored reading of the new login is shown instead, or
+        nothing when there is none. The same stored reading also stands in
+        while this token is throttled and claudehop (or autohop, which runs
+        it) has read the login more recently than this widget could."""
+        snap = self.hop_snap
+        if (snap is None or snap.state.provider or not snap.state.active
+                or not self._primary_is_hop_home()):
+            return
+        active = snap.state.active
+        st = self._primary_state()
+        r = snap.cached.get(active)
+        has = r is not None and r.has_figures
+        if st.last_hop_name != active and (st.last_read_at is not None
+                                           or st.last_hop_name is not None or has):
+            # A new login: the old one's throttle or error says nothing about it.
+            st.cloud_state = 'loading' if st.token else 'no_token'
+            st.cloud_error = ""
+            st.cloud_retry_at = None
+            if has:
+                self._apply_usage(st, self._reading_as_cloud(snap, active, r),
+                                  r.at, active, r.source)
+            else:
+                st.usage_data = None
+                st.last_pct5 = st.last_pct7 = None
+                st.last_resets_5h = st.last_resets_7d = st.last_week_scope = None
+                st.last_model_limits = []
+                st.last_read_at = None
+                st.last_hop_name = active
+                st.last_source = 'live'
+            self._sync_primary()
+        elif has and (st.last_read_at is None or r.at > st.last_read_at):
+            self._apply_usage(st, self._reading_as_cloud(snap, active, r),
+                              r.at, active, r.source)
+            self._sync_primary()
+
+    @staticmethod
+    def _reading_as_cloud(snap, name: str, r) -> dict:
+        """A stored reading in the usage API's shape: claudehop's own entry
+        when the reading is claudehop's, else the two windows."""
+        if r.source in ('claudehop', 'probe') and name in snap.cloud:
+            return snap.cloud[name]
+        week = ({'utilization': r.pct7, 'resets_at': r.resets_7d}
+                if r.pct7 is not None else None)
+        limits = ([{'kind': 'weekly_scoped', 'group': 'weekly', 'percent': r.pct7,
+                    'resets_at': r.resets_7d,
+                    'scope': {'model': {'display_name': r.week_scope}}}]
+                  if week and r.week_scope else [])
+        return {'five_hour': {'utilization': r.pct5, 'resets_at': r.resets_5h},
+                'seven_day': None if r.week_scope else week, 'limits': limits}
+
+    def _cache_covers_live(self) -> bool:
+        """True when claudehop read the live login within the poll interval,
+        so this widget's own poll would only spend the token's allowance on
+        the same figures (and make a 429 likelier for both)."""
+        snap = self.hop_snap
+        if (snap is None or snap.state.provider or not snap.state.active
+                or not self._primary_is_hop_home()):
+            return False
+        r = snap.cached.get(snap.state.active)
+        if r is None or not r.has_figures or r.source not in ('claudehop', 'probe'):
+            return False
+        age = (datetime.now(timezone.utc) - r.at).total_seconds()
+        return 0 <= age < self._settings.poll_interval_seconds
 
     def read_all_hop(self):
         """Run `hop usage` once in the background (the Read all button)."""
@@ -3025,6 +3193,7 @@ class App:
         self._hop_reading_all = False
         self._hop_read_result = (datetime.now(timezone.utc), result)
         self._after_hop_change()
+        self._refresh_hop_snapshot()      # the new readings, without waiting a tick
         return False
 
     def _after_hop_change(self):
@@ -3131,10 +3300,7 @@ class App:
         shell.pack_start(core, True, True, 0)
         win.add(shell)
 
-        try:
-            hs = claudehop.load_state(st.token)
-        except Exception:
-            hs = None
+        hs = self.hop_state()
         plan, _flat = subscription_summary(st.subscription_info)
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
@@ -3149,12 +3315,14 @@ class App:
             'network_error': ('Offline', 'danger'),
             'no_token': ('Not connected', 'muted'),
         }.get(state, ('Checking', 'muted'))
+        if st.last_source != 'live' and st.last_read_at and state not in ('auth_error', 'no_token'):
+            tag_text, tag_kind = f"Read {claudehop.ago(st.last_read_at, now)}", 'muted'
         tag = lbl(tag_text, f'tag tag-{tag_kind}')
         tag.set_valign(Gtk.Align.START)
         head.pack_end(tag, False, False, 0)
         core.pack_start(head, False, False, 0)
 
-        bad = state in ('auth_error', 'network_error', 'rate_limited', 'no_token')
+        bad = state in BAD_CLOUD_STATES and not reading_is_recent(st)
         rings = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         rings.set_homogeneous(True)
         for pct, iso, name, weekly in (
@@ -3179,12 +3347,9 @@ class App:
             rings.pack_start(col, True, True, 0)
         core.pack_start(rings, False, False, 0)
 
-        # The current session, from the local logs, anchored on the reset time.
-        try:
-            acc = self._primary_account().label
-            rows = self.store.query(since=now - SESSION_LOOKBACK, account=acc)
-            block = active_session(rows, st.last_resets_5h)
-        except Exception:
+        # The current session, as the scan thread last worked it out.
+        block = self._tray_block
+        if block is not None and block.remaining().total_seconds() <= 0:
             block = None
         sess = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
         sess.get_style_context().add_class('notice')
@@ -3209,7 +3374,7 @@ class App:
 
         if hs is not None and len(hs.profiles) > 1:
             try:
-                pick = claudehop.most_room(self.hop_readings(hs),
+                pick = claudehop.most_room(self.hop_readings(),
                                            [p.name for p in hs.profiles],
                                            hs.active, now)
             except Exception:
@@ -3340,7 +3505,7 @@ class App:
         self._tray_hop_items = {}
         self._tray_hop_names = ()
         try:
-            hs = claudehop.load_state(self._primary_state().token)
+            hs = self.hop_state()
             self._tray_hop_names = self._hop_names(hs)
             if hs and (len(hs.profiles) > 1 or hs.providers):
                 hop_hdr = Gtk.MenuItem(label='Hop accounts')
@@ -3472,9 +3637,9 @@ class App:
 
     def _update_tray_icon(self, st: AccountState):
         """Draw the indicator icon as a ring filled to the 5-hour use, in the
-        state colour; a broken ring when the connection has failed."""
-        if st.cloud_state in ('auth_error', 'network_error', 'rate_limited',
-                              'no_token'):
+        state colour; a broken ring when the connection has failed and there
+        is no recent reading to show instead."""
+        if st.cloud_state in BAD_CLOUD_STATES and not reading_is_recent(st):
             state, pct = 'error', None
         elif st.awaiting_new_window or st.last_pct5 is None:
             state, pct = 'none', None
@@ -3500,9 +3665,10 @@ class App:
         ``?`` for the brief gap between a window rollover and the API
         returning fresh data.
         Otherwise the most recently known 5h percentage — preserved between
-        resets so a transient blip doesn't blank the label."""
-        if st.cloud_state in ('auth_error', 'network_error', 'rate_limited',
-                              'no_token'):
+        resets so a transient blip doesn't blank the label. A throttled poll
+        keeps showing a reading under ``STALE_READING`` old (claudehop's, when
+        it read the login since), rather than ``!``."""
+        if st.cloud_state in BAD_CLOUD_STATES and not reading_is_recent(st):
             return '!'
         if st.awaiting_new_window or st.last_pct5 is None:
             return '?'
@@ -3519,8 +3685,7 @@ class App:
         wk = f"7d {st.last_week_scope}" if st.last_week_scope else "7d"
         models = [m for m in st.last_model_limits
                   if m['model'] != st.last_week_scope]
-        if st.cloud_state in ('auth_error', 'network_error', 'rate_limited',
-                              'no_token'):
+        if st.cloud_state in BAD_CLOUD_STATES and not reading_is_recent(st):
             hint = st.cloud_state.replace('_', ' ')
             _set('5h', f"5h  {self._emoji_bar(None)}  {hint}")
             _set('7d', f"{wk}  {self._emoji_bar(None)}  {hint}")
@@ -3561,24 +3726,25 @@ class App:
 
     def _update_tray_hop(self, primary: 'AccountState'):
         """Name the account in the tray and keep the hop lines current."""
-        try:
-            hs = claudehop.load_state(primary.token)
-        except Exception:
-            return
+        hs = self.hop_state()
         if self._hop_names(hs) != getattr(self, '_tray_hop_names', ()):
             self._set_tray_menu()          # accounts added or removed: rebuild
         hdr = getattr(self, '_tray_limits_hdr', None)
         if hdr is not None:
+            note = ""
+            if (primary.last_read_at is not None and (primary.last_source != 'live'
+                    or primary.cloud_state in BAD_CLOUD_STATES)):
+                note = f" (read {claudehop.ago(primary.last_read_at, datetime.now(timezone.utc))})"
             if hs and hs.active:
                 hdr.set_label(f"Limits · {hs.active}"
-                              + (" (login idle)" if hs.provider else ""))
+                              + (" (login idle)" if hs.provider else note))
             else:
-                hdr.set_label('Limits')
+                hdr.set_label('Limits' + note)
         if hs is None:
             return
         now = datetime.now(timezone.utc)
-        readings = self.hop_readings(hs)
-        runs = claudehop.run_terminals()
+        readings = self.hop_readings()
+        runs = self.hop_snap.runs if self.hop_snap else {}
         items = getattr(self, '_tray_hop_items', {})
         for p in hs.profiles:
             it = items.get(p.name)
@@ -3615,8 +3781,7 @@ class App:
             it.set_sensitive(not self._hop_reading_all)
 
     def _tray_account_line(self, st: AccountState) -> str:
-        if st.cloud_state in ('auth_error', 'network_error', 'rate_limited',
-                              'no_token'):
+        if st.cloud_state in BAD_CLOUD_STATES and not reading_is_recent(st):
             return f"   {st.account.label}: !"
         if st.last_pct7 is None:
             return f"   {st.account.label}: ?"
@@ -3686,6 +3851,12 @@ class App:
     def _local_loop(self):
         rc = load_rate_card()
         rc_stamp = _rate_card_stamp()
+        # claudehop first, so the tray names the login and shows its stored
+        # figures before the first scan (which can take a while after a break).
+        try:
+            GLib.idle_add(self._apply_hop_snapshot, self._take_hop_snapshot())
+        except Exception as e:
+            print(f"[{APP_ID}] claudehop: {e}", file=sys.stderr)
         while self._running:
             try:
                 # Pick up an edited rate_card.json without a restart. The card
@@ -3697,11 +3868,22 @@ class App:
                     rc = load_rate_card()
                     self.store.forget_scans()
                     GLib.idle_add(self._reprice_after_card_change, rc)
+                migrated = not self._first_scan_done and self.store.needs_reprice()
                 counts = scan_into_store(self.store, rc,
                                          accounts=self._accounts)
+                if migrated:
+                    # This database was written by an earlier version, whose
+                    # costs came from a stale rate card and whose tool
+                    # attribution was incomplete. The scan re-read every log
+                    # still on disk; reprice covers rows whose log is gone.
+                    n = self.store.reprice_all(rc)
+                    print(f"[{APP_ID}] upgraded store: repriced {n:,} messages",
+                          file=sys.stderr)
                 imported = sum(counts.values())
-                if imported:
+                if imported or not self._first_scan_done:
                     self.data_version += 1
+                self._first_scan_done = True
+                GLib.idle_add(self._apply_hop_snapshot, self._take_hop_snapshot())
                 # The tray's session line, worked out here rather than on
                 # the interface thread (it reads every turn of the last hours).
                 acc = self._primary_account().label
@@ -3717,7 +3899,7 @@ class App:
                 # `imported > 0` tells the view whether the heavier table views
                 # need a rebuild (they keep scroll/selection otherwise).
                 if self.window and self._window_visible:
-                    GLib.idle_add(self.window.refresh_view, imported > 0)
+                    GLib.idle_add(self.window.refresh_view, imported > 0, True)
                 GLib.idle_add(self._update_tray_block)
                 # Re-check budgets on the main loop — _check_budgets fires
                 # libnotify, which (like all GLib/D-Bus state) must not be
@@ -3776,17 +3958,24 @@ class App:
                     GLib.idle_add(self._set_cloud, 'no_token', "", None,
                                   acc.label)
                     continue
+                if acc.label == primary_label and self._cache_covers_live():
+                    # claudehop read this login moments ago; the snapshot has
+                    # already put that reading on the tray.
+                    continue
                 GLib.idle_add(self._set_cloud, 'loading', "", None, acc.label)
                 # Who claudehop says is live, read before and after the fetch so a
                 # hop in the middle files the reading under neither account.
-                who = (claudehop.active_name(state.token)
-                       if acc.label == primary_label else None)
+                is_hop = acc.label == primary_label and self._primary_is_hop_home()
+                who = claudehop.active_name(state.token) if is_hop else None
                 try:
                     data = fetch_cloud_usage(state.token)
+                    read_at = datetime.now(timezone.utc)
                     if who and claudehop.active_name(
                             load_token(acc.credentials_file)) != who:
                         who = None
-                    GLib.idle_add(self._on_cloud_data, data, acc.label, who)
+                    if who:
+                        self._save_hop_usage(who, data)
+                    GLib.idle_add(self._on_cloud_data, data, acc.label, who, read_at)
                 except RateLimitError as e:
                     wait = max(e.retry_after or 0, 120)
                     retry_at = datetime.now(timezone.utc) + timedelta(
@@ -3823,9 +4012,47 @@ class App:
                 sleep_for = max(1, min(sleep_for, soonest))
             self._api_wake.wait(timeout=sleep_for)
 
+    @staticmethod
+    def _apply_usage(st: AccountState, data: dict, at: Optional[datetime],
+                     hop_name: Optional[str], source: str = 'live') -> tuple:
+        """Put one usage reading (in the API's shape) into ``st``. Returns
+        ``(pct5, pct7, u5, u7)``. A stored reading (``source`` other than
+        'live') is kept only as the last-known figures, with any window whose
+        reset has passed shown as empty."""
+        five = data.get('five_hour') or {}
+        # Team seats have no seven_day window; their weekly figure is the
+        # fullest weekly meter, named after the model it covers.
+        seven = weekly_window(data)
+        u5 = normalize_utilization(five.get('utilization', 0))
+        u7 = normalize_utilization((seven or {}).get('utilization', 0))
+        pct5 = int(u5 * 100)
+        pct7 = int(u7 * 100) if seven else None
+        r5 = five.get('resets_at')
+        r7 = (seven or {}).get('resets_at')
+        if source != 'live':
+            now = datetime.now(timezone.utc)
+            for which in ('5', '7'):
+                reset = parse_resets_at(r5 if which == '5' else r7)
+                if reset is not None and reset <= now:
+                    if which == '5':
+                        pct5, r5 = 0, None
+                    elif pct7 is not None:
+                        pct7, r7 = 0, None
+        st.usage_data = data if source == 'live' else None
+        st.awaiting_new_window = False
+        st.last_pct5, st.last_pct7 = pct5, pct7
+        st.last_resets_5h, st.last_resets_7d = r5, r7
+        st.last_week_scope = (seven or {}).get('scope')
+        st.last_read_at = at or datetime.now(timezone.utc)
+        st.last_model_limits = extract_model_limits(data)
+        st.last_hop_name = hop_name
+        st.last_source = source
+        return pct5, pct7, u5, u7
+
     def _on_cloud_data(self, data: Optional[dict],
                        account_label: str = DEFAULT_ACCOUNT_LABEL,
-                       hop_name: Optional[str] = None):
+                       hop_name: Optional[str] = None,
+                       read_at: Optional[datetime] = None):
         st = self._account_states.get(account_label)
         if st is None:
             return False
@@ -3835,32 +4062,7 @@ class App:
         st.cloud_retry_at = None
         st.awaiting_new_window = False
         if data:
-            five = data.get('five_hour') or {}
-            # Team seats have no seven_day window; their weekly figure is the
-            # fullest weekly meter, named after the model it covers.
-            seven = weekly_window(data)
-            u5 = normalize_utilization(five.get('utilization', 0))
-            u7 = normalize_utilization((seven or {}).get('utilization', 0))
-            pct5 = int(u5 * 100)
-            pct7 = int(u7 * 100) if seven else None
-            r5 = five.get('resets_at')
-            r7 = (seven or {}).get('resets_at')
-
-            # If the resets_at shifted while we had no fresh data, the
-            # window has rolled over — but the API has now returned new
-            # numbers so clear any "?" awaiting flag.
-            st.last_pct5, st.last_pct7 = pct5, pct7
-            st.last_resets_5h, st.last_resets_7d = r5, r7
-            st.last_week_scope = (seven or {}).get('scope')
-            st.last_read_at = datetime.now(timezone.utc)
-            st.last_model_limits = extract_model_limits(data)
-            if hop_name and account_label == self._primary_account().label:
-                try:
-                    self.store.save_hop_usage(hop_name, pct5, pct7, r5, r7,
-                                              st.last_week_scope)
-                except Exception as e:
-                    print(f"tracker: could not save hop usage: {e}", file=sys.stderr)
-
+            pct5, pct7, u5, u7 = self._apply_usage(st, data, read_at, hop_name)
             if account_label == self._primary_account().label:
                 if HAS_NOTIFY:
                     self._notify_thresholds(pct5, pct7 or 0, max(u5, u7),
@@ -3885,6 +4087,22 @@ class App:
             elif v == 'budgets':
                 self.window._update_budgets_view()
         return False
+
+    def _save_hop_usage(self, name: str, data: dict):
+        """Remember a poll as claudehop account ``name``'s reading, so it can
+        still be shown after a hop. Poll thread, so the window never waits on
+        the database."""
+        try:
+            five = data.get('five_hour') or {}
+            seven = weekly_window(data)
+            self.store.save_hop_usage(
+                name, int(normalize_utilization(five.get('utilization', 0)) * 100),
+                int(normalize_utilization(seven.get('utilization', 0)) * 100)
+                if seven else None,
+                five.get('resets_at'), (seven or {}).get('resets_at'),
+                (seven or {}).get('scope'))
+        except Exception as e:
+            print(f"tracker: could not save hop usage: {e}", file=sys.stderr)
 
     def _set_cloud(self, state: str, msg: str,
                    retry_at: Optional[datetime],
@@ -4118,12 +4336,8 @@ class App:
         Gtk.main_quit()
 
     def run(self):
-        # SIGUSR1 = "second instance asked us to raise the window"
-        try:
-            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1,
-                                 self._on_raise_signal)
-        except (AttributeError, ValueError):
-            pass  # platform without unix signals — fine
+        # SIGUSR1 ("a second launch asked us to raise the window") is handled
+        # from the moment the lock is taken; see run() below.
         self._show_window()
         Gtk.main()
 
@@ -4145,7 +4359,25 @@ def run():
         print(f"Claude Token Tracker is already running (pid={e.pid}). "
               "Bringing existing window forward.", file=sys.stderr)
         sys.exit(0)
+    # A second launch signals SIGUSR1 to whoever holds the lock, and the
+    # default action of SIGUSR1 is to end the process. The handler used to be
+    # installed only once the app had finished starting, so clicking the icon
+    # again during a slow start ended the starting widget (seen in the session
+    # log: a starting widget's scope ending the second a later launch said
+    # "already running").
+    holder: Dict[str, Optional['App']] = {'app': None}
+
+    def on_raise():
+        if holder['app'] is not None:
+            holder['app']._on_raise_signal()
+        return GLib.SOURCE_CONTINUE      # before the app exists, the window opens anyway
     try:
-        App().run()
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, on_raise)
+    except (AttributeError, ValueError):
+        signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+    try:
+        app = App()
+        holder['app'] = app
+        app.run()
     finally:
         lock.close()

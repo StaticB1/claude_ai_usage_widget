@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS file_scan (
     path TEXT NOT NULL,
     size INTEGER NOT NULL,
     mtime REAL NOT NULL,
+    read_to INTEGER,
+    state TEXT,
     PRIMARY KEY (account, path)
 );
 
@@ -129,14 +131,18 @@ class Store:
     Connections are per-thread and kept open. Reopening the database on every
     call meant re-running ``PRAGMA journal_mode=WAL`` (a write) hundreds of
     times per dashboard refresh; the GUI polls this from two threads, so the
-    handle is thread-local rather than shared.
+    handle is thread-local rather than shared. There is no lock shared between
+    threads: in WAL mode readers never wait for the writer, and a lock of our
+    own made the window wait for every scan to finish writing.
     """
 
     def __init__(self, path: Optional[Path] = None):
         self.path = path or DB_FILE
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
         self._local = threading.local()
+        # One scan at a time: the timer and the refresh button would otherwise
+        # read the same new lines twice.
+        self.scan_lock = threading.Lock()
         self._init()
 
     # ── Connection handling ─────────────────────────────────────────────────
@@ -155,13 +161,12 @@ class Store:
         if conn is None:
             conn = self._connect()
             self._local.conn = conn
-        with self._lock:
-            try:
-                yield conn
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     def close(self) -> None:
         conn = getattr(self._local, 'conn', None)
@@ -194,6 +199,14 @@ class Store:
                 session_id TEXT NOT NULL, account TEXT NOT NULL,
                 since TEXT NOT NULL, last_seen TEXT NOT NULL,
                 PRIMARY KEY (session_id, since))""")
+            fcols = {r['name'] for r in c.execute(
+                "PRAGMA table_info(file_scan)").fetchall()}
+            if 'read_to' not in fcols:
+                # Where each log was read up to, so a growing log is read from
+                # there. Files recorded before this have none and are read
+                # whole once more the next time they change.
+                c.execute("ALTER TABLE file_scan ADD COLUMN read_to INTEGER")
+                c.execute("ALTER TABLE file_scan ADD COLUMN state TEXT")
             bcols = {r['name'] for r in c.execute(
                 "PRAGMA table_info(budgets)").fetchall()}
             if 'limit_pct' not in bcols:
@@ -504,28 +517,48 @@ class Store:
                              (account,)).fetchone() is not None
 
     def scanned_file_map(self, account: str) -> Dict[str, tuple]:
-        """Return ``{path: (size, mtime)}`` for files already imported for
-        ``account``. Used to skip re-parsing unchanged session logs."""
+        """Return ``{path: (size, mtime, read_to, state)}`` for files already
+        imported for ``account``: the signature that lets a scan skip an
+        unchanged log, and where a changed one was read up to (None: from the
+        start) with the parser state to resume with, as JSON text. The state
+        is left undecoded: decoding every file's on every scan took most of a
+        scan's time, and only a changed file needs it."""
         with self._conn() as c:
             rows = c.execute(
-                "SELECT path, size, mtime FROM file_scan WHERE account=?",
-                (account,),
+                "SELECT path, size, mtime, read_to, state FROM file_scan "
+                "WHERE account=?", (account,),
             ).fetchall()
-        return {r['path']: (r['size'], r['mtime']) for r in rows}
+        return {r[0]: (r[1], r[2], r[3], r[4]) for r in rows}
+
+    def forget_files(self, account: str, paths: Iterable[str]) -> None:
+        """Drop the scan records of ``paths`` (logs that are gone)."""
+        rows = [(account, p) for p in paths]
+        if not rows:
+            return
+        with self._conn() as c:
+            c.executemany("DELETE FROM file_scan WHERE account=? AND path=?", rows)
 
     def mark_files_scanned(self, account: str,
                            items: Iterable[tuple]) -> None:
-        """Record ``(path, size, mtime)`` signatures for freshly-parsed files
-        so the next scan can skip them while they're unchanged."""
-        rows = [(account, str(p), int(sz), float(mt)) for p, sz, mt in items]
+        """Record ``(path, size, mtime[, read_to, state])`` for freshly read
+        files so the next scan can skip them while they're unchanged, and read
+        only what is appended to them after that."""
+        rows = []
+        for item in items:
+            p, sz, mt = item[:3]
+            read_to = item[3] if len(item) > 3 else None
+            state = item[4] if len(item) > 4 else None
+            rows.append((account, str(p), int(sz), float(mt), read_to,
+                         _json.dumps(state) if state is not None else None))
         if not rows:
             return
         with self._conn() as c:
             c.executemany(
-                """INSERT INTO file_scan(account, path, size, mtime)
-                   VALUES(?,?,?,?)
+                """INSERT INTO file_scan(account, path, size, mtime, read_to, state)
+                   VALUES(?,?,?,?,?,?)
                    ON CONFLICT(account, path)
-                   DO UPDATE SET size=excluded.size, mtime=excluded.mtime""",
+                   DO UPDATE SET size=excluded.size, mtime=excluded.mtime,
+                                 read_to=excluded.read_to, state=excluded.state""",
                 rows,
             )
 
