@@ -1,6 +1,8 @@
+import argparse
 import io
 import json
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -8,8 +10,10 @@ import pytest
 from cct import cli, config, statusline
 from cct import hop as claudehop
 
-RESET_5H = 1793900000
-RESET_7D = 1794400000
+# Resets still ahead whenever the tests run: a window past its reset reads
+# as empty.
+RESET_5H = int(time.time()) + 2 * 3600
+RESET_7D = int(time.time()) + 5 * 86400
 
 
 def _payload(five=31.0, week=29.0):
@@ -182,3 +186,32 @@ def test_the_snapshot_takes_a_newer_status_line_reading(tmp_path, monkeypatch):
     snap = claudehop.take_snapshot('tok-A', {}, {'alpha': line})
     assert snap.cached['alpha'].pct5 == 55.0
     assert snap.cached['alpha'].source == 'statusline'
+
+
+def test_a_window_past_its_reset_reads_as_empty(here, monkeypatch):
+    # A reading from last night, when the 5-hour window was full; that window
+    # has reset since, and the weekly one has not.
+    monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(here))
+    monkeypatch.setattr(cli, 'load_settings', lambda: config.Settings())
+    past = datetime.now(timezone.utc) - timedelta(hours=12)
+    statusline.save({'rate_limits': {
+        'five_hour': {'used_percentage': 100, 'resets_at': (past + timedelta(hours=1)).timestamp()},
+        'seven_day': {'used_percentage': 84, 'resets_at': RESET_7D}}}, here, past)
+    data = cli._safe_cloud_data()
+    assert data['five_hour'] == {'utilization': 0.0, 'resets_at': None}
+    assert data['seven_day']['utilization'] == 84
+
+
+def test_the_prompt_does_not_show_a_window_that_has_reset(monkeypatch, capsys):
+    gone = (datetime.now(timezone.utc) - timedelta(hours=11)).isoformat()
+    old = claudehop.Reading(100.0, gone, 84.0, None, None,
+                            datetime.now(timezone.utc) - timedelta(hours=12), 'claudehop')
+
+    class NoRows:
+        def query(self, **kw):
+            return []
+    monkeypatch.setattr(cli, 'Store', NoRows)
+    monkeypatch.setattr(cli, '_resolve_account', lambda label: None)
+    monkeypatch.setattr(cli, '_hop_reading', lambda label: old)
+    cli.cmd_prompt(argparse.Namespace(no_cloud=False, account='hop:eben'))
+    assert capsys.readouterr().out.strip() == '5h:0%'

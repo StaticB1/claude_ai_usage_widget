@@ -27,6 +27,25 @@ from .pricing import RateCard, load_rate_card
 from .store import HOP_PREFIX, Store
 
 
+def _as_of_now(data: Optional[dict]) -> Optional[dict]:
+    """``data`` with each window whose reset time has passed shown as empty.
+
+    A saved reading can be hours old, and a window that was full then has
+    started again since; the dashboard treats stored readings the same way."""
+    if not isinstance(data, dict):
+        return data
+    now = datetime.now(timezone.utc)
+    out = dict(data)
+    for key in ('five_hour', 'seven_day'):
+        w = data.get(key)
+        if isinstance(w, dict):
+            _cur, _left, was = claudehop.window_now(w.get('utilization'),
+                                                    w.get('resets_at'), now)
+            if was is not None:
+                out[key] = {**w, 'utilization': 0.0, 'resets_at': None}
+    return out
+
+
 def _safe_cloud_data(account: Optional[Account] = None) -> Optional[dict]:
     """The account's plan windows in the usage API's shape, or None.
 
@@ -39,7 +58,7 @@ def _safe_cloud_data(account: Optional[Account] = None) -> Optional[dict]:
     # A reading taken before a claudehop hop belongs to the login that was
     # live then, not to this one.
     if saved is not None and saved.get('hop_name') in (None, statusline.hop_name_for(claude_dir)):
-        return statusline.as_cloud(saved)
+        return _as_of_now(statusline.as_cloud(saved))
     if not load_settings().token_polling:
         return None
     creds = account.credentials_file if account else None
@@ -611,6 +630,7 @@ def cmd_prompt(args):
                                   'resets_at': hr.resets_5h}}
         elif hr is None:
             data = _safe_cloud_data(acc)
+    data = _as_of_now(data)
     five = data.get('five_hour') if isinstance(data, dict) else None
     five = five if isinstance(five, dict) else {}
 

@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-11-06
+
+### Fixed
+- **`ctt prompt` showed a full window that had already reset.** With polling
+  off, a claudehop or status-line reading can be hours old; a 5-hour window
+  that read 100% at 20:18 still printed `5h:100%` the next morning. The CLI
+  now treats a window whose reset time has passed as empty, as the dashboard
+  already did, and plan budgets fed by an old status-line reading do the same.
+
 ## [2.5.0] - 2026-11-05
 
 The plan figures now come from Claude Code itself, and the widget no longer
