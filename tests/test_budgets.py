@@ -211,3 +211,74 @@ def test_pct_period_key_changes_when_resets_at_advances(store):
     k2 = next(x for x in evaluate_budgets(store, usage_data=u2)
               if x.id == bid).period_key
     assert k1 != k2
+
+
+# ── Plan-window budgets (USD / token limits on a 5h / 7d period) ───────────
+
+def test_usd_budget_on_plan_window_does_not_renotify_every_minute(store, rc):
+    """A 5h/7d budget must not re-fire its alert on every poll.
+
+    The period key named the instant of evaluation, so it changed every
+    minute and `should_notify()` read that as a brand new period.
+    """
+    t0 = datetime(2026, 10, 20, 4, 39, 30, tzinfo=timezone.utc)
+    store.upsert_turns([_turn(t0 - timedelta(minutes=1), msg_id='m1')], rc)
+    bid = store.add_budget('5h cap', 'global', '5h',
+                           limit_usd=6.0, limit_tokens=None, notify_at_pct=50)
+    s = next(x for x in evaluate_budgets(store, t0) if x.id == bid)
+    assert s.should_notify()
+    store.update_budget_notification(bid, int(s.pct * 100), s.period_key)
+
+    # The GUI re-checks budgets every 10 seconds; a minute later the same
+    # window is still over its threshold and must stay quiet.
+    later = next(x for x in evaluate_budgets(store, t0 + timedelta(minutes=1))
+                 if x.id == bid)
+    assert later.period_key == s.period_key
+    assert not later.should_notify()
+
+
+def test_usd_budget_on_plan_window_key_is_stable_without_cloud_data(store, rc):
+    """Without cloud data the key still has to name a window, not a minute."""
+    t0 = datetime(2026, 10, 20, 4, 39, 30, tzinfo=timezone.utc)
+    bid = store.add_budget('7d cap', 'global', '7d',
+                           limit_usd=6.0, limit_tokens=None)
+    k1 = next(x for x in evaluate_budgets(store, t0) if x.id == bid).period_key
+    k2 = next(x for x in evaluate_budgets(store, t0 + timedelta(minutes=1))
+              if x.id == bid).period_key
+    assert k1 == k2
+
+
+def test_usd_budget_on_5h_anchors_on_the_plan_reset(store, rc):
+    """A 5h budget measures the plan window the API is billing against."""
+    now = datetime(2026, 10, 20, 5, 0, tzinfo=timezone.utc)
+    usage = {'five_hour': {'utilization': 50,
+                           'resets_at': '2026-10-20T09:30:00Z'}}
+    store.upsert_turns([
+        _turn(datetime(2026, 10, 20, 4, 0, tzinfo=timezone.utc), msg_id='old'),
+        _turn(datetime(2026, 10, 20, 4, 45, tzinfo=timezone.utc), msg_id='in'),
+    ], rc)
+    bid = store.add_budget('5h cap', 'global', '5h',
+                           limit_usd=6.0, limit_tokens=None)
+    s = next(x for x in evaluate_budgets(store, now, usage_data=usage)
+             if x.id == bid)
+    # The plan window is [09:30 - 5h, 09:30) = [04:30, 09:30): the 04:00
+    # turn belongs to the previous window and must not be counted.
+    assert s.spent_usd == pytest.approx(3.0)
+    assert s.period_key == '5h@2026-10-20T09:30'
+
+
+def test_usd_budget_ignores_a_reset_moment_already_gone(store, rc):
+    """A stale reply must not anchor the spend on a window that has closed."""
+    now = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc)
+    usage = {'five_hour': {'utilization': 50,
+                           'resets_at': '2026-10-20T05:30:00Z'}}
+    store.upsert_turns([
+        _turn(datetime(2026, 10, 20, 10, 0, tzinfo=timezone.utc), msg_id='m1'),
+    ], rc)
+    bid = store.add_budget('5h cap', 'global', '5h',
+                           limit_usd=6.0, limit_tokens=None)
+    s = next(x for x in evaluate_budgets(store, now, usage_data=usage)
+             if x.id == bid)
+    # Falls back to the sliding window, so the spend is still measured.
+    assert s.spent_usd == pytest.approx(3.0)
+    assert s.period_key != '5h@2026-10-20T05:30'

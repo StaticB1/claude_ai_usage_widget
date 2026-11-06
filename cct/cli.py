@@ -681,9 +681,12 @@ def cmd_export(args):
 def cmd_budget(args):
     store = Store()
     if args.action == 'list':
-        # Only fetch cloud data if any pct-based budget exists
+        # Cloud data is needed by plan-% budgets, and by any budget on a plan
+        # window ('5h' / '7d') so that it measures the same window the
+        # dashboard shows instead of a sliding one.
         usage_data = None
-        if any(b.get('limit_pct') for b in store.list_budgets()):
+        if any(b.get('limit_pct') or b.get('period') in ('5h', '7d')
+               for b in store.list_budgets()):
             usage_data = _safe_cloud_data()
         states = evaluate_budgets(store, usage_data=usage_data)
         if args.json:

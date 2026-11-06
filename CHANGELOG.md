@@ -91,6 +91,18 @@ Faster, steadier, and right about which claudehop account it is showing.
   longer blames an open `hop` menu, which stopped holding the lock in claudehop
   2.0.0.
 
+### Fixed
+- **A budget on a plan window re-fired its alert every minute.** A 5-hour or
+  7-day budget with a dollar or token limit took its period key from the
+  instant it was evaluated, so the key changed every minute; the alert is
+  re-armed whenever the key changes, and the dashboard checks budgets every
+  ten seconds. The key now names the window — the API's reset moment when it
+  is known, and the 5-hour or 7-day grid the window falls in when it is not —
+  so the alert fires once per window, as it does for a monthly budget. Those
+  budgets also measure the plan window the account is billed against, rather
+  than a sliding five hours, and the CLI asks for the same cloud data the
+  dashboard uses, so both report the same numbers.
+
 ## [2.3.0] - 2026-10-13
 
 A redesign of the dashboard, the tray icon and the usage panel.
