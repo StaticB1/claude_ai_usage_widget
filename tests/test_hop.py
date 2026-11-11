@@ -109,16 +109,32 @@ def test_probe_and_throttle_are_named(tmp_path, monkeypatch):
     now = datetime.now(timezone.utc)
     _cache(d, {
         'alpha': {'windows': {'five_hour': {'pct': 5.0, 'resetsAt': None}},
-                  'fetchedAt': now.timestamp() - 120, 'source': 'probe',
+                  'fetchedAt': now.timestamp() - 1200, 'source': 'probe',
                   'throttledUntil': now.timestamp() + 1500},
         'beta': {'windows': None, 'throttledUntil': now.timestamp() + 600},
     })
     cache = hop.load_usage_cache()
     usage, fresh = hop.usage_text(cache['alpha'], now)
     assert usage == '5-hour 5% · 7-day ?'
-    assert fresh.startswith('read 2m ago through claude; server throttling reads for 2')
+    assert fresh.startswith('read 20m ago through claude; server throttling reads for 2')
     assert hop.usage_text(cache['beta'], now)[0] == 'no reading yet'
     assert 'throttling' in hop.usage_text(cache['beta'], now)[1]
+
+
+def test_a_fresh_reading_needs_no_throttle_note(tmp_path, monkeypatch):
+    # `hop usage --probe` read the login through Claude Code a minute ago while
+    # the endpoint still refuses it: the figures are current, so the countdown
+    # would only make them look stale.
+    d = _setup(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    _cache(d, {'alpha': {'windows': {'five_hour': {'pct': 51.0, 'resetsAt': None}},
+                         'fetchedAt': now.timestamp() - 60, 'source': 'probe',
+                         'throttledUntil': now.timestamp() + 1800}})
+    r = hop.load_usage_cache()['alpha']
+    assert hop.usage_text(r, now) == ('5-hour 51% · 7-day ?', 'read 1m ago through claude')
+    later = now + timedelta(seconds=hop.THROTTLE_NOTE_AFTER_S)
+    assert hop.usage_text(r, later)[1] == (
+        'read 11m ago through claude; server throttling reads for 20m')
 
 
 def test_the_newer_reading_wins_and_keeps_the_throttle():
@@ -219,6 +235,30 @@ def test_read_all_collects_notes(tmp_path, monkeypatch):
     monkeypatch.setattr(hop, 'find_claudehop', lambda: exe)
     got = hop.read_all()
     assert (got.status, got.notes) == ('done', {'a': '', 'b': 'the server rejected this token'})
+
+
+def test_read_all_reads_throttled_accounts_through_claude(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    args = tmp_path / 'args'
+    exe = _fake_hop(tmp_path, f'echo "$@" > {args}\necho \'{{"accounts": []}}\'\n')
+    monkeypatch.setattr(hop, 'find_claudehop', lambda: exe)
+    assert hop.read_all().status == 'done'
+    assert args.read_text().split() == ['usage', '--json', '--probe']
+
+
+def test_read_all_drops_probe_for_a_claudehop_before_1_8(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    calls = tmp_path / 'calls'
+    # claudehop 1.7 refuses a flag it does not know, the way claudehop does.
+    exe = _fake_hop(tmp_path, f'echo "$@" >> {calls}\n'
+                              'for a in "$@"; do [ "$a" = --probe ] && {\n'
+                              '  echo "claudehop: unknown option \'--probe\'. Try: claudehop help" >&2\n'
+                              '  exit 2; }; done\n'
+                              'echo \'{"accounts": [{"name": "a", "note": ""}]}\'\n')
+    monkeypatch.setattr(hop, 'find_claudehop', lambda: exe)
+    got = hop.read_all()
+    assert (got.status, got.notes) == ('done', {'a': ''})
+    assert calls.read_text().splitlines() == ['usage --json --probe', 'usage --json']
 
 
 def test_read_all_does_not_start_while_the_lock_is_held(tmp_path, monkeypatch):

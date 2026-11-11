@@ -404,12 +404,21 @@ def _window_text(label: str, pct: Optional[float], resets: Optional[str],
     return f"{label} {cur:.0f}%"
 
 
+# A throttle is named only beside a reading at least this old: it says why the
+# figures are old. A fresh reading (one taken through Claude Code while the
+# endpoint refuses, say) needs no such note.
+THROTTLE_NOTE_AFTER_S = 600
+
+
 def usage_text(reading: Optional[Reading],
                now: Optional[datetime] = None) -> Tuple[str, str]:
     """``(usage, freshness)`` for one account's reading."""
     now = now or datetime.now(timezone.utc)
     throttle = ""
-    if reading is not None and reading.throttled_until and reading.throttled_until > now:
+    stale = (reading is None or not reading.has_figures
+             or (now - reading.at).total_seconds() >= THROTTLE_NOTE_AFTER_S)
+    if (stale and reading is not None and reading.throttled_until
+            and reading.throttled_until > now):
         throttle = ("server throttling reads for "
                     f"{countdown((reading.throttled_until - now).total_seconds())}")
     if reading is None or not reading.has_figures:
@@ -657,14 +666,22 @@ class ReadAll:
 _running: Optional[subprocess.Popen] = None
 
 
-def read_all(wait: float = READ_ALL_WAIT_S) -> ReadAll:
-    """Run ``hop usage --json`` once and report what came of it.
+def read_all(wait: float = READ_ALL_WAIT_S, probe: bool = True) -> ReadAll:
+    """Run ``hop usage --json --probe`` once and report what came of it.
 
     claudehop asks the usage endpoint for every saved account, renews an idle
-    account's aged-out token first under its own locks, waits out a server
-    throttle, and writes ``.usage-cache``, which ``load_usage_cache`` reads. It
-    spends a little of the endpoint's per-token budget, so it runs only when
-    the person asks.
+    account's aged-out token first under its own locks, and writes
+    ``.usage-cache``, which ``load_usage_cache`` reads. It spends a little of
+    the endpoint's per-token budget, so it runs only when the person asks.
+
+    The endpoint refuses clients other than Claude Code for up to an hour once
+    a token's small allowance is spent, and Claude Code itself asks it as
+    well, so the login that is live, or was lately, is often refused. With
+    ``probe`` (claudehop 1.8.0 and later) such an account is read through
+    Claude Code instead: one one-word reply from the smallest model, whose
+    answer carries the same 5-hour and weekly figures. That spends a sliver of
+    the account's allowance and starts its 5-hour window if none is running.
+    An older claudehop, which does not know ``--probe``, is run without it.
 
     claudehop is never killed: stopping it between a token renewal and the
     write that saves it would lose that account's login. A read still going
@@ -680,8 +697,10 @@ def read_all(wait: float = READ_ALL_WAIT_S) -> ReadAll:
         return ReadAll('error', "claudehop is not installed or not on PATH.")
     if lock_busy():
         return ReadAll('busy', busy_message("Press again once it finishes."))
+    started = time.monotonic()
+    cmd = [exe, 'usage', '--json'] + (['--probe'] if probe else [])
     try:
-        proc = subprocess.Popen([exe, 'usage', '--json'], stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True)
     except OSError as e:
@@ -716,6 +735,8 @@ def read_all(wait: float = READ_ALL_WAIT_S) -> ReadAll:
         doc = json.loads(''.join(out))
     except ValueError:
         said = (''.join(err).strip().splitlines() or [''])[-1]
+        if probe and "'--probe'" in said:      # claudehop before 1.8.0
+            return read_all(max(0.0, wait - (time.monotonic() - started)), probe=False)
         return ReadAll('error', f"claudehop: {said[:160]}" if said
                        else f"claudehop exited {proc.returncode}.")
     notes: Dict[str, str] = {}

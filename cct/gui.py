@@ -51,6 +51,7 @@ from .config import (APP_ID, APP_NAME, APP_VERSION, LOCAL_SCAN_INTERVAL,
 from .notifications import NotificationManager, WindowSnapshot
 from . import hop as claudehop
 from . import statusline
+from . import throttle
 from . import ui
 from .format import (fmt, fmt_cost, fmt_duration, fmt_full,
                      fmt_reset_absolute, fmt_reset_countdown, rel_time)
@@ -164,6 +165,7 @@ DAILY_REFRESH_S = 300
 # A poll that failed in one of these ways leaves the account without a current
 # reading of its own.
 BAD_CLOUD_STATES = ('auth_error', 'network_error', 'rate_limited', 'no_token')
+RATE_LIMITED_MSG = "Claude.ai is rate-limiting this token."
 
 # A reading this recent is still shown as the account's figure when a poll
 # fails, instead of an error mark: the usage endpoint throttles a token that
@@ -2314,7 +2316,9 @@ class TrackerWindow(Gtk.Window):
             self._set_notice("No OAuth token. Run `claude` to log in, or paste a "
                              "token.", action='token', label='Set token')
             self._plan_foot.set_text('')
-        elif state == 'rate_limited':
+        elif state == 'rate_limited' and not (stored and recent):
+            # A recent reading from claudehop or the status line is shown as
+            # it is below; this notice is for when the figures are getting old.
             extra = ""
             if cv.cloud_retry_at:
                 secs = max(0, int((cv.cloud_retry_at - datetime.now(timezone.utc))
@@ -2323,9 +2327,14 @@ class TrackerWindow(Gtk.Window):
             self._set_tag("Rate limited", 'warn')
             shown = (f" The rings show {who}'s reading from {when}." if stored
                      else " The rings show the last reading.")
-            self._set_notice((cv.cloud_error or "Claude.ai is rate-limiting this "
-                              "token.") + extra + shown,
-                             'warn', action='retry', label='Try now')
+            if self.app.hop_snap is not None and self.app._primary_is_hop_home():
+                # Asking the endpoint again only brings another 429; claudehop
+                # can read the login through Claude Code instead.
+                self._set_notice((cv.cloud_error or RATE_LIMITED_MSG) + extra + shown,
+                                 'warn', action='read', label='Read all accounts')
+            else:
+                self._set_notice((cv.cloud_error or RATE_LIMITED_MSG) + extra + shown,
+                                 'warn', action='retry', label='Try now')
             self._plan_foot.set_text('')
         elif state == 'auth_error':
             self._set_tag("Token rejected", 'danger')
@@ -2355,9 +2364,11 @@ class TrackerWindow(Gtk.Window):
             self._set_tag(f"Read {claudehop.ago(cv.last_read_at, datetime.now(timezone.utc))}",
                           'ok' if recent else 'muted')
             self._set_notice(None)
-            self._plan_foot.set_text(
-                f"Read by {who} at {when} · "
-                f"{ui.level_word(p5).capitalize()} in this window")
+            foot = (f"Read by {who} at {when} · "
+                    f"{ui.level_word(p5).capitalize()} in this window")
+            if state == 'rate_limited' and cv.cloud_retry_at:
+                foot += f" · next poll {cv.cloud_retry_at.astimezone():%H:%M}"
+            self._plan_foot.set_text(foot)
         else:
             self._set_tag("Live", 'ok')
             self._set_notice(None)
@@ -3000,6 +3011,8 @@ class App:
             )
         self._sync_primary()
 
+        # The usage endpoint's refusals, kept across restarts (poll thread).
+        self._throttles = throttle.Throttles()
         self._api_wake = threading.Event()
         self._window_visible = True
         # Bumped whenever new turns land, so views know their cached figures
@@ -3106,10 +3119,12 @@ class App:
         if (primary.last_read_at is not None and primary.last_source == 'live'
                 and primary.last_hop_name == snap.state.active):
             bad = primary.cloud_state in BAD_CLOUD_STATES
+            limited = primary.cloud_state == 'rate_limited'
             live = claudehop.Reading(
                 primary.last_pct5, primary.last_resets_5h, primary.last_pct7,
                 primary.last_resets_7d, primary.last_week_scope,
-                primary.last_read_at, 'widget' if bad else 'live')
+                primary.last_read_at, 'widget' if bad else 'live',
+                primary.cloud_retry_at if limited else None)
         return claudehop.with_live(snap, live)
 
     def _take_hop_snapshot(self):
@@ -3175,11 +3190,19 @@ class App:
         has = r is not None and r.has_figures
         if st.last_hop_name != active and (st.last_read_at is not None
                                            or st.last_hop_name is not None or has):
-            # A new login: the old one's throttle or error says nothing about it.
-            st.cloud_state = (('loading' if st.token else 'no_token')
-                              if self._settings.token_polling else 'idle')
-            st.cloud_error = ""
-            st.cloud_retry_at = None
+            # A new login: the old one's throttle or error says nothing about
+            # it, but a refusal already known for this one still holds.
+            held = (self._known_throttle(
+                        throttle.key_for(self._primary_account().label, active),
+                        active, datetime.now(timezone.utc))
+                    if self._settings.token_polling and st.token else None)
+            if held is not None:
+                st.cloud_state, st.cloud_error = 'rate_limited', RATE_LIMITED_MSG
+            else:
+                st.cloud_state = (('loading' if st.token else 'no_token')
+                                  if self._settings.token_polling else 'idle')
+                st.cloud_error = ""
+            st.cloud_retry_at = held
             if has:
                 self._apply_usage(st, self._reading_as_cloud(snap, active, r),
                                   r.at, active, r.source)
@@ -3270,6 +3293,25 @@ class App:
             return False
         age = (datetime.now(timezone.utc) - r.at).total_seconds()
         return 0 <= age < self._settings.poll_interval_seconds
+
+    def _known_throttle(self, key: str, who: Optional[str],
+                        now: datetime) -> Optional[datetime]:
+        """When the usage endpoint will answer this login again, if it is
+        refusing it now: from this widget's own last 429 (kept across
+        restarts) or from claudehop's record of claudehop account ``who``.
+        Poll thread."""
+        held = self._throttles.until(key, now)
+        r = None
+        if who:
+            snap = self.hop_snap
+            # The first poll runs before the scan thread's first snapshot, so
+            # until then claudehop's cache is read here.
+            r = (snap.cached.get(who) if snap is not None
+                 else claudehop.load_usage_cache().get(who))
+        theirs = r.throttled_until if r is not None else None
+        if theirs is not None and theirs > now and (held is None or theirs > held):
+            held = theirs
+        return held
 
     def read_all_hop(self):
         """Run `hop usage` once in the background (the Read all button)."""
@@ -4061,14 +4103,27 @@ class App:
                     # claudehop read this login moments ago; the snapshot has
                     # already put that reading on the tray.
                     continue
-                GLib.idle_add(self._set_cloud, 'loading', "", None, acc.label)
                 # Who claudehop says is live, read before and after the fetch so a
                 # hop in the middle files the reading under neither account.
                 is_hop = acc.label == primary_label and self._primary_is_hop_home()
                 who = claudehop.active_name(state.token) if is_hop else None
+                key = throttle.key_for(acc.label, who)
+                held = self._known_throttle(key, who, now)
+                if held is not None:
+                    # The endpoint refuses this login until then (this widget's
+                    # last 429, from before a restart or a hop, or claudehop's);
+                    # asking sooner only brings another 429.
+                    retries.append(held)
+                    if state.cloud_state != 'rate_limited' or state.cloud_retry_at != held:
+                        GLib.idle_add(self._set_cloud, 'rate_limited',
+                                      RATE_LIMITED_MSG, held, acc.label)
+                    continue
+                GLib.idle_add(self._set_cloud, 'loading', "", None, acc.label)
                 try:
                     data = fetch_cloud_usage(state.token)
                     read_at = datetime.now(timezone.utc)
+                    throttle.log_request(key, 200)
+                    self._throttles.clear(key)
                     if who and claudehop.active_name(
                             load_token(acc.credentials_file)) != who:
                         who = None
@@ -4076,22 +4131,26 @@ class App:
                         self._save_hop_usage(who, data)
                     GLib.idle_add(self._on_cloud_data, data, acc.label, who, read_at)
                 except RateLimitError as e:
+                    throttle.log_request(key, 429, e.retry_after)
                     wait = max(e.retry_after or 0, 120)
                     retry_at = datetime.now(timezone.utc) + timedelta(
                         seconds=wait)
+                    self._throttles.set(key, retry_at)
                     retries.append(retry_at)
                     GLib.idle_add(self._set_cloud, 'rate_limited',
-                                  "Claude.ai is rate-limiting this token.",
-                                  retry_at, acc.label)
+                                  RATE_LIMITED_MSG, retry_at, acc.label)
                 except AuthError as e:
+                    throttle.log_request(key, e.code)
                     GLib.idle_add(self._set_cloud, 'auth_error',
                                   f"OAuth rejected (HTTP {e.code}). "
                                   "Re-run `claude` to refresh.", None,
                                   acc.label)
                 except CloudApiError as e:
+                    throttle.log_request(key, 'error')
                     GLib.idle_add(self._set_cloud, 'network_error',
                                   str(e), None, acc.label)
                 except Exception as e:
+                    throttle.log_request(key, 'error')
                     GLib.idle_add(self._set_cloud, 'network_error',
                                   str(e), None, acc.label)
 

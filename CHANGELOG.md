@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-11-11
+
+Accounts stuck on "server throttling reads" can be read again.
+
+### Changed
+- **Read all accounts reads a throttled account through Claude Code.** The
+  button runs `hop usage --probe` (claudehop 1.8.0 and later; older versions
+  run plain `hop usage`). An account the usage endpoint refuses is read from
+  one one-word reply instead, which carries the same 5-hour and weekly
+  figures. It spends a sliver of that account's allowance and starts its
+  5-hour window if none is running. The plan panel offers the same button
+  while the live login is rate-limited; its old "Try now" only woke a poll that
+  then waited out the refusal anyway.
+- **The throttle note appears only beside an old reading.** "Server throttling
+  reads for 20m" explained why figures were old, and still showed beside a
+  reading taken a minute earlier through Claude Code. It now shows once the
+  reading is 10 minutes old.
+
+### Fixed
+- **The widget asked for a login it knew was refused.** It kept a 429 only in
+  memory and only for the login it got it for: after a restart, or a hop to a
+  login claudehop had already found throttled, it asked at once and got another
+  429. It now waits for the later of its own `Retry-After` and claudehop's,
+  keeps its own in `throttle.json` across restarts, and logs every request to
+  `usage-requests.log` so the endpoint's allowance can be measured.
+
 ## [2.5.1] - 2026-11-06
 
 ### Fixed

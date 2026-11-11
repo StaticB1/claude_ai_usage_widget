@@ -224,6 +224,13 @@ figures from, in order:
    in `~/.claude/.credentials.json`. See the
    [risk note](#about-the-live-usage-feature) first. Each account has a
    **"No poll"** switch, and `ctt cloud` asks Claude.ai once when you run it.
+   The usage endpoint answers clients other than Claude Code from a small
+   allowance per login, then refuses them with HTTP 429 for 25 minutes to an
+   hour, and Claude Code spends the same allowance, so the login you are using
+   is the one most often refused. The widget never asks before a refusal's
+   `Retry-After` has passed, whether the refusal was its own (it keeps them in
+   `throttle.json` across restarts) or one claudehop recorded, and it logs every
+   request it sends to `usage-requests.log`.
 
 The tag on the plan panel says how old the reading is and who took it.
 Everything in the Token Tracker works without any of these.
@@ -317,6 +324,8 @@ desktops where the AppIndicator dropdown itself can't be restyled.
 | `~/.config/claude-token-tracker/history.db` | SQLite — long-term token/cost history. |
 | `~/.config/claude-token-tracker/config.json` | Accounts, settings, and an optional fallback OAuth token. |
 | `~/.config/claude-token-tracker/rate_card.json` | Optional pricing override. |
+| `~/.config/claude-token-tracker/throttle.json` | When the usage endpoint will answer each refused login again. No tokens. |
+| `~/.config/claude-token-tracker/usage-requests.log` | One line per usage request the widget sent: time, login, HTTP status, `Retry-After`. Keeps about two days. |
 
 ### Multi-account
 
@@ -349,12 +358,20 @@ it, none of this appears.
   With polling on, the widget skips a poll while claudehop's reading of the live
   login is younger than the poll interval, so the two don't spend the token's
   allowance on the same figures.
-- **Read all accounts.** This button runs `hop usage` once, so claudehop reads
-  every account and renews an idle account's token first. Each read spends a
-  little of the usage endpoint's allowance, so it never runs on its own. If
-  another claudehop command holds its lock, the card says which one instead of
-  waiting (claudehop 2.0.0 and later record it; before 2.0.0, an open `hop`
-  menu held the lock until you chose).
+- **Read all accounts.** This button runs `hop usage --probe` once, so
+  claudehop reads every account and renews an idle account's token first. An
+  account the usage endpoint is refusing ("server throttling reads") is read
+  through Claude Code instead: one one-word reply from the smallest model, whose
+  answer carries the same 5-hour and weekly figures. That spends a sliver of the
+  account's allowance and starts its 5-hour window if none is running, so the
+  button never runs on its own. With claudehop older than 1.8.0 it runs plain
+  `hop usage`. The same button appears on the plan panel while the live login
+  is rate-limited. If another claudehop command holds its lock, the card says
+  which one instead of waiting (claudehop 2.0.0 and later record it; before
+  2.0.0, an open `hop` menu held the lock until you chose).
+- **Throttle notes.** "Server throttling reads for 20m" beside an account
+  means the endpoint refuses that login until then and the reading shown is at
+  least 10 minutes old. A newer reading needs no such note.
 - **Where to go next.** The login with the most 5-hour room, chosen the way
   `hop next` chooses: from its `next` list when you have one, never a full
   login, and the soonest reset first among close calls.
