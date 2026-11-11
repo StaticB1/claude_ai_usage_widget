@@ -227,7 +227,9 @@ figures from, in order:
    The usage endpoint answers clients other than Claude Code from a small
    allowance per login, then refuses them with HTTP 429 for 25 minutes to an
    hour, and Claude Code spends the same allowance, so the login you are using
-   is the one most often refused. The widget never asks before a refusal's
+   is the one most often refused. Three reads in about ten minutes were enough
+   to lock a login out for an hour, so the widget waits at least 15 minutes
+   between polls (the default and the minimum). It never asks before a refusal's
    `Retry-After` has passed, whether the refusal was its own (it keeps them in
    `throttle.json` across restarts) or one claudehop recorded, and it logs every
    request it sends to `usage-requests.log`.

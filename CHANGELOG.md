@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.6.1] - 2026-11-11
+
+### Fixed
+- **Polling every two minutes got a login refused for an hour by itself.**
+  The request log 2.6.0 added showed it the same day: a fresh login read at
+  11:36 and 11:38 was refused at 11:40 with a `Retry-After` of 3600 seconds.
+  The poll interval is now at least 15 minutes, and that is the default; a
+  shorter interval saved in `config.json` is raised to it. Read all accounts
+  still gives a current reading at any time.
+
 ## [2.6.0] - 2026-11-11
 
 Accounts stuck on "server throttling reads" can be read again.

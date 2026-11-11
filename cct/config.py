@@ -7,7 +7,7 @@ from typing import List, Optional
 
 APP_ID = 'claude-token-tracker'
 APP_NAME = 'Claude Usage Widget & Token Tracker'
-APP_VERSION = '2.6.0'
+APP_VERSION = '2.6.1'
 
 CLAUDE_DIR = Path.home() / '.claude' / 'projects'
 CREDENTIALS_FILE = Path.home() / '.claude' / '.credentials.json'
@@ -24,7 +24,12 @@ LOCAL_SCAN_INTERVAL = 10           # seconds — local log re-scan / tray block
 
 NOTIFICATION_THRESHOLDS = [75, 90, 100]
 
-DEFAULT_POLL_INTERVAL_SECONDS = 120  # match the original widget's cadence
+# The usage endpoint allows a login only a few reads before it refuses it for
+# an hour: on 11 Nov 2026 a login read at 11:29, 11:36 and 11:38 was refused at
+# 11:40 with a Retry-After of 3600 s. Polling every two minutes, the old
+# default, did that by itself, so no interval below this is used.
+MIN_POLL_INTERVAL_SECONDS = 900
+DEFAULT_POLL_INTERVAL_SECONDS = MIN_POLL_INTERVAL_SECONDS
 DEFAULT_THRESHOLDS = {'warn': 60, 'critical': 85}
 DEFAULT_BURN_RATE = {'enabled': False, 'multiplier': 1.5}
 BURN_RATE_GRACE_HOURS = 8
@@ -170,8 +175,8 @@ def load_settings() -> Settings:
     th = cfg.get('thresholds') or {}
     br = cfg.get('burn_rate') or {}
     return Settings(
-        poll_interval_seconds=int(
-            cfg.get('poll_interval_seconds') or DEFAULT_POLL_INTERVAL_SECONDS),
+        poll_interval_seconds=max(MIN_POLL_INTERVAL_SECONDS, int(
+            cfg.get('poll_interval_seconds') or DEFAULT_POLL_INTERVAL_SECONDS)),
         thresholds={
             'warn': int(th.get('warn', DEFAULT_THRESHOLDS['warn'])),
             'critical': int(th.get('critical', DEFAULT_THRESHOLDS['critical'])),

@@ -5,6 +5,15 @@ from datetime import datetime, timedelta, timezone
 from cct import throttle
 
 
+def test_no_poll_interval_below_fifteen_minutes(tmp_path, monkeypatch):
+    from cct import config
+    monkeypatch.setattr(config, 'CONFIG_FILE', tmp_path / 'config.json')
+    assert config.load_settings().poll_interval_seconds == 900          # default
+    for asked, used in ((120, 900), (899, 900), (1800, 1800)):
+        (tmp_path / 'config.json').write_text(json.dumps({'poll_interval_seconds': asked}))
+        assert config.load_settings().poll_interval_seconds == used
+
+
 def test_keys_follow_the_claudehop_login_when_known():
     assert throttle.key_for('Default', 'ebenworks-admin') == 'hop:ebenworks-admin'
     assert throttle.key_for('Default') == 'account:Default'

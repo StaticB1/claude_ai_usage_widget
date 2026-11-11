@@ -45,7 +45,7 @@ from .cloud import (AuthError, CloudApiError, RateLimitError,
                     weekly_window)
 from .config import (APP_ID, APP_NAME, APP_VERSION, LOCAL_SCAN_INTERVAL,
                      PERIOD_LABELS, RATE_CARD_FILE, DEFAULT_ACCOUNT_LABEL,
-                     BEDROCK_ACCOUNT_LABEL,
+                     BEDROCK_ACCOUNT_LABEL, MIN_POLL_INTERVAL_SECONDS,
                      Account, load_accounts, load_settings, save_accounts,
                      save_settings, Settings)
 from .notifications import NotificationManager, WindowSnapshot
@@ -2744,7 +2744,7 @@ class TrackerWindow(Gtk.Window):
         grid.attach(label("Poll Claude.ai with my login token"), 0, 0, 1, 1)
         grid.attach(self._token_poll_switch, 1, 0, 1, 1)
 
-        self._poll_spin = Gtk.SpinButton.new_with_range(60, 3600, 30)
+        self._poll_spin = Gtk.SpinButton.new_with_range(MIN_POLL_INTERVAL_SECONDS, 3600, 60)
         self._poll_spin.set_value(s.poll_interval_seconds)
         grid.attach(label("Poll interval (seconds)"), 0, 1, 1, 1)
         grid.attach(self._poll_spin, 1, 1, 1, 1)
