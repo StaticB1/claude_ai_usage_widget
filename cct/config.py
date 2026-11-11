@@ -7,7 +7,7 @@ from typing import List, Optional
 
 APP_ID = 'claude-token-tracker'
 APP_NAME = 'Claude Usage Widget & Token Tracker'
-APP_VERSION = '2.6.1'
+APP_VERSION = '2.6.2'
 
 CLAUDE_DIR = Path.home() / '.claude' / 'projects'
 CREDENTIALS_FILE = Path.home() / '.claude' / '.credentials.json'
@@ -24,12 +24,12 @@ LOCAL_SCAN_INTERVAL = 10           # seconds — local log re-scan / tray block
 
 NOTIFICATION_THRESHOLDS = [75, 90, 100]
 
-# The usage endpoint allows a login only a few reads before it refuses it for
-# an hour: on 11 Nov 2026 a login read at 11:29, 11:36 and 11:38 was refused at
-# 11:40 with a Retry-After of 3600 s. Polling every two minutes, the old
-# default, did that by itself, so no interval below this is used.
-MIN_POLL_INTERVAL_SECONDS = 900
-DEFAULT_POLL_INTERVAL_SECONDS = MIN_POLL_INTERVAL_SECONDS
+# Polling every two minutes can get a login refused for an hour (11 Nov 2026: a
+# login read at 11:36 and 11:38 was refused at 11:40, Retry-After 3600 s), but
+# Eben chose it over 15-minute polling, whose figures were too old to be
+# useful (2.6.1, withdrawn in 2.6.2). The widget waits out any refusal itself.
+MIN_POLL_INTERVAL_SECONDS = 60
+DEFAULT_POLL_INTERVAL_SECONDS = 120
 DEFAULT_THRESHOLDS = {'warn': 60, 'critical': 85}
 DEFAULT_BURN_RATE = {'enabled': False, 'multiplier': 1.5}
 BURN_RATE_GRACE_HOURS = 8

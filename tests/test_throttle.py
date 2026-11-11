@@ -5,11 +5,11 @@ from datetime import datetime, timedelta, timezone
 from cct import throttle
 
 
-def test_no_poll_interval_below_fifteen_minutes(tmp_path, monkeypatch):
+def test_poll_interval_is_two_minutes_and_never_below_a_minute(tmp_path, monkeypatch):
     from cct import config
     monkeypatch.setattr(config, 'CONFIG_FILE', tmp_path / 'config.json')
-    assert config.load_settings().poll_interval_seconds == 900          # default
-    for asked, used in ((120, 900), (899, 900), (1800, 1800)):
+    assert config.load_settings().poll_interval_seconds == 120          # default
+    for asked, used in ((120, 120), (900, 900), (5, 60), (59, 60)):
         (tmp_path / 'config.json').write_text(json.dumps({'poll_interval_seconds': asked}))
         assert config.load_settings().poll_interval_seconds == used
 

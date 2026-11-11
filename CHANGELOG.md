@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.6.2] - 2026-11-11
+
+### Changed
+- **Polling is back to every two minutes.** 2.6.1 raised the interval to 15
+  minutes to stop a login being refused for an hour, but the live figures then
+  went up to 15 minutes out of date, which is too old for a gauge. The default
+  is 120 seconds again, with a minimum of 60. The trade stays: two-minute polling can get a
+  login refused for an hour (see 2.6.1 below), during which the widget shows
+  the last reading and waits. Raise the interval in Settings to ask less often.
+
 ## [2.6.1] - 2026-11-11
 
 ### Fixed
