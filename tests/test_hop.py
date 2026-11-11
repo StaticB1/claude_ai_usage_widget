@@ -359,3 +359,66 @@ def test_live_reading_replaces_the_stored_one_only_when_newer(tmp_path, monkeypa
 def test_no_snapshot_without_claudehop(tmp_path, monkeypatch):
     monkeypatch.setenv('CLAUDE_ACCOUNTS_DIR', str(tmp_path / 'none'))
     assert hop.take_snapshot(None, {}) is None
+
+
+# ── A reading file another tool keeps for the live login ───────────────────
+
+def _quota(path, at, five=0.74, week=0.12, resets5=None, resets7=None):
+    path.write_text(json.dumps({
+        'at': at.timestamp(),
+        'five_hour': {'used': five, 'resets_at': (resets5 or at + timedelta(hours=4)).timestamp()},
+        'seven_day': {'used': week, 'resets_at': (resets7 or at + timedelta(days=3)).timestamp()},
+        'event': {'status': 'allowed', 'type': 'five_hour'}}))
+
+
+def test_reading_file_gives_the_live_logins_figures(tmp_path):
+    now = datetime.now(timezone.utc)
+    f = tmp_path / 'quota.json'
+    _quota(f, now - timedelta(minutes=2))
+    r = hop.reading_from_file(f, now - timedelta(hours=1))
+    assert (round(r.pct5), round(r.pct7), r.source) == (74, 12, 'file')
+    assert r.at == (now - timedelta(minutes=2)).replace(microsecond=r.at.microsecond)
+    assert r.has_figures and r.week_scope is None
+    usage, fresh = hop.usage_text(r, now)
+    assert usage.startswith('5-hour 74% · 7-day 12%') and fresh == 'read 2m ago from the reading file'
+
+
+def test_reading_file_older_than_the_last_hop_belongs_to_the_old_login(tmp_path):
+    now = datetime.now(timezone.utc)
+    f = tmp_path / 'quota.json'
+    _quota(f, now - timedelta(minutes=10))
+    assert hop.reading_from_file(f, now - timedelta(minutes=9)) is None      # written before the hop
+    assert hop.reading_from_file(f, now - timedelta(minutes=10, seconds=-10)) is None  # inside the grace
+    assert hop.reading_from_file(f, now - timedelta(minutes=11)) is not None
+    assert hop.reading_from_file(f, None) is not None                         # no hop known
+
+
+def test_a_missing_or_damaged_reading_file_is_nothing(tmp_path):
+    assert hop.reading_from_file(tmp_path / 'nope.json') is None
+    assert hop.reading_from_file('') is None
+    bad = tmp_path / 'bad.json'
+    for text in ('{not json', '[]', '{"at": "x"}', '{"at": 1794363527, "five_hour": {"used": "a"}}',
+                 '{"at": 1794363527, "five_hour": {"used": 50}}'):         # 50 is not a fraction
+        bad.write_text(text)
+        assert hop.reading_from_file(bad) is None
+
+
+def test_the_snapshot_takes_the_newer_reading_file_for_the_live_login_only(tmp_path, monkeypatch):
+    d = _setup(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    (d / 'active').write_text('alpha\n')
+    import os
+    os.utime(d / 'active', (now.timestamp() - 7200,) * 2)              # hopped two hours ago
+    _cache(d, {'alpha': _entry(56.0, 10.0, now - timedelta(minutes=9)),
+               'beta': _entry(4.0, 0.0, now - timedelta(minutes=2))})
+    f = tmp_path / 'quota.json'
+    _quota(f, now - timedelta(seconds=100))
+    snap = hop.take_snapshot('tok-A', {}, None, str(f))
+    assert round(snap.cached['alpha'].pct5) == 74 and snap.cached['alpha'].source == 'file'
+    assert round(snap.cached['beta'].pct5) == 4                           # not the live login: untouched
+    _quota(f, now - timedelta(minutes=20))                              # older than claudehop's
+    assert hop.take_snapshot('tok-A', {}, None, str(f)).cached['alpha'].source == 'claudehop'
+    (d / 'provider').write_text('bedrock\n')                              # a provider bypasses the login
+    (d / 'bedrock.provider').write_text('claude-bedrock\n')
+    _quota(f, now)
+    assert hop.take_snapshot('tok-A', {}, None, str(f)).cached['alpha'].source == 'claudehop'

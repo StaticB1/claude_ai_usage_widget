@@ -7,7 +7,7 @@ from typing import List, Optional
 
 APP_ID = 'claude-token-tracker'
 APP_NAME = 'Claude Usage Widget & Token Tracker'
-APP_VERSION = '2.6.2'
+APP_VERSION = '2.7.0'
 
 CLAUDE_DIR = Path.home() / '.claude' / 'projects'
 CREDENTIALS_FILE = Path.home() / '.claude' / '.credentials.json'
@@ -168,6 +168,9 @@ class Settings:
     # Code and claude.ai, so the windows come from Claude Code's status line
     # (``ctt statusline``) or claudehop instead.
     token_polling: bool = False
+    # A JSON file another tool keeps with the live login's 5-hour and weekly
+    # figures (see hop.reading_from_file). '' = none. Set in config.json.
+    reading_file: str = ''
 
 
 def load_settings() -> Settings:
@@ -189,6 +192,7 @@ def load_settings() -> Settings:
         theme=(t if (t := str(cfg.get('theme') or 'system'))
               in ('system', 'light', 'dark') else 'system'),
         token_polling=bool(cfg.get('token_polling', False)),
+        reading_file=str(cfg.get('reading_file') or ''),
     )
 
 
@@ -199,4 +203,6 @@ def save_settings(s: Settings) -> None:
     cfg['burn_rate'] = dict(s.burn_rate)
     cfg['theme'] = s.theme
     cfg['token_polling'] = bool(s.token_polling)
+    if s.reading_file:
+        cfg['reading_file'] = s.reading_file
     save_config(cfg)

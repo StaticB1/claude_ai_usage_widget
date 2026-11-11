@@ -2240,6 +2240,7 @@ class TrackerWindow(Gtk.Window):
                             r.week_scope, was5=was5, was7=was7)
             who = {'probe': "claudehop, through claude", 'claudehop': "claudehop",
                    'widget': "this widget while it was live",
+                   'file': "the reading file",
                    'statusline': "Claude Code's status line"}.get(r.source, r.source)
             self._set_tag(f"Read {claudehop.ago(r.at, now)}", 'muted')
             self._set_notice(
@@ -2307,6 +2308,7 @@ class TrackerWindow(Gtk.Window):
         stored = cv.last_source != 'live' and cv.last_read_at is not None
         who = {'probe': "claudehop, through claude", 'claudehop': "claudehop",
                'widget': "this widget",
+               'file': "the reading file",
                'statusline': "Claude Code's status line"}.get(cv.last_source, cv.last_source)
         when = (cv.last_read_at.astimezone().strftime('%H:%M')
                 if cv.last_read_at else '—')
@@ -2809,6 +2811,7 @@ class TrackerWindow(Gtk.Window):
             },
             theme=load_settings().theme,
             token_polling=bool(self._token_poll_switch.get_active()),
+            reading_file=load_settings().reading_file,
         )
         self.app.apply_settings(new_settings)
         self._flash_saved(self._notif_saved_label,
@@ -3014,6 +3017,10 @@ class App:
         # The usage endpoint's refusals, kept across restarts (poll thread).
         self._throttles = throttle.Throttles()
         self._api_wake = threading.Event()
+        # Set once the first claudehop snapshot is shown (or has failed): the
+        # first poll waits for it, so opening the widget again does not ask the
+        # usage endpoint for a login that is already known to be refused.
+        self._first_snapshot = threading.Event()
         self._window_visible = True
         # Bumped whenever new turns land, so views know their cached figures
         # are stale; and the tray's session, worked out in the scan thread.
@@ -3138,7 +3145,8 @@ class App:
             if r is not None:
                 from_line[name] = r
         snap = claudehop.take_snapshot(self._primary_state().token,
-                                       self.store.hop_usage(), from_line)
+                                       self.store.hop_usage(), from_line,
+                                       self._settings.reading_file)
         self._snap_has_hop = snap is not None
         self._hop_since = self.store.hop_tracking_since() if snap else None
         self._bedrock_rows = self.store.has_account_rows(BEDROCK_ACCOUNT_LABEL)
@@ -3151,6 +3159,7 @@ class App:
         """Show a new snapshot. Interface thread."""
         before = self.hop_state()
         self.hop_snap = snap
+        self._first_snapshot.set()
         self._adopt_hop_reading()
         after = self.hop_state()
         hopped = (before is not None and after is not None
@@ -3281,15 +3290,16 @@ class App:
                 'seven_day': None if r.week_scope else week, 'limits': limits}
 
     def _cache_covers_live(self) -> bool:
-        """True when claudehop read the live login within the poll interval,
-        so this widget's own poll would only spend the token's allowance on
-        the same figures (and make a 429 likelier for both)."""
+        """True when claudehop (or the reading file) read the live login within
+        the poll interval, so this widget's own poll would only spend the
+        token's allowance on the same figures (and make a 429 likelier for
+        both)."""
         snap = self.hop_snap
         if (snap is None or snap.state.provider or not snap.state.active
                 or not self._primary_is_hop_home()):
             return False
         r = snap.cached.get(snap.state.active)
-        if r is None or not r.has_figures or r.source not in ('claudehop', 'probe'):
+        if r is None or not r.has_figures or r.source not in ('claudehop', 'probe', 'file'):
             return False
         age = (datetime.now(timezone.utc) - r.at).total_seconds()
         return 0 <= age < self._settings.poll_interval_seconds
@@ -3996,6 +4006,7 @@ class App:
             GLib.idle_add(self._apply_hop_snapshot, self._take_hop_snapshot())
         except Exception as e:
             print(f"[{APP_ID}] claudehop: {e}", file=sys.stderr)
+            self._first_snapshot.set()
         while self._running:
             try:
                 # Pick up an edited rate_card.json without a restart. The card
@@ -4051,6 +4062,7 @@ class App:
             time.sleep(LOCAL_SCAN_INTERVAL)
 
     def _api_loop(self):
+        self._first_snapshot.wait(20)
         while self._running:
             # Consume any pending wake *before* polling, so a wake request
             # raised while we poll/sleep below is preserved and triggers the

@@ -328,8 +328,35 @@ desktops where the AppIndicator dropdown itself can't be restyled.
 | `~/.config/claude-token-tracker/history.db` | SQLite — long-term token/cost history. |
 | `~/.config/claude-token-tracker/config.json` | Accounts, settings, and an optional fallback OAuth token. |
 | `~/.config/claude-token-tracker/rate_card.json` | Optional pricing override. |
+| `reading_file` in `config.json` | Optional. A JSON file another tool keeps with the live login's reading; see [A reading file](#a-reading-file). |
 | `~/.config/claude-token-tracker/throttle.json` | When the usage endpoint will answer each refused login again. No tokens. |
 | `~/.config/claude-token-tracker/usage-requests.log` | One line per usage request the widget sent: time, login, HTTP status, `Retry-After`. Keeps about two days. |
+
+### A reading file
+
+Claude Code's own `/usage` asks the same `api/oauth/usage` endpoint the widget
+does, with the same login, and keeps no copy of the answer on disk, so there is
+no second place to read it from. What every Claude Code reply does carry is the
+rate-limit figures, and a tool that reads them can keep them in a file. Point
+`reading_file` in `config.json` at that file and the widget uses it for the
+live login, with no request to the endpoint:
+
+```json
+{ "reading_file": "~/.my-tool/quota.json" }
+```
+
+```json
+{ "at": 1794363527.4,
+  "five_hour": { "used": 0.74, "resets_at": 1794378600 },
+  "seven_day": { "used": 0.12, "resets_at": 1794438000 } }
+```
+
+`at` and `resets_at` are epoch seconds and `used` is a fraction. The file
+belongs to whichever login was live when it was written, so it counts only when
+it is more than 30 seconds newer than claudehop's last hop. It is used when it
+is the newest reading of the live login, the tag says "read from the reading
+file", and while it is younger than the poll interval the widget skips its own
+poll. Without claudehop the file is not used.
 
 ### Multi-account
 

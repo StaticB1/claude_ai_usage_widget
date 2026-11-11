@@ -503,7 +503,10 @@ def _hop_report(store: Store, cutoff: Optional[datetime]) -> Optional[dict]:
         return None
     now = datetime.now(timezone.utc)
     names = [p.name for p in hs.profiles]
-    readings = claudehop.all_readings(names, store.hop_usage())
+    rf = load_settings().reading_file
+    from_file = (claudehop.reading_from_file(rf, claudehop.active_changed_at())
+                 if rf and hs.active and not hs.provider else None)
+    readings = claudehop.all_readings(names, store.hop_usage(), hs.active, None, from_file)
     runs = claudehop.run_terminals()
     totals = {r['hop_account']: r for r in store.hop_account_summary(cutoff)}
     rows = []

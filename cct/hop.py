@@ -28,7 +28,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -251,6 +251,44 @@ def reading_from_seen(row: Optional[dict]) -> Optional[Reading]:
                    row.get('week_scope'), _parse_iso(row.get('seen_at')), 'widget')
 
 
+# A reading file is attributed to the live login only when written after the
+# last hop by at least this long, so a reading of the previous login written a
+# moment after the switch is not shown as the new one's.
+FILE_GRACE_S = 30
+
+
+def reading_from_file(path, live_since: Optional[datetime] = None) -> Optional[Reading]:
+    """The live login's reading from a JSON file another tool keeps, or None.
+
+    The file holds ``{"at": epoch seconds, "five_hour": {"used": 0.74,
+    "resets_at": epoch}, "seven_day": {...}}``, ``used`` a fraction, as a tool
+    that reads the rate limits Claude Code reports with every reply writes it
+    (``reading_file`` in config.json). Such a file belongs to whichever login
+    was live when it was written, so it counts only when it is newer than the
+    last hop (``live_since``) by ``FILE_GRACE_S``. A reading taken that way
+    never asks the usage endpoint, so it spends none of its allowance.
+    """
+    doc = _read_json(Path(path).expanduser()) if path else {}
+    at = _epoch(doc.get('at'))
+    if at is None or (live_since is not None
+                      and at < live_since + timedelta(seconds=FILE_GRACE_S)):
+        return None
+
+    def window(key):
+        w = doc.get(key)
+        used = _num(w.get('used')) if isinstance(w, dict) else None
+        when = _epoch(w.get('resets_at')) if isinstance(w, dict) else None
+        if used is None or not 0 <= used <= 10:      # a fraction; 10 = 1000%, as cloud caps
+            return None, None
+        return used * 100, when.isoformat() if when else None
+
+    pct5, r5 = window('five_hour')
+    pct7, r7 = window('seven_day')
+    if pct5 is None and pct7 is None:
+        return None
+    return Reading(pct5, r5, pct7, r7, None, at, 'file')
+
+
 def load_usage_cache() -> Dict[str, Reading]:
     """claudehop's last reading of every account, keyed by account name."""
     doc = _read_json(accounts_dir() / '.usage-cache')
@@ -303,13 +341,21 @@ class Snapshot:
 
 def take_snapshot(live_token: Optional[str],
                   seen_rows: Dict[str, dict],
-                  extra: Optional[Dict[str, Reading]] = None) -> Optional[Snapshot]:
+                  extra: Optional[Dict[str, Reading]] = None,
+                  reading_file: Optional[str] = None) -> Optional[Snapshot]:
     """claudehop's state, readings and ``hop run`` terminals, or None when
     claudehop is not in use. ``seen_rows`` is ``Store.hop_usage()``; ``extra``
-    holds other readings by account name (Claude Code's status line)."""
+    holds other readings by account name (Claude Code's status line);
+    ``reading_file`` is the optional file of the live login's reading (see
+    ``reading_from_file``)."""
     hs = load_state(live_token)
     if hs is None:
         return None
+    if reading_file and hs.active and not hs.provider:
+        got = reading_from_file(reading_file, active_changed_at())
+        if got is not None:
+            extra = dict(extra or {})
+            extra[hs.active] = newest(got, extra.get(hs.active))
     raw = _read_json(accounts_dir() / '.usage-cache')
     cache: Dict[str, Reading] = {}
     cloud: Dict[str, dict] = {}
@@ -339,17 +385,20 @@ def with_live(snap: Snapshot, live: Optional[Reading]) -> Dict[str, Optional[Rea
 
 def all_readings(names: List[str], seen_rows: Dict[str, dict],
                  live_name: Optional[str] = None,
-                 live: Optional[Reading] = None) -> Dict[str, Optional[Reading]]:
+                 live: Optional[Reading] = None,
+                 from_file: Optional[Reading] = None) -> Dict[str, Optional[Reading]]:
     """The best reading for each account: the live one for the live login when
     there is one, otherwise the newer of the widget's own (``seen_rows``, from
-    ``Store.hop_usage``) and claudehop's cache."""
+    ``Store.hop_usage``), claudehop's cache and, for the live login, the
+    reading file's (``from_file``)."""
     cache = load_usage_cache()
     out: Dict[str, Optional[Reading]] = {}
     for n in names:
         if n == live_name and live is not None and live.has_figures:
             out[n] = live
         else:
-            out[n] = newest(reading_from_seen(seen_rows.get(n)), cache.get(n))
+            theirs = from_file if n == live_name else None
+            out[n] = newest(reading_from_seen(seen_rows.get(n)), cache.get(n), theirs)
     return out
 
 
@@ -432,6 +481,8 @@ def usage_text(reading: Optional[Reading],
         fresh = f"read {ago(reading.at, now)}"
         if reading.source == 'probe':
             fresh += " through claude"
+        elif reading.source == 'file':
+            fresh += " from the reading file"
     return usage, "; ".join(x for x in (fresh, throttle) if x)
 
 

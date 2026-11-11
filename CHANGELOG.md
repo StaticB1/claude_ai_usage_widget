@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.7.0] - 2026-11-11
+
+### Added
+- **A reading file for the live login.** `reading_file` in `config.json` names
+  a JSON file a tool keeps from the rate limits Claude Code reports with every
+  reply (format in the README). The widget and `ctt accounts` use it for the
+  live login whenever it is newer than their other readings, and skip their
+  own poll while it is younger than the poll interval, so the usage endpoint is
+  asked less and refuses less. In one check the file read 82% of the 5-hour
+  window where the widget, working from a 9-minute-old reading, showed 56%.
+
+### Fixed
+- **Opening the widget spent a read on a refused login.** The first poll ran
+  before claudehop's state was loaded, so it could not know a login was
+  already refused. It now waits for the first snapshot (at most 20 seconds).
+
 ## [2.6.2] - 2026-11-11
 
 ### Changed
