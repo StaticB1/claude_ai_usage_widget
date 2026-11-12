@@ -37,6 +37,20 @@ def key_for(label: str, hop_name: Optional[str] = None) -> str:
     return f"hop:{hop_name}" if hop_name else f"account:{label}"
 
 
+def backoff_holds(cloud_state: str, retry_at: Optional[datetime], now: datetime,
+                  token_before: Optional[str], token_now: Optional[str]) -> bool:
+    """Whether an account's last refusal still stops the poll from asking.
+
+    Only while it lasts, and only for the token it was earned with: after a
+    claudehop hop the token is another account's, whose own refusal (if any)
+    is found under its own ``key_for`` key. A token Claude Code merely
+    renewed is another token too; the same account's refusal is then still
+    found under that key.
+    """
+    return (cloud_state == 'rate_limited' and retry_at is not None
+            and retry_at > now and token_now == token_before)
+
+
 def _parse(raw) -> Optional[datetime]:
     if not isinstance(raw, str):
         return None

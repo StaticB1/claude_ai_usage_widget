@@ -3148,9 +3148,9 @@ class App:
         # is now. The token the poll thread holds is re-read only when it asks
         # the usage endpoint, so after a hop it still matched the account left
         # behind, and named that account for as long as polling waited (an
-        # hour, when the endpoint had refused the old login).
-        live_token = (load_token(self._primary_account().credentials_file)
-                      or self._primary_state().token)
+        # hour, when the endpoint had refused the old login). Never fall back
+        # to that token: with none, claudehop's `active` pointer decides.
+        live_token = load_token(self._primary_account().credentials_file)
         snap = claudehop.take_snapshot(live_token,
                                        self.store.hop_usage(), from_line,
                                        self._settings.reading_file)
@@ -4100,11 +4100,11 @@ class App:
                 state = self._account_states.get(acc.label)
                 if state is None:
                     continue
-                # Read the login first. After a hop or a new /login it is a
-                # different login, and the backoff below was earned by the old
-                # one; skipping before this read kept the old token for the
-                # whole backoff. A refusal of the same account is still held
-                # by _known_throttle further down, which keys it by account.
+                # Read the login first. After a claudehop hop it is another
+                # account's, and the backoff below was earned by the old one;
+                # skipping before this read kept the old token for the whole
+                # backoff. A refusal of the account now live is still found by
+                # _known_throttle further down, which keys it by account.
                 held_token = state.token
                 fresh_token = load_token(acc.credentials_file)
                 if fresh_token:
@@ -4116,8 +4116,8 @@ class App:
                 # up healthy accounts (a 429 on one token used to delay the
                 # whole loop, and thus every other account, by ≥120s).
                 retry_at = state.cloud_retry_at
-                if (state.cloud_state == 'rate_limited' and retry_at
-                        and retry_at > now and state.token == held_token):
+                if throttle.backoff_holds(state.cloud_state, retry_at, now,
+                                          held_token, state.token):
                     retries.append(retry_at)
                     continue
                 if not state.token:

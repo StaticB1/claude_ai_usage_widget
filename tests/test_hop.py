@@ -34,6 +34,17 @@ def test_live_account_comes_from_the_token_then_the_pointer(tmp_path, monkeypatc
     assert hop.load_state('tok-rotated').active == 'alpha'   # falls back to pointer
 
 
+def test_a_token_held_from_before_a_hop_still_names_the_old_account(tmp_path, monkeypatch):
+    # claudehop saves the live login into the account it leaves, so the token
+    # read before a hop matches that profile and outranks the moved pointer.
+    # The tray must decide from the token read now, or from the pointer alone.
+    _setup(tmp_path, monkeypatch)
+    (tmp_path / 'active').write_text('beta\n')              # the hop
+    assert hop.load_state('tok-A').active == 'alpha'         # the held token: wrong
+    assert hop.load_state('tok-B').active == 'beta'          # the token read now
+    assert hop.load_state(None).active == 'beta'             # no token: the pointer
+
+
 def test_profiles_carry_email_and_plan_but_no_token(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     st = hop.load_state()

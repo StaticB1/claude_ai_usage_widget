@@ -60,3 +60,27 @@ def test_the_request_log_names_outcomes_and_stays_short(tmp_path, monkeypatch):
     assert len(text) <= 400
     assert text.endswith(' hop:n29 200\n')
     assert all(ln.startswith('2026-11-11T') for ln in text.splitlines())   # whole lines only
+
+
+def test_a_backoff_holds_only_for_the_token_that_earned_it():
+    now = datetime.now(timezone.utc)
+    later = now + timedelta(minutes=40)
+    # the same login, still refused: the poll waits
+    assert throttle.backoff_holds('rate_limited', later, now, 'tok-old', 'tok-old')
+    # a hop put another account's token in the file: asked now, not in 40 minutes
+    assert not throttle.backoff_holds('rate_limited', later, now, 'tok-old', 'tok-new')
+    # a refusal that has run out, or a state that is not one
+    assert not throttle.backoff_holds('rate_limited', now - timedelta(seconds=1), now, 't', 't')
+    assert not throttle.backoff_holds('rate_limited', None, now, 't', 't')
+    assert not throttle.backoff_holds('ok', later, now, 't', 't')
+
+
+def test_a_renewed_token_of_the_same_account_is_still_refused(tmp_path):
+    # backoff_holds lets a renewed token through; the per-account record the
+    # poll reads next is what still holds it back.
+    now = datetime.now(timezone.utc)
+    t = throttle.Throttles(tmp_path / 'throttle.json')
+    t.set(throttle.key_for('Default', 'alpha'), now + timedelta(minutes=40))
+    assert not throttle.backoff_holds('rate_limited', now + timedelta(minutes=40), now, 'a1', 'a2')
+    assert t.until(throttle.key_for('Default', 'alpha'), now) is not None
+    assert t.until(throttle.key_for('Default', 'beta'), now) is None

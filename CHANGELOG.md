@@ -15,7 +15,9 @@ All notable changes to this project will be documented in this file.
   tray named that account, showed its figures and never polled the new one.
   The 10-second check now reads the live token from the credential file each
   time, and the poll reads the token before it decides to wait out a refusal,
-  so a refusal earned by the old login no longer holds up the new one. In a
+  so a refusal earned by the account you hopped from no longer holds up the
+  one you hopped to. (A widget account claudehop does not manage keeps one
+  refusal for the account, whoever is signed in to it.) In a
   sandboxed run with the old login refused, 2.7.0 was still on it 75 seconds
   after the hop; 2.7.1 moved to the new login 6 seconds after it.
 
