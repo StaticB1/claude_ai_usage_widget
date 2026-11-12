@@ -75,9 +75,11 @@ def test_a_backoff_holds_only_for_the_token_that_earned_it():
     assert not throttle.backoff_holds('ok', later, now, 't', 't')
 
 
-def test_a_renewed_token_of_the_same_account_is_still_refused(tmp_path):
-    # backoff_holds lets a renewed token through; the per-account record the
-    # poll reads next is what still holds it back.
+def test_backoff_holds_leaves_a_renewed_token_to_the_per_account_record(tmp_path):
+    # backoff_holds lets a renewed token through; the per-account record
+    # (Throttles, under key_for) is what the poll reads next to hold it back.
+    # That the poll then reads it is in gui.py, which these tests do not load;
+    # the sandboxed hop run in the 2.7.1 changelog entry is its check.
     now = datetime.now(timezone.utc)
     t = throttle.Throttles(tmp_path / 'throttle.json')
     t.set(throttle.key_for('Default', 'alpha'), now + timedelta(minutes=40))
