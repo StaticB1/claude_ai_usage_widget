@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.7.1] - 2026-11-12
+
+### Fixed
+- **After a hop the widget kept showing the account you had left.** It
+  worked out which saved login is live from the token it had read last, and
+  it re-read that token only when it was about to ask the usage endpoint. A
+  login the endpoint had refused was not asked about for up to an hour, so for
+  that hour the old token still matched the old account's saved profile: the
+  tray named that account, showed its figures and never polled the new one.
+  The 10-second check now reads the live token from the credential file each
+  time, and the poll reads the token before it decides to wait out a refusal,
+  so a refusal earned by the old login no longer holds up the new one. In a
+  sandboxed run with the old login refused, 2.7.0 was still on it 75 seconds
+  after the hop; 2.7.1 moved to the new login 6 seconds after it.
+
 ## [2.7.0] - 2026-11-11
 
 ### Added
