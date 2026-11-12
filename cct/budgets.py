@@ -9,6 +9,20 @@ from .periods import (local_day_start, local_month_end, local_month_start,
                      local_week_start)
 from .store import Store
 
+# Grid the plan windows are bucketed on when the API's reset moment is not
+# known (no token, offline, a reply that went stale). Anthropic's own
+# windows do not sit on a fixed grid — they open on the account's first
+# message — so this is an approximation; all it has to be is *stable*, so
+# that the key names a window instead of the instant of evaluation.
+_GRID_ORIGIN = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _grid_boundary(moment: datetime, span: timedelta) -> datetime:
+    """The first ``span``-sized grid boundary at or after ``moment``."""
+    moment = moment.astimezone(timezone.utc)
+    steps = (moment - _GRID_ORIGIN) // span + 1
+    return _GRID_ORIGIN + steps * span
+
 
 def period_window(period: str,
                   now: Optional[datetime] = None,
@@ -23,7 +37,10 @@ def period_window(period: str,
 
     Rolling Anthropic plan windows ('5h', '7d') are anchored on `resets_at`
     from the cloud API, so the key only changes when Anthropic actually resets
-    the quota. Without it, falls back to a rolling window ending at `now`.
+    the quota. Without it, the window falls back to a rolling one ending at
+    `now` and the key falls back to the grid boundary that window falls in —
+    still a window, never the instant of evaluation, so that a budget over
+    its threshold does not re-fire its alert on every poll.
     """
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
@@ -43,10 +60,17 @@ def period_window(period: str,
         end_l = local_month_end(local)
         key = start_l.strftime('%Y-%m')
     elif period in ('5h', '7d'):
-        end_dt = parse_resets_at(resets_at) or now
         span = BLOCK_DURATION if period == '5h' else timedelta(days=7)
+        anchor = parse_resets_at(resets_at)
+        end_dt = anchor or now
+        # The key names the *window*, never the instant of evaluation: with a
+        # reset moment it is that moment, without one it is the grid boundary
+        # the window falls in. A key taken from `now` itself changed on every
+        # poll, and `should_notify()` reads a changed key as a new period,
+        # so a budget over its threshold re-fired its alert every minute.
+        key_dt = anchor if anchor is not None else _grid_boundary(now, span)
         return (end_dt - span, end_dt,
-                end_dt.strftime(f'{period}@%Y-%m-%dT%H:%M'))
+                key_dt.strftime(f'{period}@%Y-%m-%dT%H:%M'))
     else:
         raise ValueError(f"Unknown period: {period}")
     return (start_l.astimezone(timezone.utc),
@@ -114,6 +138,26 @@ def _resets_at(usage_data: Optional[dict], window: str) -> Optional[str]:
     return (bucket or {}).get('resets_at') if isinstance(bucket, dict) else None
 
 
+def _open_reset(usage_data: Optional[dict], window: str,
+                now: datetime) -> Optional[str]:
+    """The plan window's reset moment — but only while it is still ahead.
+
+    A reply that went stale (the app asleep past the reset, a poll that
+    failed) still carries the old moment. Anchoring a *spend* window on it
+    would measure a window that has already closed, so leave it out and let
+    the caller fall back to the sliding window.
+    """
+    if window not in ('5h', '7d'):
+        return None
+    resets_at = _resets_at(usage_data, window)
+    if not resets_at:
+        return None
+    parsed = parse_resets_at(resets_at)
+    if parsed is None or parsed <= now:
+        return None
+    return resets_at
+
+
 def evaluate_budgets(store: Store,
                      now: Optional[datetime] = None,
                      usage_data: Optional[dict] = None) -> List[BudgetState]:
@@ -142,7 +186,13 @@ def evaluate_budgets(store: Store,
             ))
             continue
 
-        start, end, key = period_window(period, now)
+        # A 5h/7d budget tracks Anthropic's plan window, so anchor it on the
+        # API's reset moment the same way the plan-% budget above is. Without
+        # that it measured a sliding window that never lined up with the one
+        # the account is billed against, and its period key changed on every
+        # poll.
+        start, end, key = period_window(
+            period, now, resets_at=_open_reset(usage_data, period, now))
         project: Optional[str] = None
         model: Optional[str] = None
         account: Optional[str] = None
